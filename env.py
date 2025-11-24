@@ -8,7 +8,7 @@ from gymnasium import spaces
 
 import env_lib, map_config
 from map_config import EnvParameters
-from alg_parameters import NetParameters
+from lstm.alg_parameters import NetParameters
 import pygame
 
 
@@ -18,9 +18,8 @@ class TrackingEnv(gym.Env):
         'render_fps': 40
     }
 
-    def __init__(self, mission=0, spawn_outside_fov=False):
+    def __init__(self, spawn_outside_fov=False):
         super().__init__()
-        self.mission = mission
         self.spawn_outside_fov = bool(spawn_outside_fov)
         self.mask_flag = getattr(map_config, 'mask_flag', False)
         self.width = map_config.width
@@ -460,7 +459,6 @@ class TrackingEnv(gym.Env):
 
         reward, terminated, truncated, info = env_lib.reward_calculate(
             self.tracker, self.target,
-            mission=self.mission,
             tracker_collision=bool(tracker_corrected),
             target_collision=bool(target_corrected),
             sector_captured=bool(sector_captured),
@@ -475,8 +473,7 @@ class TrackingEnv(gym.Env):
             ))
             if self._best_distance is None or cur_dist < (self._best_distance - 1e-6):
                 self._best_distance = cur_dist
-                if self.mission == 0:
-                    reward += 0.02
+                # 移除密集奖励
                 info['closest_record_improved'] = True
             else:
                 info['closest_record_improved'] = False

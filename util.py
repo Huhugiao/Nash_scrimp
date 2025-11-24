@@ -17,7 +17,7 @@ try:
 except Exception:
     wandb = None
 
-from alg_parameters import *
+from lstm.alg_parameters import *  # 使用通用参数
 from map_config import EnvParameters
 
 
@@ -193,10 +193,13 @@ def get_opponent_id_one_hot(opponent_id):
     return one_hot
 
 def build_critic_observation(actor_obs, opponent_strategy=None, policy_manager=None):
+    """构建critic观测：actor_obs + opponent_id context"""
+    from lstm.alg_parameters import NetParameters  # 确保导入
+    
     actor_vec = np.asarray(actor_obs, dtype=np.float32).reshape(-1)
     
     # 不再强制填充，使用实际观测长度
-    # Tracker: 21维, Target: 18维
+    # Tracker: 27维, Target: 24维
     
     context = np.zeros(NetParameters.CONTEXT_LEN, dtype=np.float32)
     if opponent_strategy is not None and policy_manager is not None:

@@ -2,8 +2,9 @@ import numpy as np
 import torch
 import ray
 
-from alg_parameters import *
-from model_lstm import Model
+from map_config import EnvParameters
+from lstm.alg_parameters import *  # 修改导入
+from lstm.model_lstm import Model
 from util import set_global_seeds, update_perf, get_opponent_id_one_hot
 from env import TrackingEnv
 from rule_policies import TRACKER_POLICY_REGISTRY, TARGET_POLICY_REGISTRY
@@ -12,14 +13,14 @@ from policymanager import PolicyManager
 
 @ray.remote(num_cpus=1, num_gpus=SetupParameters.NUM_GPU / max((TrainingParameters.N_ENVS + 1), 1))
 class Runner(object):
-    """Runner with LSTM-based Asymmetric Actor-Critic observations and adaptive opponent sampling."""
+    """Runner for training tracker with LSTM-based Asymmetric Actor-Critic."""
 
-    def __init__(self, env_id, mission):
+    def __init__(self, env_id):
         self.ID = env_id
-        self.mission = mission
         set_global_seeds(env_id * 123)
 
-        self.env = TrackingEnv(mission=mission)
+        # 固定为tracker训练
+        self.env = TrackingEnv()
         self.local_device = torch.device('cuda') if SetupParameters.USE_GPU_LOCAL else torch.device('cpu')
 
         self.agent_model = Model(self.local_device)
@@ -28,53 +29,46 @@ class Runner(object):
         self.policy_manager = None
         self.current_opponent_policy = None
         self.current_opponent_id = -1
-        self.opponent_role = "target" if self.mission == 0 else "tracker"
+        
         if TrainingParameters.OPPONENT_TYPE in {"random", "random_nonexpert"}:
             self.policy_manager = PolicyManager()
 
-        # Maintain role-specific observations
-        self.tracker_obs, self.target_obs = None, None
+        # 初始化观测
         obs_tuple = self.env.reset()
         if isinstance(obs_tuple, tuple) and len(obs_tuple) == 2:
-            # env.reset() -> ( (tracker_obs, target_obs), info )
             try:
                 self.tracker_obs, self.target_obs = obs_tuple[0]
             except Exception:
-                # fallback: duplicate
                 self.tracker_obs = obs_tuple[0]
                 self.target_obs = obs_tuple[0]
         else:
-            # 兼容单一观测
-            base_obs = obs_tuple[0] if isinstance(obs_tuple, tuple) else obs_tuple
-            self.tracker_obs = base_obs
-            self.target_obs = base_obs
+            self.tracker_obs = obs_tuple[0] if isinstance(obs_tuple, tuple) else obs_tuple
+            self.target_obs = self.tracker_obs
 
         self.agent_hidden = None
         self.opponent_hidden = None
 
-    def _get_opponent_action(self, actor_obs, critic_obs):
+    def _get_opponent_action(self, target_obs, privileged_state=None):
+        """获取对手(target)动作"""
         if TrainingParameters.OPPONENT_TYPE == "policy":
+            dummy_context = np.zeros(NetParameters.CONTEXT_LEN, dtype=np.float32)
+            critic_obs = np.concatenate([target_obs, dummy_context])
+            
             opp_action, _, new_hidden, _, _ = self.opponent_model.evaluate(
-                actor_obs, critic_obs, self.opponent_hidden, greedy=True
+                target_obs, critic_obs, self.opponent_hidden, greedy=True
             )
             self.opponent_hidden = new_hidden
             return opp_action
-        elif TrainingParameters.OPPONENT_TYPE == "expert":
-            # 使用新的策略接口
-            if self.mission == 0:  # tracker训练，对手是target
-                default_target = sorted(TARGET_POLICY_REGISTRY.keys())[0]
-                policy_cls = TARGET_POLICY_REGISTRY.get(default_target)
-                if policy_cls:
-                    policy_obj = policy_cls()
-                    return policy_obj.get_action(actor_obs)
-            else:  # target训练，对手是tracker
-                default_tracker = sorted(TRACKER_POLICY_REGISTRY.keys())[0]
-                policy_fn = TRACKER_POLICY_REGISTRY.get(default_tracker)
-                if policy_fn:
-                    return policy_fn(actor_obs)
-            raise ValueError("No expert policy found")
+            
         elif TrainingParameters.OPPONENT_TYPE in {"random", "random_nonexpert"}:
-            return self.policy_manager.get_action(self.current_opponent_policy, actor_obs)
+            if self.policy_manager and self.current_opponent_policy:
+                return self.policy_manager.get_action(
+                    self.current_opponent_policy, 
+                    target_obs, 
+                    privileged_state
+                )
+            return np.zeros(2, dtype=np.float32)
+            
         else:
             raise ValueError(f"Unsupported OPPONENT_TYPE: {TrainingParameters.OPPONENT_TYPE}")
 
@@ -115,7 +109,7 @@ class Runner(object):
                 'critic_obs': np.zeros((n_steps, NetParameters.CRITIC_VECTOR_LEN), dtype=np.float32),
                 'rewards': np.zeros(n_steps, dtype=np.float32),
                 'values': np.zeros(n_steps, dtype=np.float32),
-                'actions': np.zeros((n_steps, getattr(NetParameters, 'ACTION_DIM', 2)), dtype=np.float32),
+                'actions': np.zeros((n_steps, NetParameters.ACTION_DIM), dtype=np.float32),
                 'logp': np.zeros(n_steps, dtype=np.float32),
                 'dones': np.zeros(n_steps, dtype=np.bool_),
                 'episode_starts': np.zeros(n_steps, dtype=np.bool_),
@@ -127,7 +121,7 @@ class Runner(object):
             performance_dict = {'per_r': [], 'per_episode_len': [], 'win': []}
 
             if self.current_opponent_policy is None and self.policy_manager:
-                self.current_opponent_policy, self.current_opponent_id = self.policy_manager.sample_policy(self.opponent_role)
+                self.current_opponent_policy, self.current_opponent_id = self.policy_manager.sample_policy("target")
 
             episode_reward = 0.0
             ep_len = 0
@@ -135,15 +129,8 @@ class Runner(object):
             episode_start = True
 
             for i in range(n_steps):
-                # === 根据训练角色选择正确的观测 ===
-                if self.mission == 0:  # 训练tracker
-                    agent_actor_obs = self.tracker_obs  # tracker观测(27)
-                    opp_actor_obs = self.target_obs      # target观测(24)
-                else:  # 训练target（不建议在当前观测维度配置下）
-                    agent_actor_obs = self.target_obs
-                    opp_actor_obs = self.tracker_obs
-
-                critic_obs_full = np.concatenate([agent_actor_obs, get_opponent_id_one_hot(self.current_opponent_id)])
+                # Tracker观测(27) + 对手ID context
+                critic_obs_full = np.concatenate([self.tracker_obs, get_opponent_id_one_hot(self.current_opponent_id)])
 
                 actor_hidden_pre, critic_hidden_pre = self.agent_model.prepare_hidden(self.agent_hidden, batch_size=1)
                 data['actor_hidden_h'][i] = actor_hidden_pre[0].detach().cpu().numpy()[:, 0, :]
@@ -151,16 +138,16 @@ class Runner(object):
                 data['critic_hidden_h'][i] = critic_hidden_pre[0].detach().cpu().numpy()[:, 0, :]
                 data['critic_hidden_c'][i] = critic_hidden_pre[1].detach().cpu().numpy()[:, 0, :]
 
+                # Agent(tracker)动作
                 agent_action, agent_pre_tanh, new_hidden, v_pred, log_prob = self.agent_model.step(
-                    agent_actor_obs, critic_obs_full, (actor_hidden_pre, critic_hidden_pre)
+                    self.tracker_obs, critic_obs_full, (actor_hidden_pre, critic_hidden_pre)
                 )
                 self.agent_hidden = new_hidden
 
-                # === 对手使用正确的观测 ===
-                opp_pair = self._get_opponent_action(opp_actor_obs, agent_actor_obs)
+                # 对手(target)动作
+                target_action = self._get_opponent_action(self.target_obs, self.tracker_obs)
 
-                tracker_action, target_action = (agent_action, opp_pair) if self.mission == 0 else (opp_pair, agent_action)
-                obs_result, reward, terminated, truncated, info = self.env.step((tracker_action, target_action))
+                obs_result, reward, terminated, truncated, info = self.env.step((agent_action, target_action))
                 done = terminated or truncated
 
                 # 解析观测
@@ -170,8 +157,8 @@ class Runner(object):
                     self.tracker_obs = obs_result
                     self.target_obs = obs_result
 
-                # 记录当前agent的actor_obs与critic_obs_full
-                data['actor_obs'][i] = agent_actor_obs
+                # 记录数据
+                data['actor_obs'][i] = self.tracker_obs
                 data['critic_obs'][i] = critic_obs_full
                 data['values'][i] = v_pred
                 data['actions'][i] = agent_pre_tanh
@@ -192,14 +179,13 @@ class Runner(object):
                     if self.policy_manager:
                         self.policy_manager.update_win_rate(self.current_opponent_policy, win)
                         self.policy_manager.reset()
-                        self.current_opponent_policy, self.current_opponent_id = self.policy_manager.sample_policy(self.opponent_role)
-                    update_perf({'episode_reward': episode_reward, 'num_step': ep_len}, performance_dict)
+                        self.current_opponent_policy, self.current_opponent_id = self.policy_manager.sample_policy("target")
 
                     episode_reward = 0.0
                     ep_len = 0
                     episodes += 1
                     episode_start = True
-                    # reset env and hidden states
+                    
                     obs_tuple = self.env.reset()
                     if isinstance(obs_tuple, tuple) and len(obs_tuple) == 2:
                         try:
@@ -208,17 +194,13 @@ class Runner(object):
                             self.tracker_obs = obs_tuple[0]
                             self.target_obs = obs_tuple[0]
                     else:
-                        base_obs = obs_tuple[0] if isinstance(obs_tuple, tuple) else obs_tuple
-                        self.tracker_obs = base_obs
-                        self.target_obs = base_obs
+                        self.tracker_obs = obs_tuple[0] if isinstance(obs_tuple, tuple) else obs_tuple
+                        self.target_obs = self.tracker_obs
                     self.agent_hidden = None
                     self.opponent_hidden = None
-                    if self.policy_manager and TrainingParameters.ADAPTIVE_SAMPLING:
-                        self.current_opponent_policy, self.current_opponent_id = self.policy_manager.sample_policy(self.opponent_role)
 
-            # 终值价值
-            last_base = self.tracker_obs if self.mission == 0 else self.target_obs
-            critic_obs_last = np.concatenate([last_base, get_opponent_id_one_hot(self.current_opponent_id)])
+            # 计算最终价值
+            critic_obs_last = np.concatenate([self.tracker_obs, get_opponent_id_one_hot(self.current_opponent_id)])
             last_value = self.agent_model.value(critic_obs_last, self.agent_hidden)
             data = self._compute_gae_returns(data, last_value)
 
@@ -234,7 +216,7 @@ class Runner(object):
             n_steps = TrainingParameters.N_STEPS
             actor_obs_arr = np.zeros((n_steps, NetParameters.ACTOR_VECTOR_LEN), dtype=np.float32)
             critic_obs_arr = np.zeros((n_steps, NetParameters.CRITIC_VECTOR_LEN), dtype=np.float32)
-            actions = np.zeros((n_steps, getattr(NetParameters, 'ACTION_DIM', 2)), dtype=np.float32)
+            actions = np.zeros((n_steps, NetParameters.ACTION_DIM), dtype=np.float32)
             performance_dict = {'per_r': [], 'per_episode_len': [], 'win': []}
 
             obs_tuple = self.env.reset()
@@ -248,50 +230,32 @@ class Runner(object):
                 tracker_obs = obs_tuple[0] if isinstance(obs_tuple, tuple) else obs_tuple
                 target_obs = tracker_obs
 
-            # ensure opponent sampling if needed
             if self.current_opponent_policy is None and self.policy_manager:
-                self.current_opponent_policy, self.current_opponent_id = self.policy_manager.sample_policy(self.opponent_role)
+                self.current_opponent_policy, self.current_opponent_id = self.policy_manager.sample_policy("target")
 
             episode_reward = 0.0
             ep_len = 0
             episodes = 0
 
             for i in range(n_steps):
-                if TrainingParameters.AGENT_TO_TRAIN == "tracker":
-                    # Build critic context using tracker obs
-                    critic_full = np.concatenate([tracker_obs, get_opponent_id_one_hot(self.current_opponent_id)])
-                    # expert tracker action from APF (explicit)
-                    teacher_name = "APF" if "APF" in TRACKER_POLICY_REGISTRY else sorted(TRACKER_POLICY_REGISTRY.keys())[0]
-                    policy_fn = TRACKER_POLICY_REGISTRY.get(teacher_name)
-                    if not policy_fn:
-                        raise ValueError("No tracker policy found (APF or default).")
-                    expert_pair = policy_fn(tracker_obs)
-                    normalized = np.asarray(expert_pair, dtype=np.float32)
-                    pre_tanh = Model.to_pre_tanh(normalized)
-                    # opponent target action
-                    opp_pair = self._get_opponent_action(target_obs, tracker_obs)
-                    tracker_action, target_action = normalized, opp_pair
-                else:
-                    # target training path (kept for completeness; note ACTOR_VECTOR_LEN mismatch)
-                    critic_full = np.concatenate([target_obs, get_opponent_id_one_hot(self.current_opponent_id)])
-                    default_target = sorted(TARGET_POLICY_REGISTRY.keys())[0]
-                    policy_cls = TARGET_POLICY_REGISTRY.get(default_target)
-                    if not policy_cls:
-                        raise ValueError("No target policy found")
-                    expert_pair = policy_cls().get_action(target_obs)
-                    normalized = np.asarray(expert_pair, dtype=np.float32)
-                    pre_tanh = Model.to_pre_tanh(normalized)
-                    opp_pair = self._get_opponent_action(tracker_obs, target_obs)
-                    tracker_action, target_action = opp_pair, normalized
+                # 使用APF专家策略生成tracker动作
+                critic_full = np.concatenate([tracker_obs, get_opponent_id_one_hot(self.current_opponent_id)])
+                teacher_name = "APF" if "APF" in TRACKER_POLICY_REGISTRY else sorted(TRACKER_POLICY_REGISTRY.keys())[0]
+                policy_fn = TRACKER_POLICY_REGISTRY.get(teacher_name)
+                if not policy_fn:
+                    raise ValueError("No tracker policy found (APF or default).")
+                expert_pair = policy_fn(tracker_obs)
+                normalized = np.asarray(expert_pair, dtype=np.float32)
+                pre_tanh = Model.to_pre_tanh(normalized)
+                
+                # 对手动作
+                target_action = self._get_opponent_action(target_obs, tracker_obs)
 
-                next_obs, reward, terminated, truncated, info = self.env.step((tracker_action, target_action))
+                next_obs, reward, terminated, truncated, info = self.env.step((normalized, target_action))
                 done = terminated or truncated
 
-                # record IL data
-                if TrainingParameters.AGENT_TO_TRAIN == "tracker":
-                    actor_obs_arr[i] = tracker_obs
-                else:
-                    actor_obs_arr[i] = target_obs
+                # 记录IL数据
+                actor_obs_arr[i] = tracker_obs
                 critic_obs_arr[i] = critic_full
                 actions[i] = pre_tanh
 
@@ -317,7 +281,7 @@ class Runner(object):
                     if self.policy_manager:
                         self.policy_manager.update_win_rate(self.current_opponent_policy, win)
                         self.policy_manager.reset()
-                        self.current_opponent_policy, self.current_opponent_id = self.policy_manager.sample_policy(self.opponent_role)
+                        self.current_opponent_policy, self.current_opponent_id = self.policy_manager.sample_policy("target")
                     obs_tuple = self.env.reset()
                     if isinstance(obs_tuple, tuple) and len(obs_tuple) == 2:
                         try:

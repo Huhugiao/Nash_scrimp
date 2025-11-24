@@ -9,7 +9,7 @@ class EnvParameters:
     # 观测 / 动作接口保持不变
     N_ACTIONS = 48
     EPISODE_LEN = 650
-    NUM_TARGET_POLICIES = 1
+    NUM_TARGET_POLICIES = 5  # Updated to match CONTEXT_LEN (Greedy, APF, DWA, Hiding, Random)
 
     # 视场与观测配置（重新设计）
     # Tracker：有限视场、雷达 360°；Target：全局视角 + 360° 雷达

@@ -1,10 +1,13 @@
 import os
+# 设置SDL为dummy模式，避免在多进程中初始化图形界面导致死锁或错误
+os.environ["SDL_VIDEODRIVER"] = "dummy"
+
 import numpy as np
 import torch
 import argparse
 import pandas as pd
 import time
-from multiprocessing import Pool, cpu_count
+import multiprocessing
 import datetime
 import map_config
 from map_config import EnvParameters, ObstacleDensity
@@ -12,8 +15,8 @@ import json
 from collections import defaultdict
 
 from env import TrackingEnv
-from model_lstm import Model
-from alg_parameters import *
+from lstm.model_lstm import Model  # 从lstm模块导入
+from lstm.alg_parameters import *  # 使用通用参数
 from util import make_gif, get_opponent_id_one_hot
 from policymanager import PolicyManager
 from rule_policies import CBFTracker, GreedyTarget, TRACKER_POLICY_REGISTRY, TARGET_POLICY_REGISTRY
@@ -21,8 +24,8 @@ from rule_policies import CBFTracker, GreedyTarget, TRACKER_POLICY_REGISTRY, TAR
 # 简化：直接定义策略名称
 TRACKER_POLICY_NAMES = tuple(TRACKER_POLICY_REGISTRY.keys())
 TARGET_POLICY_NAMES = tuple(TARGET_POLICY_REGISTRY.keys())
-TRACKER_TYPE_CHOICES = TRACKER_POLICY_NAMES + ("policy", "random")
-TARGET_TYPE_CHOICES = TARGET_POLICY_NAMES + ("policy", "random")
+TRACKER_TYPE_CHOICES = TRACKER_POLICY_NAMES + ("policy", "all")
+TARGET_TYPE_CHOICES = TARGET_POLICY_NAMES + ("policy", "all")
 
 DEFAULT_TRACKER = "CBF"
 DEFAULT_TARGET = "Greedy"
@@ -50,7 +53,6 @@ class BattleConfig:
                  specific_tracker_strategy=None,
                  specific_target_strategy=None,
                  main_output_dir=None,
-                 test_random_once=False,
                  obstacle_density=None):
         self.tracker_type = tracker_type or DEFAULT_TRACKER
         self.target_type = target_type or DEFAULT_TARGET
@@ -64,22 +66,22 @@ class BattleConfig:
         self.specific_tracker_strategy = specific_tracker_strategy
         self.specific_target_strategy = specific_target_strategy
         self.main_output_dir = main_output_dir
-        self.test_random_once = test_random_once
         self.obstacle_density = obstacle_density or ObstacleDensity.MEDIUM
 
         os.makedirs(output_dir, exist_ok=True)
-        self.mission = 0
+        # 删除 mission 相关
+        # self.mission = 0
         self.run_dir = None
         self.run_timestamp = None
 
-        # 设置障碍物密度（布局已取消）
+        # 设置障碍物密度
         map_config.set_obstacle_density(self.obstacle_density)
 
 
 def run_battle_batch(args):
     config, episode_indices = args
 
-    # 确保每个进程都设置正确的障碍物密度（布局已取消）
+    # 确保每个进程都设置正确的障碍物密度
     map_config.set_obstacle_density(config.obstacle_density)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -99,9 +101,8 @@ def run_battle_batch(args):
         target_model.network.load_state_dict(model_dict['model'])
         target_model.network.eval()
 
-    policy_manager = None
-    if config.tracker_type == "random" or config.target_type == "random":
-        policy_manager = PolicyManager()
+    # PolicyManager is needed for ID lookup in build_critic_observation
+    policy_manager = PolicyManager()
 
     batch_results = []
 
@@ -126,11 +127,12 @@ def run_battle_batch(args):
     return batch_results
 
 
-def run_single_episode(config, episode_idx, tracker_model, target_model, device, policy_manager=None, force_save_gif=False):
-    # 确保障碍物密度设置正确（布局已取消）
+def run_single_episode(config, episode_idx, tracker_model, target_model, device, policy_manager, force_save_gif=False):
+    # 确保障碍物密度设置正确
     map_config.set_obstacle_density(config.obstacle_density)
     
-    env = TrackingEnv(mission=config.mission)
+    # 删除 mission 参数，直接构造环境
+    env = TrackingEnv()
     try:
         obs_result = env.reset()
         # 解包观测
@@ -159,19 +161,12 @@ def run_single_episode(config, episode_idx, tracker_model, target_model, device,
         tracker_hidden = None
         target_hidden = None
 
-        if policy_manager:
-            policy_manager.reset()
-
         # 初始化策略
-        tracker_strategy, tracker_policy_fn, tracker_uses_manager = _init_tracker_policy(
-            config, policy_manager
-        )
+        tracker_strategy, tracker_policy_fn = _init_tracker_policy(config)
         if hasattr(tracker_policy_fn, 'reset'):
             tracker_policy_fn.reset()
 
-        target_strategy, target_policy_obj, target_uses_manager = _init_target_policy(
-            config, policy_manager
-        )
+        target_strategy, target_policy_obj = _init_target_policy(config)
         if hasattr(target_policy_obj, 'reset'):
             target_policy_obj.reset()
 
@@ -206,8 +201,8 @@ def run_single_episode(config, episode_idx, tracker_model, target_model, device,
 
                 # Tracker动作
                 t_action = _get_tracker_action(
-                    config, tracker_model, tracker_policy_fn, tracker_uses_manager,
-                    policy_manager, tracker_strategy, tracker_actor_obs,
+                    config, tracker_model, tracker_policy_fn,
+                    tracker_strategy, tracker_actor_obs,
                     tracker_critic_obs, tracker_hidden, privileged_state
                 )
                 if isinstance(t_action, tuple) and len(t_action) == 3:
@@ -217,8 +212,8 @@ def run_single_episode(config, episode_idx, tracker_model, target_model, device,
 
                 # Target动作
                 g_action = _get_target_action(
-                    config, target_model, target_policy_obj, target_uses_manager,
-                    policy_manager, target_strategy, target_actor_obs,
+                    config, target_model, target_policy_obj,
+                    target_strategy, target_actor_obs,
                     target_critic_obs, target_hidden, privileged_state
                 )
                 if isinstance(g_action, tuple) and len(g_action) == 3:
@@ -226,8 +221,14 @@ def run_single_episode(config, episode_idx, tracker_model, target_model, device,
                 else:
                     target_action = g_action
 
+                # 确保传入 env.step 的是 2D 连续动作
+                tracker_action = np.asarray(tracker_action, dtype=np.float32).reshape(2)
+                target_action = np.asarray(target_action, dtype=np.float32).reshape(2)
+
                 # 执行动作
-                step_obs, reward, terminated, truncated, info = env.step(tracker_action, target_action)
+                step_obs, reward, terminated, truncated, info = env.step(
+                    (tracker_action, target_action)
+                )
                 done = terminated or truncated
                 episode_reward += float(reward)
                 episode_step += 1
@@ -256,8 +257,9 @@ def run_single_episode(config, episode_idx, tracker_model, target_model, device,
 
         if save_gif and len(episode_frames) > 1:
             try:
-                gif_path = os.path.join(config.main_output_dir or config.output_dir,
-                                        f"episode_{episode_idx:03d}.gif")
+                # 优先使用 run_dir (具体对战文件夹)，其次 main_output_dir (评估根目录)，最后 output_dir
+                save_dir = config.run_dir if config.run_dir else (config.main_output_dir or config.output_dir)
+                gif_path = os.path.join(save_dir, f"episode_{episode_idx:03d}.gif")
                 make_gif(episode_frames, gif_path, fps=EnvParameters.N_ACTIONS // 2)
             except Exception:
                 pass
@@ -278,79 +280,84 @@ def run_single_episode(config, episode_idx, tracker_model, target_model, device,
         env.close()
 
 
-def _init_tracker_policy(config, policy_manager):
+def _init_tracker_policy(config):
     """初始化tracker策略"""
     tracker_strategy = config.specific_tracker_strategy
     
     if config.tracker_type == "policy":
-        return tracker_strategy or "policy", None, False
-    elif config.tracker_type == "random":
-        if tracker_strategy is None and policy_manager:
-            tracker_strategy, _ = policy_manager.sample_policy("tracker")
-        tracker_strategy = tracker_strategy or DEFAULT_TRACKER
-        
-        # 从注册表动态获取类并实例化
+        return tracker_strategy or "policy", None
+    elif config.tracker_type == "all":
+        if tracker_strategy is None:
+             raise ValueError("Tracker type is 'all' but no specific strategy provided")
         policy_cls = TRACKER_POLICY_REGISTRY.get(tracker_strategy, CBFTracker)
-        return tracker_strategy, policy_cls(), policy_manager is not None
+        return tracker_strategy, policy_cls()
     elif config.tracker_type in TRACKER_POLICY_REGISTRY:
         tracker_strategy = tracker_strategy or config.tracker_type
         policy_cls = TRACKER_POLICY_REGISTRY[config.tracker_type]
-        return tracker_strategy, policy_cls(), False
+        return tracker_strategy, policy_cls()
     else:
         raise ValueError(f"Unsupported tracker type: {config.tracker_type}")
 
 
-def _init_target_policy(config, policy_manager):
+def _init_target_policy(config):
     """初始化target策略"""
     target_strategy = config.specific_target_strategy
     
     if config.target_type == "policy":
-        return target_strategy or "policy", None, False
-    elif config.target_type == "random":
-        if target_strategy is None and policy_manager:
-            target_strategy, _ = policy_manager.sample_policy("target")
-        target_strategy = target_strategy or DEFAULT_TARGET
-        
-        # 从注册表动态获取类并实例化
+        return target_strategy or "policy", None
+    elif config.target_type == "all":
+        if target_strategy is None:
+             raise ValueError("Target type is 'all' but no specific strategy provided")
         policy_cls = TARGET_POLICY_REGISTRY.get(target_strategy, GreedyTarget)
-        return target_strategy, policy_cls(), policy_manager is not None
+        return target_strategy, policy_cls()
     elif config.target_type in TARGET_POLICY_REGISTRY:
         target_strategy = target_strategy or config.target_type
         policy_cls = TARGET_POLICY_REGISTRY[config.target_type]
-        return target_strategy, policy_cls(), False
+        return target_strategy, policy_cls()
     else:
         raise ValueError(f"Unsupported target type: {config.target_type}")
 
 
-def _get_tracker_action(config, model, policy_fn, uses_manager, policy_manager, 
-                        strategy, actor_obs, critic_obs, hidden, privileged_state=None):
+def _get_tracker_action(config, model, policy_fn, strategy, actor_obs, critic_obs, hidden, privileged_state=None):
     """获取tracker动作"""
     if config.tracker_type == "policy":
+        # model.evaluate 返回的是 tanh 后的二维动作（归一化在 [-1,1]）
         eval_result = model.evaluate(actor_obs, critic_obs, hidden, greedy=True)
-        return eval_result if isinstance(eval_result, tuple) else (eval_result, None, hidden)
+        if isinstance(eval_result, tuple):
+            raw_action, pre_tanh, new_hidden, _, _ = eval_result
+        else:
+            raw_action, pre_tanh, new_hidden = eval_result, None, hidden
+        # 显式转换为 numpy(2,)，避免后续堆叠出错
+        raw_action = np.asarray(raw_action, dtype=np.float32).reshape(2)
+        return raw_action, pre_tanh, new_hidden
     else:
         if policy_fn is None:
             raise ValueError(f"No tracker policy function for strategy {strategy}")
-        
+        # 规则策略直接输出 env 控制动作（二维连续）
         if hasattr(policy_fn, 'get_action'):
             action = policy_fn.get_action(actor_obs, privileged_state)
         else:
             action = policy_fn(actor_obs, privileged_state)
-            
-        return (action, None, None) if not isinstance(action, tuple) else action
+        action = np.asarray(action, dtype=np.float32).reshape(2)
+        return action, None, None
 
 
-def _get_target_action(config, model, policy_obj, uses_manager, policy_manager,
-                       strategy, actor_obs, critic_obs, hidden, privileged_state=None):
+def _get_target_action(config, model, policy_obj, strategy, actor_obs, critic_obs, hidden, privileged_state=None):
     """获取target动作"""
     if config.target_type == "policy":
         eval_result = model.evaluate(actor_obs, critic_obs, hidden, greedy=True)
-        return eval_result if isinstance(eval_result, tuple) else (eval_result, None, hidden)
+        if isinstance(eval_result, tuple):
+            raw_action, pre_tanh, new_hidden, _, _ = eval_result
+        else:
+            raw_action, pre_tanh, new_hidden = eval_result, None, hidden
+        raw_action = np.asarray(raw_action, dtype=np.float32).reshape(2)
+        return raw_action, pre_tanh, new_hidden
     else:
         if policy_obj is None:
             raise ValueError(f"No target policy object for strategy {strategy}")
         action = policy_obj.get_action(actor_obs)
-        return (action, None, None) if not isinstance(action, tuple) else action
+        action = np.asarray(action, dtype=np.float32).reshape(2)
+        return action, None, None
 
 def build_critic_observation(actor_obs, opponent_strategy=None, policy_manager=None):
     actor_vec = np.asarray(actor_obs, dtype=np.float32).reshape(-1)
@@ -407,7 +414,6 @@ def analyze_strategy_performance(df):
 
 def run_strategy_evaluation(base_config):
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    # 布局名称移除
     main_evaluation_dir = os.path.join(
         base_config.output_dir,
         f"evaluation_{base_config.tracker_type}_vs_{base_config.target_type}_{base_config.obstacle_density}_{timestamp}"
@@ -420,12 +426,12 @@ def run_strategy_evaluation(base_config):
     tracker_strategies = []
     target_strategies = []
 
-    if base_config.tracker_type == "random":
+    if base_config.tracker_type == "all":
         tracker_strategies = get_available_policies("tracker")
     else:
         tracker_strategies = [base_config.tracker_type]
 
-    if base_config.target_type == "random":
+    if base_config.target_type == "all":
         target_strategies = get_available_policies("target")
     else:
         target_strategies = [base_config.target_type]
@@ -453,8 +459,8 @@ def run_strategy_evaluation(base_config):
                 output_dir=strategy_output_dir,
                 seed=base_config.seed + combination_count,
                 state_space=base_config.state_space,
-                specific_tracker_strategy=tracker_strategy if base_config.tracker_type == "random" else None,
-                specific_target_strategy=target_strategy if base_config.target_type == "random" else None,
+                specific_tracker_strategy=tracker_strategy if base_config.tracker_type == "all" else None,
+                specific_target_strategy=target_strategy if base_config.target_type == "all" else None,
                 main_output_dir=main_evaluation_dir,
                 obstacle_density=base_config.obstacle_density)
             results, run_dir = run_battle(config, strategy_name=f"{tracker_strategy}_vs_{target_strategy}")
@@ -520,7 +526,6 @@ def run_battle(config, strategy_name=None):
     else:
         print(f"运行对战: {config.tracker_type} vs {config.target_type}, {config.episodes} 场")
 
-    # 移除布局名称
     if strategy_name:
         run_name = f"battle_{strategy_name}"
     else:
@@ -532,29 +537,28 @@ def run_battle(config, strategy_name=None):
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
 
-    num_processes = min(cpu_count() // 2, 6)
+    num_processes = min(multiprocessing.cpu_count() // 2, 6)
     batch_size = max(10, config.episodes // max(num_processes, 1))
 
     start_time = time.time()
     results = []
 
-    if config.test_random_once and config.target_type == "random":
-        results = _run_random_once_suite(config)
-    else:
-        batches = []
-        for batch_start in range(0, config.episodes, batch_size):
-            batch_end = min(batch_start + batch_size, config.episodes)
-            batch_episodes = list(range(batch_start, batch_end))
-            batches.append((config, batch_episodes))
+    batches = []
+    for batch_start in range(0, config.episodes, batch_size):
+        batch_end = min(batch_start + batch_size, config.episodes)
+        batch_episodes = list(range(batch_start, batch_end))
+        batches.append((config, batch_episodes))
 
-        try:
-            with Pool(processes=num_processes) as pool:
-                batch_results = pool.map(run_battle_batch, batches)
-            for batch in batch_results:
-                results.extend(batch)
-        except Exception as e:
-            print(f"Error in parallel execution: {e}")
-            return None, None
+    try:
+        # 使用 spawn 上下文启动进程池，避免死锁
+        ctx = multiprocessing.get_context('spawn')
+        with ctx.Pool(processes=num_processes) as pool:
+            batch_results = pool.map(run_battle_batch, batches)
+        for batch in batch_results:
+            results.extend(batch)
+    except Exception as e:
+        print(f"Error in parallel execution: {e}")
+        return None, None
 
     if not results:
         print("No successful episodes completed!")
@@ -602,47 +606,13 @@ def run_battle(config, strategy_name=None):
     return df, config.run_dir
 
 
-def _run_random_once_suite(config):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    tracker_model = None
-    target_model = None
-    if config.tracker_type == "policy":
-        tracker_model = Model(device, global_model=False)
-        model_dict = torch.load(config.tracker_model_path, map_location=device)
-        tracker_model.network.load_state_dict(model_dict['model'])
-        tracker_model.network.eval()
-    if config.target_type == "policy":
-        target_model = Model(device, global_model=False)
-        model_dict = torch.load(config.target_model_path, map_location=device)
-        target_model.network.load_state_dict(model_dict['model'])
-        target_model.network.eval()
-    policy_manager = PolicyManager()
-    original_strategy = config.specific_target_strategy
-    results = []
-    for episode_idx, strategy in enumerate(policy_manager.get_policies_by_role("target")):
-        config.specific_target_strategy = strategy
-        try:
-            result = run_single_episode(config, episode_idx, tracker_model, target_model, device,
-                                        policy_manager, force_save_gif=True)
-            results.append(result)
-        except Exception as e:
-            print(f"Error in episode {strategy}: {e}")
-            results.append({
-                "episode_id": episode_idx,
-                "steps": 0,
-                "reward": 0.0,
-                "tracker_caught_target": False,
-                "target_reached_exit": False,
-                "tracker_type": config.tracker_type,
-                "target_type": config.target_type,
-                "tracker_strategy": config.specific_tracker_strategy or config.tracker_type,
-                "target_strategy": strategy
-            })
-    config.specific_target_strategy = original_strategy
-    return results
-
-
 if __name__ == "__main__":
+    # 强制设置启动方法为 spawn
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
+
     # Get available strategies dynamically
     available_tracker_strategies = get_available_policies("tracker")
     available_target_strategies = get_available_policies("target")
@@ -665,37 +635,27 @@ Examples:
   # Policy vs Greedy target with no obstacles
   python evaluate.py --tracker policy --target Greedy --tracker_model ./models/tracker.pkl --obstacles none
 
-  # GVF tracker vs all target strategies with dense obstacles (CQB layout)
-  python evaluate.py --tracker CBF --target random --episodes 100 --obstacles dense
-
-  # GVF tracker vs specific target with sparse obstacles
-  python evaluate.py --tracker CBF --target Greedy --episodes 50 --obstacles sparse
+  # GVF tracker vs all target strategies with dense obstacles
+  python evaluate.py --tracker CBF --target all --episodes 100 --obstacles dense
         """
     )
     
-    parser.add_argument('--tracker', type=str, default="CBF",
+    parser.add_argument('--tracker', type=str, default="policy",
                        choices=list(TRACKER_TYPE_CHOICES),
                        help=f'Tracker type: {", ".join(TRACKER_TYPE_CHOICES)}')
-    parser.add_argument('--target', type=str, default="Hiding",
+    parser.add_argument('--target', type=str, default="all",
                        choices=list(TARGET_TYPE_CHOICES),
                        help=f'Target type: {", ".join(TARGET_TYPE_CHOICES)}')
     
-    parser.add_argument('--tracker_strategy', type=str, default=None,
-                       choices=available_tracker_strategies,
-                       help=f'Specific tracker strategy for random mode')
-    parser.add_argument('--target_strategy', type=str, default=None,
-                       choices=available_target_strategies,
-                       help=f'Specific target strategy for random mode')
-    
     parser.add_argument('--tracker_model', type=str, 
-                       default='./models/TrackingEnv/DualAgent07-10-252349/best_model/tracker_net_checkpoint.pkl',
+                       default='./models/TrackingEnv/lstm_ppo_11-24-16-33/best_model/tracker_net_checkpoint.pkl',
                        help='Path to tracker model (required when --tracker=policy)')
     parser.add_argument('--target_model', type=str, default=None,
                        help='Path to target model (required when --target=policy)')
     
-    parser.add_argument('--episodes', type=int, default=1,
+    parser.add_argument('--episodes', type=int, default=10,
                        help='Number of episodes to run')
-    parser.add_argument('--save_gif_freq', type=int, default=1,
+    parser.add_argument('--save_gif_freq', type=int, default=5,
                        help='Save GIF every N episodes (0 to disable)')
     parser.add_argument('--output_dir', type=str, default='./scrimp_battle',
                        help='Output directory for results')
@@ -703,14 +663,11 @@ Examples:
                        help='Random seed')
     parser.add_argument('--state_space', type=str, default='vector',
                        help='State space representation')
-    parser.add_argument('--test_random_once', action='store_true', default=True,
-                       help='Test each strategy once when using random target')
     
     parser.add_argument('--obstacles', type=str, 
                        default=ObstacleDensity.DENSE,
                        choices=ObstacleDensity.ALL_LEVELS,
                        help='Obstacle density level (none/sparse/medium/dense)')
-    # 移除 --layout 相关参数（布局已取消）
     
     args = parser.parse_args()
     
@@ -718,16 +675,7 @@ Examples:
         parser.error("--tracker_model is required when tracker is 'policy'")
     if args.target == 'policy' and args.target_model is None:
         parser.error("--target_model is required when target is 'policy'")
-    if args.tracker == 'random':
-        if args.tracker_strategy and args.tracker_strategy not in TRACKER_POLICY_REGISTRY:
-            parser.error(f"Unsupported tracker strategy: {args.tracker_strategy}")
-    elif args.tracker_strategy is not None:
-        parser.error("--tracker_strategy is only valid when tracker='random'")
-    if args.target == 'random':
-        if args.target_strategy and args.target_strategy not in TARGET_POLICY_REGISTRY:
-            parser.error(f"Unsupported target strategy: {args.target_strategy}")
-    elif args.target_strategy is not None:
-        parser.error("--target_strategy is only valid when target='random'")
+
     config = BattleConfig(
         tracker_type=args.tracker,
         target_type=args.target,
@@ -738,13 +686,10 @@ Examples:
         output_dir=args.output_dir,
         seed=args.seed,
         state_space=args.state_space,
-        specific_tracker_strategy=args.tracker_strategy if args.tracker == 'random' else None,
-        specific_target_strategy=args.target_strategy if args.target == 'random' else None,
-        test_random_once=args.test_random_once,
         obstacle_density=args.obstacles
     )
 
-    if config.tracker_type == "random" or config.target_type == "random":
+    if config.tracker_type == "all" or config.target_type == "all":
         run_strategy_evaluation(config)
     else:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")

@@ -1,13 +1,12 @@
 import importlib
-from typing import Optional, Tuple
-
 import numpy as np
 import torch
+from typing import Optional, Tuple
 from torch.cuda.amp.autocast_mode import autocast
 from torch.cuda.amp.grad_scaler import GradScaler
 
-from alg_parameters import NetParameters, TrainingParameters
-from nets_lstm import ProtectingNetLSTM
+from lstm.alg_parameters import NetParameters, TrainingParameters  # 修改导入
+from lstm.nets_lstm import ProtectingNetLSTM
 
 
 class Model(object):
@@ -300,16 +299,19 @@ class Model(object):
         self.net_scaler.step(self.net_optimizer)
         self.net_scaler.update()
 
-        return [float(total_loss.detach().cpu().numpy()),
-                float(policy_loss.detach().cpu().numpy()),
-                float(entropy.detach().cpu().numpy()),
-                float(value_loss.detach().cpu().numpy()),
-                float(raw_adv_std.detach().cpu().numpy()),
-                float(approx_kl_value.detach().cpu().numpy()),
-                float(value_clip_fraction.detach().cpu().numpy()),
-                float(torch.nan_to_num(clipfrac).detach().cpu().numpy()),
-                float(torch.nan_to_num(grad_norm).detach().cpu().numpy()),
-                float(raw_adv_mean.detach().cpu().numpy())]
+        # 保持返回顺序稳定，便于 driver 里通过 RecordingParameters.LOSS_NAME 映射
+        # index:   0         1             2           3            4               5                 6                    7                     8                 9
+        return [float(total_loss.detach().cpu().numpy()),         # total
+                float(policy_loss.detach().cpu().numpy()),        # policy
+                float(entropy.detach().cpu().numpy()),            # entropy
+                float(value_loss.detach().cpu().numpy()),         # value
+                float(raw_adv_std.detach().cpu().numpy()),        # adv_std (可选)
+                float(approx_kl_value.detach().cpu().numpy()),    # approx_kl
+                float(value_clip_fraction.detach().cpu().numpy()),# value_clip_fraction
+                float(torch.nan_to_num(clipfrac).detach().cpu().numpy()), # clipfrac
+                float(torch.nan_to_num(grad_norm).detach().cpu().numpy()),# grad_norm
+                float(raw_adv_mean.detach().cpu().numpy())]       # adv_mean
+
     def imitation_train(self, actor_obs, critic_obs, optimal_actions):
         if self.net_optimizer is None or self.net_scaler is None:
             raise RuntimeError("Global model required for imitation training.")

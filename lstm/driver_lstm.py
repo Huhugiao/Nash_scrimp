@@ -1,11 +1,13 @@
-import os
+import os, sys
 import os.path as osp
 import math
 import numpy as np
 import torch
 import ray
+from collections import deque   # <-- 新增
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 try:
     import setproctitle
@@ -14,18 +16,14 @@ except Exception:
 
 from torch.utils.tensorboard import SummaryWriter
 
-from alg_parameters import *
+from map_config import EnvParameters
+from lstm.alg_parameters import *  # 修改导入
 from env import TrackingEnv
-from model_lstm import Model
-from runner_lstm import Runner
-from util import set_global_seeds, write_to_tensorboard, write_to_wandb, make_gif, get_opponent_id_one_hot
+from lstm.model_lstm import Model
+from lstm.runner_lstm import Runner
+from util import set_global_seeds, make_gif, get_opponent_id_one_hot
 from rule_policies import TRACKER_POLICY_REGISTRY, TARGET_POLICY_REGISTRY
 from policymanager import PolicyManager
-
-try:
-    import wandb
-except Exception:
-    wandb = None
 
 IL_INITIAL_PROB = 0.8
 IL_FINAL_PROB = 0.1
@@ -42,21 +40,33 @@ NUM_LSTM_LAYERS = 1
 
 if not ray.is_initialized():
     ray.init(num_gpus=SetupParameters.NUM_GPU)
-print("Welcome to SCRIMP with LSTM on Protecting Environment!\n")
-print(f"Training agent: {TrainingParameters.AGENT_TO_TRAIN} with {TrainingParameters.OPPONENT_TYPE} opponent")
+print("Welcome to SCRIMP with LSTM - Training Tracker!\n")
+print(f"Opponent type: {TrainingParameters.OPPONENT_TYPE}")
 print(f"LSTM Configuration: Hidden Size={LSTM_HIDDEN_SIZE}, Layers={NUM_LSTM_LAYERS}")
+
 if TrainingParameters.OPPONENT_TYPE in {"random", "random_nonexpert"}:
-    # 动态打印可用的target策略（来自注册表）
     available = sorted(list(TARGET_POLICY_REGISTRY.keys()))
-    if TrainingParameters.OPPONENT_TYPE == "random":
-        # 若支持专家目标策略，可选地在前面插入
-        pass
-    print("Available target policies:", ", ".join(available))
+    weights = TrainingParameters.RANDOM_OPPONENT_WEIGHTS.get("target", {})
+    
+    print(f"\nMulti-Opponent Configuration:")
+    print(f"  Available target policies: {', '.join(available)}")
+    print(f"  Sampling weights:")
+    for policy_name in available:
+        weight = weights.get(policy_name, 1.0)
+        print(f"    - {policy_name}: {weight}")
+    
+    if TrainingParameters.ADAPTIVE_SAMPLING:
+        print(f"  Adaptive sampling: ENABLED")
+        print(f"    - Window size: {TrainingParameters.ADAPTIVE_SAMPLING_WINDOW}")
+        print(f"    - Min games: {TrainingParameters.ADAPTIVE_SAMPLING_MIN_GAMES}")
+        print(f"    - Strength: {TrainingParameters.ADAPTIVE_SAMPLING_STRENGTH}")
+    else:
+        print(f"  Adaptive sampling: DISABLED")
+
 print(f"IL type: {getattr(TrainingParameters, 'IL_TYPE', 'expert')}")
 print(f"IL probability will cosine anneal from {IL_INITIAL_PROB*100:.1f}% to {IL_FINAL_PROB*100:.1f}% over {IL_DECAY_STEPS} steps")
-# Add explicit notice for APF expert when training tracker
-if TrainingParameters.AGENT_TO_TRAIN == "tracker" and getattr(TrainingParameters, 'IL_TYPE', 'expert') == "expert":
-    print("Imitation teacher (tracker): APF rule policy")
+if getattr(TrainingParameters, 'IL_TYPE', 'expert') == "expert":
+    print("Imitation teacher: APF rule policy")
 
 def_attr = lambda name, default: getattr(RecordingParameters, name, default)
 SUMMARY_PATH = def_attr('SUMMARY_PATH', f'./runs/TrackingEnv/{RecordingParameters.EXPERIMENT_NAME}{RecordingParameters.TIME}')
@@ -76,7 +86,6 @@ all_args = {
     'max_steps': TrainingParameters.N_MAX_STEPS,
     'episode_len': EnvParameters.EPISODE_LEN,
     'n_actions': EnvParameters.N_ACTIONS,
-    'agent_to_train': TrainingParameters.AGENT_TO_TRAIN,
     'opponent_type': TrainingParameters.OPPONENT_TYPE,
     'il_type': getattr(TrainingParameters, 'IL_TYPE', 'expert'),
     'il_initial_prob': IL_INITIAL_PROB,
@@ -227,33 +236,66 @@ def compute_performance_stats(performance_dict):
     return stats
 
 
+def format_train_log(curr_steps, curr_episodes, phase, il_prob,
+                     train_stats, avg_losses, recent_window_stats):
+    """
+    生成单行训练日志字符串，便于在 terminal 中观察。
+    phase: 'IL' or 'RL'
+    train_stats: compute_performance_stats 返回的 dict
+    avg_losses:  PPO loss 向量或 None（IL 阶段为 None）
+    recent_window_stats: 最近若干 iteration 的滑动平均（dict），可为 None
+    """
+    parts = [
+        f"[{phase}] step={curr_steps:,}",
+        f"ep={curr_episodes:,}",
+        f"ILp={il_prob*100:5.1f}%"
+    ]
+
+    # 性能指标（本 iteration）
+    if train_stats:
+        r_mean = train_stats.get('per_r_mean', 0.0)
+        r_std = train_stats.get('per_r_std', 0.0)
+        win_mean = train_stats.get('win_mean', 0.0)
+        parts.append(f"R={r_mean:7.3f}±{r_std:5.2f}")
+        if win_mean > 0.0:
+            parts.append(f"Win={win_mean*100:5.1f}%")
+
+    # 损失（仅 RL / PPO）
+    if avg_losses is not None:
+        names = RecordingParameters.LOSS_NAME
+        for idx, val in enumerate(avg_losses):
+            if idx < len(names):
+                parts.append(f"{names[idx]}={val:7.4f}")
+
+    # 滑动平均（更稳定的观测）
+    if recent_window_stats:
+        r_w = recent_window_stats.get('per_r_mean', None)
+        win_w = recent_window_stats.get('win_mean', None)
+        if r_w is not None:
+            parts.append(f"[R@{recent_window_stats['window']}it]={r_w:7.3f}")
+        if win_w is not None:
+            parts.append(f"[Win@{recent_window_stats['window']}it]={win_w*100:5.1f}%")
+
+    return " | ".join(parts)
+
+
 def main():
     model_dict = None
-    wandb_id = None
 
     if def_attr('RETRAIN', False):
         restore_path = def_attr('RESTORE_DIR', None)
         if restore_path:
-            model_path = restore_path + f"/{TrainingParameters.AGENT_TO_TRAIN}_net_checkpoint.pkl"
+            model_path = restore_path + "/tracker_net_checkpoint.pkl"
             if os.path.exists(model_path):
                 model_dict = torch.load(model_path, map_location='cpu')
 
-    if def_attr('WANDB', False) and wandb is not None:
-        wandb_id = model_dict.get('wandb_id', None) if model_dict else None
-        wandb.init(project=RecordingParameters.EXPERIMENT_PROJECT,
-                   name=RecordingParameters.EXPERIMENT_NAME,
-                   entity=getattr(RecordingParameters, 'ENTITY', None),
-                   notes=getattr(RecordingParameters, 'EXPERIMENT_NOTE', ''),
-                   config=all_args,
-                   id=wandb_id,
-                   resume='allow')
-        print('Launching wandb...\n')
-
     global_summary = None
     if def_attr('TENSORBOARD', True):
-        os.makedirs(SUMMARY_PATH, exist_ok=True)
-        global_summary = SummaryWriter(SUMMARY_PATH)
-        print('Launching tensorboard...\n')
+        # 日志目录强制绑到 MODEL_PATH 下，保证模型与 tfevents 在一起
+        tb_dir = osp.join(MODEL_PATH, "tfevents")
+        os.makedirs(tb_dir, exist_ok=True)
+        global_summary = SummaryWriter(tb_dir)
+        print(f'Launching tensorboard at: {tb_dir}\n')
 
     if setproctitle is not None:
         setproctitle.setproctitle(
@@ -271,27 +313,28 @@ def main():
     opponent_weights = None
     if TrainingParameters.OPPONENT_TYPE == "policy":
         opponent_model = Model(global_device, False, lstm_hidden_size=LSTM_HIDDEN_SIZE, num_lstm_layers=NUM_LSTM_LAYERS)
-        if TrainingParameters.AGENT_TO_TRAIN == "tracker":
-            opp_path = SetupParameters.PRETRAINED_TARGET_PATH
-        else:
-            opp_path = SetupParameters.PRETRAINED_TRACKER_PATH
+        opp_path = SetupParameters.PRETRAINED_TARGET_PATH
         if opp_path and os.path.exists(opp_path):
             opponent_dict = torch.load(opp_path, map_location='cpu')
             opponent_model.network.load_state_dict(opponent_dict['model'])
             opponent_weights = opponent_model.get_weights()
 
-    env_mission = 0 if TrainingParameters.AGENT_TO_TRAIN == "tracker" else 1
-
+    # 固定mission=0 (tracker训练)
     global_policy_manager = None
     if TrainingParameters.OPPONENT_TYPE in {"random", "random_nonexpert"} and TrainingParameters.ADAPTIVE_SAMPLING:
         global_policy_manager = PolicyManager()
 
-    envs = [Runner.remote(i + 1, env_mission) for i in range(TrainingParameters.N_ENVS)]
-    eval_env = TrackingEnv(mission=env_mission)
+    envs = [Runner.remote(i + 1) for i in range(TrainingParameters.N_ENVS)]
+    eval_env = TrackingEnv()
 
     curr_steps = int(model_dict.get("step", 0)) if model_dict is not None else 0
     curr_episodes = int(model_dict.get("episode", 0)) if model_dict is not None else 0
     best_perf = float(model_dict.get("reward", -1e9)) if model_dict is not None else -1e9
+
+    # 最近若干 iteration 的滑动窗口，用于更平滑的统计
+    RECENT_WINDOW_ITERS = 20
+    recent_rewards = deque(maxlen=RECENT_WINDOW_ITERS)
+    recent_wins = deque(maxlen=RECENT_WINDOW_ITERS)
 
     last_test_t = -int(EVAL_INTERVAL) - 1
     last_model_t = -int(SAVE_INTERVAL) - 1
@@ -311,10 +354,10 @@ def main():
             do_il = (np.random.rand() < il_prob)
 
             weights = training_model.get_weights()
-
             performance_dict = {'per_r': [], 'per_episode_len': [], 'win': []}
 
             if do_il:
+                # ---------------- IL / 模仿阶段 ----------------
                 jobs = [e.imitation.remote(weights, opponent_weights, curr_steps) for e in envs]
                 il_batches = ray.get(jobs)
                 actor_vec = np.concatenate([b['actor_obs'] for b in il_batches], axis=0)
@@ -336,7 +379,6 @@ def main():
                             actor_vec[start:end], critic_vec[start:end], lbl[start:end]
                         )
                         if not np.all(np.isfinite(loss_result)):
-                            print(f"[WARN] 非有限模仿损失，跳过该 batch（step={curr_steps}）")
                             continue
                         mb_loss.append(loss_result)
                 if global_summary and mb_loss:
@@ -346,7 +388,35 @@ def main():
                         global_summary.add_scalar('Train/imitation_loss', avg_il_loss, curr_steps)
                 curr_steps += int(TrainingParameters.N_ENVS * TrainingParameters.N_STEPS)
                 curr_episodes += total_il_episodes
+
+                # 本 iteration 统计
+                train_stats = compute_performance_stats(performance_dict)
+                # 记录滑动窗口
+                if len(performance_dict['per_r']) > 0:
+                    recent_rewards.append(train_stats['per_r_mean'])
+                if len(performance_dict.get('win', [])) > 0:
+                    recent_wins.append(train_stats['win_mean'])
+
+                # 构造滑动窗口统计
+                recent_window_stats = None
+                if len(recent_rewards) > 0:
+                    recent_window_stats = {
+                        'window': len(recent_rewards),
+                        'per_r_mean': float(np.mean(recent_rewards)),
+                        'win_mean': float(np.mean(recent_wins)) if recent_wins else None,
+                    }
+
+                # terminal 打印：IL 不带 PPO 损失
+                print(format_train_log(
+                    curr_steps, curr_episodes, phase="IL",
+                    il_prob=il_prob,
+                    train_stats=train_stats,
+                    avg_losses=None,
+                    recent_window_stats=recent_window_stats
+                ))
+
             else:
+                # ---------------- RL / PPO 阶段 ----------------
                 pm_state = global_policy_manager.win_history if global_policy_manager else None
                 if TrainingParameters.OPPONENT_TYPE in {"random", "random_nonexpert"}:
                     jobs = [e.run.remote(weights, opponent_weights, curr_steps, pm_state) for e in envs]
@@ -421,9 +491,33 @@ def main():
                 curr_steps += steps_batch
                 curr_episodes += episodes_batch
 
-            train_stats = compute_performance_stats(performance_dict)
-            avg_perf_for_best = train_stats.get('per_r_mean', -1e9)
+                train_stats = compute_performance_stats(performance_dict)
+                avg_perf_for_best = train_stats.get('per_r_mean', -1e9)
 
+                # 维护滑动窗口
+                if len(performance_dict['per_r']) > 0:
+                    recent_rewards.append(train_stats['per_r_mean'])
+                if len(performance_dict.get('win', [])) > 0:
+                    recent_wins.append(train_stats['win_mean'])
+                recent_window_stats = None
+                if len(recent_rewards) > 0:
+                    recent_window_stats = {
+                        'window': len(recent_rewards),
+                        'per_r_mean': float(np.mean(recent_rewards)),
+                        'win_mean': float(np.mean(recent_wins)) if recent_wins else None,
+                    }
+
+                # terminal 打印：RL 阶段带 PPO loss
+                print(format_train_log(
+                    curr_steps, curr_episodes, phase="RL",
+                    il_prob=il_prob,
+                    train_stats=train_stats,
+                    avg_losses=(np.nanmean(valid_losses, axis=0) if valid_losses else None),
+                    recent_window_stats=recent_window_stats
+                ))
+
+            # ------------ 公共逻辑：TensorBoard / 保存 / Eval / GIF ------------
+            # 注意：上面 IL/ RL 分支都已经得到 train_stats / avg_perf_for_best
             if global_summary:
                 for key, value in train_stats.items():
                     global_summary.add_scalar(f'Train/{key}', value, curr_steps)
@@ -432,7 +526,7 @@ def main():
                 last_model_t = curr_steps
                 model_path = osp.join(MODEL_PATH, 'latest')
                 os.makedirs(model_path, exist_ok=True)
-                save_path = model_path + f"/{TrainingParameters.AGENT_TO_TRAIN}_net_checkpoint.pkl"
+                save_path = model_path + "/tracker_net_checkpoint.pkl"
                 checkpoint = {"model": training_model.network.state_dict(),
                               "optimizer": training_model.net_optimizer.state_dict(),
                               "step": curr_steps, "episode": curr_episodes, "reward": avg_perf_for_best}
@@ -443,7 +537,7 @@ def main():
                 last_best_t = curr_steps
                 model_path = osp.join(MODEL_PATH, 'best_model')
                 os.makedirs(model_path, exist_ok=True)
-                save_path = model_path + f"/{TrainingParameters.AGENT_TO_TRAIN}_net_checkpoint.pkl"
+                save_path = model_path + "/tracker_net_checkpoint.pkl"
                 checkpoint = {"model": training_model.network.state_dict(),
                               "optimizer": training_model.net_optimizer.state_dict(),
                               "step": curr_steps, "episode": curr_episodes, "reward": best_perf}
@@ -453,6 +547,11 @@ def main():
             if curr_steps - last_test_t >= EVAL_INTERVAL:
                 last_test_t = curr_steps
                 eval_stats = evaluate_single_agent(eval_env, training_model, opponent_model, global_device)
+                # terminal eval 打印
+                msg_parts = [f"[EVAL] step={curr_steps:,}"]
+                for k, v in eval_stats.items():
+                    msg_parts.append(f"{k}={v:7.3f}")
+                print(" | ".join(msg_parts))
                 if global_summary:
                     for key, value in eval_stats.items():
                         global_summary.add_scalar(f'Eval/{key}', value, curr_steps)
@@ -461,7 +560,6 @@ def main():
                 last_gif_t = curr_steps
                 generate_one_episode_gif(eval_env, training_model, opponent_model, global_device, curr_steps)
                 print(f"GIF saved for step {curr_steps}")
-
     except KeyboardInterrupt:
         print("CTRL-C pressed. killing remote workers")
     finally:
@@ -469,7 +567,7 @@ def main():
         model_path = MODEL_PATH + '/final'
         if not os.path.exists(model_path):
             os.makedirs(model_path, exist_ok=True)
-        save_path = model_path + f"/{TrainingParameters.AGENT_TO_TRAIN}_net_checkpoint.pkl"
+        save_path = model_path + "/tracker_net_checkpoint.pkl"
         checkpoint = {"model": training_model.network.state_dict(),
                       "optimizer": training_model.net_optimizer.state_dict(),
                       "step": curr_steps, "episode": curr_episodes, "reward": best_perf}
@@ -478,44 +576,26 @@ def main():
         ray.shutdown()
 
 
-def get_opponent_action_for_eval(actor_obs, critic_obs, opponent_type, agent_to_train, opponent_model,
-                                  policy_manager, current_policy_name, current_policy_id, opponent_hidden=None):
+def get_opponent_action_for_eval(target_obs, opponent_type, opponent_model,
+                                  policy_manager, current_policy_name, current_policy_id, opponent_hidden=None,
+                                  privileged_state=None):
+    """评估时获取对手(target)动作"""
     if opponent_type == "policy":
         if opponent_model is None:
             raise RuntimeError("OPPONENT_TYPE=policy but opponent_model is None")
-        opp_action, _, new_opponent_hidden, _, _ = opponent_model.evaluate(actor_obs, critic_obs, opponent_hidden, greedy=True)
+        dummy_context = np.zeros(NetParameters.CONTEXT_LEN, dtype=np.float32)
+        critic_obs = np.concatenate([target_obs, dummy_context])
+        opp_action, _, new_opponent_hidden, _, _ = opponent_model.evaluate(target_obs, critic_obs, opponent_hidden, greedy=True)
         return opp_action, new_opponent_hidden
-    elif opponent_type == "expert":
-        if agent_to_train == "tracker":
-            default_target = sorted(TARGET_POLICY_REGISTRY.keys())[0]
-            policy_cls = TARGET_POLICY_REGISTRY.get(default_target)
-            if policy_cls:
-                policy_obj = policy_cls()
-                opp_pair = policy_obj.get_action(actor_obs)
-            else:
-                raise ValueError("No target policy found")
-        else:
-            default_tracker = sorted(TRACKER_POLICY_REGISTRY.keys())[0]
-            policy_fn = TRACKER_POLICY_REGISTRY.get(default_tracker)
-            if policy_fn:
-                opp_pair = policy_fn(actor_obs)
-            else:
-                raise ValueError("No tracker policy found")
-        return opp_pair, None
+        
     elif opponent_type in {"random", "random_nonexpert"}:
         if policy_manager and current_policy_name:
-            opp_pair = policy_manager.get_action(current_policy_name, actor_obs)
+            opp_pair = policy_manager.get_action(current_policy_name, target_obs, privileged_state)
         else:
-            # 回退到默认策略
-            if agent_to_train == "tracker":
-                default_target = sorted(TARGET_POLICY_REGISTRY.keys())[0]
-                policy_cls = TARGET_POLICY_REGISTRY.get(default_target)
-                policy_obj = policy_cls()
-                opp_pair = policy_obj.get_action(actor_obs)
-            else:
-                default_tracker = sorted(TRACKER_POLICY_REGISTRY.keys())[0]
-                policy_fn = TRACKER_POLICY_REGISTRY.get(default_tracker)
-                opp_pair = policy_fn(actor_obs)
+            default_target = sorted(TARGET_POLICY_REGISTRY.keys())[0]
+            policy_cls = TARGET_POLICY_REGISTRY.get(default_target)
+            policy_obj = policy_cls()
+            opp_pair = policy_obj.get_action(target_obs)
         return opp_pair, None
     else:
         raise ValueError(f"Unsupported OPPONENT_TYPE: {opponent_type}")
@@ -546,38 +626,21 @@ def evaluate_single_agent(eval_env, agent_model, opponent_model, device):
 
         current_policy_name, current_policy_id = (None, -1)
         if eval_policy_manager:
-            opponent_role = "target" if TrainingParameters.AGENT_TO_TRAIN == "tracker" else "tracker"
-            current_policy_name, current_policy_id = eval_policy_manager.sample_policy(opponent_role)
+            current_policy_name, current_policy_id = eval_policy_manager.sample_policy("target")
             eval_policy_manager.reset()
 
         while not done and ep_len < EnvParameters.EPISODE_LEN:
-            # 训练tracker：agent使用tracker_obs；对手使用target_obs
-            if TrainingParameters.AGENT_TO_TRAIN == "tracker":
-                critic_obs_full = np.concatenate([tracker_obs, get_opponent_id_one_hot(current_policy_id)])
-                agent_action, _, agent_hidden, _, _ = agent_model.evaluate(tracker_obs, critic_obs_full, agent_hidden, greedy=True)
+            # Agent(tracker)动作
+            critic_obs_full = np.concatenate([tracker_obs, get_opponent_id_one_hot(current_policy_id)])
+            agent_action, _, agent_hidden, _, _ = agent_model.evaluate(tracker_obs, critic_obs_full, agent_hidden, greedy=True)
 
-                # 对手动作
-                opp_actor_obs = target_obs
-                opp_pair, opponent_hidden = get_opponent_action_for_eval(
-                    opp_actor_obs, opp_actor_obs, TrainingParameters.OPPONENT_TYPE, TrainingParameters.AGENT_TO_TRAIN,
-                    opponent_model, eval_policy_manager, current_policy_name, current_policy_id, opponent_hidden
-                )
+            # 对手(target)动作
+            target_action, opponent_hidden = get_opponent_action_for_eval(
+                target_obs, TrainingParameters.OPPONENT_TYPE,
+                opponent_model, eval_policy_manager, current_policy_name, current_policy_id, opponent_hidden
+            )
 
-                tracker_action, target_action = agent_action, opp_pair
-            else:
-                # 训练target（注意：当前网络的ACTOR_VECTOR_LEN=27，目标观测24，仅保留逻辑以防将来扩展）
-                critic_obs_full = np.concatenate([target_obs, get_opponent_id_one_hot(current_policy_id)])
-                agent_action, _, agent_hidden, _, _ = agent_model.evaluate(target_obs, critic_obs_full, agent_hidden, greedy=True)
-
-                opp_actor_obs = tracker_obs
-                opp_pair, opponent_hidden = get_opponent_action_for_eval(
-                    opp_actor_obs, opp_actor_obs, TrainingParameters.OPPONENT_TYPE, TrainingParameters.AGENT_TO_TRAIN,
-                    opponent_model, eval_policy_manager, current_policy_name, current_policy_id, opponent_hidden
-                )
-
-                tracker_action, target_action = opp_pair, agent_action
-
-            obs_result, reward, terminated, truncated, info = eval_env.step((tracker_action, target_action))
+            obs_result, reward, terminated, truncated, info = eval_env.step((agent_action, target_action))
             done = terminated or truncated
             ep_r += float(reward)
             ep_len += 1
@@ -625,8 +688,7 @@ def generate_one_episode_gif(eval_env, agent_model, opponent_model, device, curr
     eval_policy_manager = PolicyManager() if TrainingParameters.OPPONENT_TYPE in {"random", "random_nonexpert"} else None
     current_policy_name, current_policy_id = (None, -1)
     if eval_policy_manager:
-        opponent_role = "target" if TrainingParameters.AGENT_TO_TRAIN == "tracker" else "tracker"
-        current_policy_name, current_policy_id = eval_policy_manager.sample_policy(opponent_role)
+        current_policy_name, current_policy_id = eval_policy_manager.sample_policy("target")
         eval_policy_manager.reset()
 
     while not done and ep_len < EnvParameters.EPISODE_LEN:
@@ -634,22 +696,15 @@ def generate_one_episode_gif(eval_env, agent_model, opponent_model, device, curr
         if frame is not None:
             episode_frames.append(frame)
 
-        if TrainingParameters.AGENT_TO_TRAIN == "tracker":
-            critic_obs_full = np.concatenate([tracker_obs, get_opponent_id_one_hot(current_policy_id)])
-            agent_action, _, agent_hidden, _, _ = agent_model.evaluate(tracker_obs, critic_obs_full, agent_hidden, greedy=True)
-            opp_actor_obs = target_obs
-        else:
-            critic_obs_full = np.concatenate([target_obs, get_opponent_id_one_hot(current_policy_id)])
-            agent_action, _, agent_hidden, _, _ = agent_model.evaluate(target_obs, critic_obs_full, agent_hidden, greedy=True)
-            opp_actor_obs = tracker_obs
+        critic_obs_full = np.concatenate([tracker_obs, get_opponent_id_one_hot(current_policy_id)])
+        agent_action, _, agent_hidden, _, _ = agent_model.evaluate(tracker_obs, critic_obs_full, agent_hidden, greedy=True)
 
-        opp_pair, opponent_hidden = get_opponent_action_for_eval(
-            opp_actor_obs, opp_actor_obs, TrainingParameters.OPPONENT_TYPE, TrainingParameters.AGENT_TO_TRAIN,
+        target_action, opponent_hidden = get_opponent_action_for_eval(
+            target_obs, TrainingParameters.OPPONENT_TYPE,
             opponent_model, eval_policy_manager, current_policy_name, current_policy_id, opponent_hidden
         )
 
-        tracker_action, target_action = (agent_action, opp_pair) if TrainingParameters.AGENT_TO_TRAIN == "tracker" else (opp_pair, agent_action)
-        obs_result, reward, terminated, truncated, info = eval_env.step((tracker_action, target_action))
+        obs_result, reward, terminated, truncated, info = eval_env.step((agent_action, target_action))
         done = terminated or truncated
         ep_len += 1
         
@@ -667,7 +722,3 @@ def generate_one_episode_gif(eval_env, agent_model, opponent_model, device, curr
         gif_path = osp.join(GIFS_PATH, f"eval_{int(curr_steps)}.gif")
         os.makedirs(GIFS_PATH, exist_ok=True)
         make_gif(episode_frames, gif_path, fps=30)
-
-# === add this entrypoint ===
-if __name__ == "__main__":
-    main()

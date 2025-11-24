@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from alg_parameters import EnvParameters, NetParameters
+from lstm.alg_parameters import EnvParameters, NetParameters
 
 
 class ProtectingNetLSTM(nn.Module):

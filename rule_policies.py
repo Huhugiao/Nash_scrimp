@@ -6,7 +6,7 @@ import math
 import numpy as np
 import heapq
 import map_config
-from model_lstm import Model
+from lstm.model_lstm import Model  # 修正导入路径
 import env_lib
 from cbf_controller import CBFTracker, apply_hard_mask
 from map_config import EnvParameters
@@ -699,6 +699,32 @@ class DWATarget:
         return 1.0 / min_dist
 
 
+class RandomTarget:
+    """
+    Random target policy: Moves with random steering (Brownian-like motion).
+    - Direction: Randomly changes heading within max turn limits.
+    - Speed: Constant max speed.
+    - Obstacle Avoidance: Relies on hard mask.
+    """
+    def __init__(self):
+        pass
+
+    def reset(self):
+        pass
+
+    def get_action(self, observation):
+        parsed = _parse_observation(observation)
+        if parsed.get('obs_type') != 'target':
+            raise ValueError("Random target policy requires target observation")
+        
+        # Random steering: [-1.0, 1.0] corresponds to [-max_turn, max_turn]
+        angle_norm = float(np.random.uniform(-1.0, 1.0))
+        speed_norm = 1.0 # Full speed
+        
+        raw_action = (angle_norm, speed_norm)
+        return apply_hard_mask_adapter(raw_action, parsed, role='target')
+
+
 # ============================================================================
 # Register Policies
 # ============================================================================
@@ -711,5 +737,6 @@ TARGET_POLICY_REGISTRY = {
     "Greedy": GreedyTarget,
     "APF": APFTarget,
     "DWA": DWATarget,
-    "Hiding": HidingAStarTarget
+    "Hiding": HidingAStarTarget,
+    "Random": RandomTarget
 }

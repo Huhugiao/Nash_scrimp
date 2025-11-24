@@ -6,7 +6,7 @@ import numpy as np
 import cvxpy as cp
 import math
 import map_config
-from model_lstm import Model
+from lstm.model_lstm import Model
 from map_config import EnvParameters
 
 

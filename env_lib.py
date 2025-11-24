@@ -205,7 +205,7 @@ def ray_distances_multi(origin, angles_rad, max_range, padding=0.0):
     return np.array([ray_distance_grid(origin, ang, max_range, padding) for ang in angles_rad],
                     dtype=np.float32)
 
-def reward_calculate(tracker, target, mission=0, tracker_collision=False, target_collision=False,
+def reward_calculate(tracker, target, tracker_collision=False, target_collision=False,
                      sector_captured=False, capture_progress=0, capture_required_steps=0):
     info = {
         'capture_progress': int(capture_progress),
@@ -213,19 +213,47 @@ def reward_calculate(tracker, target, mission=0, tracker_collision=False, target
         'tracker_collision': bool(tracker_collision),
         'target_collision': bool(target_collision)
     }
+
+    # --- Dense shaping 部分（每步）---
     reward = 0.0
     terminated = False
+
+    try:
+        # 1) 距离 shaping：越近越好
+        dx = (tracker['x'] + map_config.pixel_size * 0.5) - (target['x'] + map_config.pixel_size * 0.5)
+        dy = (tracker['y'] + map_config.pixel_size * 0.5) - (target['y'] + map_config.pixel_size * 0.5)
+        dist = math.hypot(dx, dy)
+
+        max_ref_dist = float(getattr(map_config.EnvParameters, 'FOV_RANGE', max(map_config.width, map_config.height)))
+        d_norm = max(0.0, min(dist / max_ref_dist, 1.0))  # [0,1]
+        w_dist = 0.02  # 距离奖励权重（可调）
+        reward += w_dist * (1.0 - d_norm)
+
+        # 2) 捕获进度 shaping：在捕获扇区内时稍微加分
+        if capture_required_steps > 0 and capture_progress > 0:
+            frac = float(capture_progress) / float(capture_required_steps)
+            frac = max(0.0, min(frac, 1.0))
+            w_cap = 0.05  # 捕获进度奖励权重（可调）
+            reward += w_cap * frac
+
+    except Exception:
+        # 任何异常不影响主流程
+        pass
+
+    # 3) 时间惩罚：鼓励更快结束
+    time_penalty = 0.001  # 每步小惩罚（可调）
+    reward -= time_penalty
+
+    # --- 终局奖励部分（与原逻辑保持一致，只是参数化）---
+    success_reward = float(getattr(map_config, 'success_reward', 20.0))
 
     if sector_captured:
         terminated = True
         info['reason'] = 'tracker_caught_target'
-        reward = 20.0
-    elif mission == 0 and tracker_collision:
+        reward += success_reward
+    elif tracker_collision:
         terminated = True
-        reward = -20.0
-    elif mission == 1 and target_collision:
-        terminated = True
-        reward = -20.0
+        reward -= success_reward
 
     return float(reward), bool(terminated), False, info
 
