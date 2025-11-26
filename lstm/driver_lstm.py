@@ -1,4 +1,8 @@
 import os, sys
+# 新增：防止 Ray Worker 中 cvxpy/numpy 的 OpenMP 线程死锁
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 import os.path as osp
 import math
 import numpy as np
@@ -29,7 +33,7 @@ IL_INITIAL_PROB = 0.8
 IL_FINAL_PROB = 0.1
 IL_DECAY_STEPS = 1e7
 
-PURE_RL_SWITCH = 1
+PURE_RL_SWITCH = 0
 if PURE_RL_SWITCH:
     IL_INITIAL_PROB = 0
     IL_FINAL_PROB = 0
@@ -66,7 +70,8 @@ if TrainingParameters.OPPONENT_TYPE in {"random", "random_nonexpert"}:
 print(f"IL type: {getattr(TrainingParameters, 'IL_TYPE', 'expert')}")
 print(f"IL probability will cosine anneal from {IL_INITIAL_PROB*100:.1f}% to {IL_FINAL_PROB*100:.1f}% over {IL_DECAY_STEPS} steps")
 if getattr(TrainingParameters, 'IL_TYPE', 'expert') == "expert":
-    print("Imitation teacher: APF rule policy")
+    # 原来是 APF，这里改成 CBF
+    print("Imitation teacher: CBF tracker policy")
 
 def_attr = lambda name, default: getattr(RecordingParameters, name, default)
 SUMMARY_PATH = def_attr('SUMMARY_PATH', f'./runs/TrackingEnv/{RecordingParameters.EXPERIMENT_NAME}{RecordingParameters.TIME}')
@@ -237,13 +242,14 @@ def compute_performance_stats(performance_dict):
 
 
 def format_train_log(curr_steps, curr_episodes, phase, il_prob,
-                     train_stats, avg_losses, recent_window_stats):
+                     train_stats, avg_losses, recent_window_stats, il_loss=None):
     """
     生成单行训练日志字符串，便于在 terminal 中观察。
     phase: 'IL' or 'RL'
     train_stats: compute_performance_stats 返回的 dict
     avg_losses:  PPO loss 向量或 None（IL 阶段为 None）
     recent_window_stats: 最近若干 iteration 的滑动平均（dict），可为 None
+    il_loss: IL 阶段的 loss (新增)
     """
     parts = [
         f"[{phase}] step={curr_steps:,}",
@@ -266,6 +272,10 @@ def format_train_log(curr_steps, curr_episodes, phase, il_prob,
         for idx, val in enumerate(avg_losses):
             if idx < len(names):
                 parts.append(f"{names[idx]}={val:7.4f}")
+    
+    # 新增：IL Loss
+    if il_loss is not None:
+        parts.append(f"IL_Loss={il_loss:7.4f}")
 
     # 滑动平均（更稳定的观测）
     if recent_window_stats:
@@ -330,6 +340,7 @@ def main():
     curr_steps = int(model_dict.get("step", 0)) if model_dict is not None else 0
     curr_episodes = int(model_dict.get("episode", 0)) if model_dict is not None else 0
     best_perf = float(model_dict.get("reward", -1e9)) if model_dict is not None else -1e9
+    avg_perf_for_best = best_perf
 
     # 最近若干 iteration 的滑动窗口，用于更平滑的统计
     RECENT_WINDOW_ITERS = 20
@@ -343,6 +354,13 @@ def main():
 
     os.makedirs(MODEL_PATH, exist_ok=True)
     os.makedirs(GIFS_PATH, exist_ok=True)
+
+    # 新增：控制 train 打印频率
+    last_train_log_t = 0
+    # 累积一个“逻辑 epoch”内的统计
+    epoch_perf_buffer = {'per_r': [], 'per_episode_len': [], 'win': []}
+    epoch_loss_buffer = []   # 累积 RL loss（IL 不一定有）
+    epoch_il_loss_buffer = [] # 新增：累积 IL loss
 
     try:
         while curr_steps < TrainingParameters.N_MAX_STEPS:
@@ -368,6 +386,7 @@ def main():
                     perf = batch['performance']
                     performance_dict['per_r'].extend(perf.get('per_r', []))
                     performance_dict['per_episode_len'].extend(perf.get('per_episode_len', []))
+                    performance_dict['win'].extend(perf.get('win', [])) # 新增：提取 win
                     total_il_episodes += batch.get('episodes', 0)
                 idx = np.random.permutation(len(actor_vec))
                 actor_vec, critic_vec, lbl = actor_vec[idx], critic_vec[idx], lbl[idx]
@@ -386,34 +405,21 @@ def main():
                     if valid_il_losses:
                         avg_il_loss = np.nanmean([loss[0] for loss in valid_il_losses])
                         global_summary.add_scalar('Train/imitation_loss', avg_il_loss, curr_steps)
+                        epoch_il_loss_buffer.append(avg_il_loss) # 新增：记录 IL loss
                 curr_steps += int(TrainingParameters.N_ENVS * TrainingParameters.N_STEPS)
                 curr_episodes += total_il_episodes
 
-                # 本 iteration 统计
+                # 只更新统计缓冲，不立即打印
                 train_stats = compute_performance_stats(performance_dict)
-                # 记录滑动窗口
                 if len(performance_dict['per_r']) > 0:
                     recent_rewards.append(train_stats['per_r_mean'])
                 if len(performance_dict.get('win', [])) > 0:
                     recent_wins.append(train_stats['win_mean'])
 
-                # 构造滑动窗口统计
-                recent_window_stats = None
-                if len(recent_rewards) > 0:
-                    recent_window_stats = {
-                        'window': len(recent_rewards),
-                        'per_r_mean': float(np.mean(recent_rewards)),
-                        'win_mean': float(np.mean(recent_wins)) if recent_wins else None,
-                    }
-
-                # terminal 打印：IL 不带 PPO 损失
-                print(format_train_log(
-                    curr_steps, curr_episodes, phase="IL",
-                    il_prob=il_prob,
-                    train_stats=train_stats,
-                    avg_losses=None,
-                    recent_window_stats=recent_window_stats
-                ))
+                # 累积到 epoch buffer
+                epoch_perf_buffer['per_r'].extend(performance_dict['per_r'])
+                epoch_perf_buffer['per_episode_len'].extend(performance_dict['per_episode_len'])
+                epoch_perf_buffer['win'].extend(performance_dict['win']) # 新增：累积 win
 
             else:
                 # ---------------- RL / PPO 阶段 ----------------
@@ -445,7 +451,6 @@ def main():
                     performance_dict['win'].extend(perf.get('win', []))
 
                 if not segments:
-                    print(f"[WARN] 无有效段落，跳过该轮训练（step={curr_steps}）")
                     curr_steps += steps_batch
                     curr_episodes += episodes_batch
                     continue
@@ -474,7 +479,6 @@ def main():
                             batch['mask'], batch['episode_starts']
                         )
                         if not np.all(np.isfinite(loss_result)):
-                            print(f"[WARN] 非有限损失，跳过该 batch（step={curr_steps}）")
                             continue
                         mb_loss.append(loss_result)
                 valid_losses = [loss for loss in mb_loss if np.all(np.isfinite(loss))]
@@ -499,6 +503,38 @@ def main():
                     recent_rewards.append(train_stats['per_r_mean'])
                 if len(performance_dict.get('win', [])) > 0:
                     recent_wins.append(train_stats['win_mean'])
+
+                # 累积 epoch 统计和 loss（用于低频打印）
+                epoch_perf_buffer['per_r'].extend(performance_dict['per_r'])
+                epoch_perf_buffer['per_episode_len'].extend(performance_dict['per_episode_len'])
+                epoch_perf_buffer['win'].extend(performance_dict['win'])
+                if valid_losses:
+                    epoch_loss_buffer.extend(valid_losses)
+
+            # ------------ 公共逻辑：TensorBoard / 保存 / Eval / GIF ------------
+            # 这里的 train_stats/avg_perf_for_best 只在 RL 分支定义，
+            # 对 IL 分支，我们只在 tensorboard 中记录 performance，不参与 best model。
+            if global_summary and 'train_stats' in locals():
+                for key, value in train_stats.items():
+                    global_summary.add_scalar(f'Train/{key}', value, curr_steps)
+
+            # 每个“逻辑 epoch”打印一次 train 概要（混合 IL / RL）
+            if curr_steps - last_train_log_t >= TrainingParameters.LOG_EPOCH_STEPS:
+                last_train_log_t = curr_steps
+
+                # 统计 epoch 内的平均性能
+                epoch_stats = compute_performance_stats(epoch_perf_buffer)
+                # 统计 epoch 内的平均 loss（只看 RL，有可能为空）
+                avg_epoch_losses = None
+                if epoch_loss_buffer:
+                    avg_epoch_losses = np.nanmean(epoch_loss_buffer, axis=0)
+                
+                # 新增：统计 epoch 内的平均 IL loss
+                avg_epoch_il_loss = None
+                if epoch_il_loss_buffer:
+                    avg_epoch_il_loss = float(np.mean(epoch_il_loss_buffer))
+
+                # 使用最近窗口（recent_rewards / recent_wins）给出平滑指标
                 recent_window_stats = None
                 if len(recent_rewards) > 0:
                     recent_window_stats = {
@@ -507,21 +543,23 @@ def main():
                         'win_mean': float(np.mean(recent_wins)) if recent_wins else None,
                     }
 
-                # terminal 打印：RL 阶段带 PPO loss
+                # phase 只用于标记当前 IL 概率下的大致训练状态
+                phase = "IL" if il_prob > 0.5 else "RL"
                 print(format_train_log(
-                    curr_steps, curr_episodes, phase="RL",
+                    curr_steps, curr_episodes, phase=phase,
                     il_prob=il_prob,
-                    train_stats=train_stats,
-                    avg_losses=(np.nanmean(valid_losses, axis=0) if valid_losses else None),
-                    recent_window_stats=recent_window_stats
+                    train_stats=epoch_stats,
+                    avg_losses=avg_epoch_losses,
+                    recent_window_stats=recent_window_stats,
+                    il_loss=avg_epoch_il_loss # 新增参数
                 ))
 
-            # ------------ 公共逻辑：TensorBoard / 保存 / Eval / GIF ------------
-            # 注意：上面 IL/ RL 分支都已经得到 train_stats / avg_perf_for_best
-            if global_summary:
-                for key, value in train_stats.items():
-                    global_summary.add_scalar(f'Train/{key}', value, curr_steps)
+                # 清空 epoch 缓冲
+                epoch_perf_buffer = {'per_r': [], 'per_episode_len': [], 'win': []}
+                epoch_loss_buffer = []
+                epoch_il_loss_buffer = [] # 新增：清空
 
+            # ---- 模型保存 & best model ----
             if curr_steps - last_model_t >= SAVE_INTERVAL:
                 last_model_t = curr_steps
                 model_path = osp.join(MODEL_PATH, 'latest')
@@ -532,7 +570,8 @@ def main():
                               "step": curr_steps, "episode": curr_episodes, "reward": avg_perf_for_best}
                 torch.save(checkpoint, save_path)
 
-            if avg_perf_for_best > best_perf and (curr_steps - last_best_t >= BEST_INTERVAL):
+            if 'avg_perf_for_best' in locals() and \
+               avg_perf_for_best > best_perf and (curr_steps - last_best_t >= BEST_INTERVAL):
                 best_perf = avg_perf_for_best
                 last_best_t = curr_steps
                 model_path = osp.join(MODEL_PATH, 'best_model')
@@ -542,12 +581,14 @@ def main():
                               "optimizer": training_model.net_optimizer.state_dict(),
                               "step": curr_steps, "episode": curr_episodes, "reward": best_perf}
                 torch.save(checkpoint, save_path)
-                print(f"New best model saved at step {curr_steps} with reward {best_perf:.4f}")
+                # 去掉 "New best model saved ..." 的打印
+                # ...no console print here...
 
+            # ---- Eval ----
             if curr_steps - last_test_t >= EVAL_INTERVAL:
                 last_test_t = curr_steps
                 eval_stats = evaluate_single_agent(eval_env, training_model, opponent_model, global_device)
-                # terminal eval 打印
+                # 精简 eval 打印
                 msg_parts = [f"[EVAL] step={curr_steps:,}"]
                 for k, v in eval_stats.items():
                     msg_parts.append(f"{k}={v:7.3f}")
@@ -556,6 +597,7 @@ def main():
                     for key, value in eval_stats.items():
                         global_summary.add_scalar(f'Eval/{key}', value, curr_steps)
 
+            # ---- GIF ----
             if curr_steps - last_gif_t >= GIF_INTERVAL:
                 last_gif_t = curr_steps
                 generate_one_episode_gif(eval_env, training_model, opponent_model, global_device, curr_steps)
@@ -722,3 +764,6 @@ def generate_one_episode_gif(eval_env, agent_model, opponent_model, device, curr
         gif_path = osp.join(GIFS_PATH, f"eval_{int(curr_steps)}.gif")
         os.makedirs(GIFS_PATH, exist_ok=True)
         make_gif(episode_frames, gif_path, fps=30)
+
+if __name__ == "__main__":
+    main()

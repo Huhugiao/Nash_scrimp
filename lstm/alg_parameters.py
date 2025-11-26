@@ -18,6 +18,8 @@ class TrainingParameters:
     N_ENVS = 4
     N_STEPS = 512        # 每个环境采样的步数
     N_MAX_STEPS = 3e7    # 总训练步数
+    # 每个“逻辑 epoch”包含多少 environment steps，用于控制打印频率
+    LOG_EPOCH_STEPS = int(2e5)
     
     MINIBATCH_SIZE = 512
     TBPTT_STEPS = 32     # LSTM截断反向传播步长
@@ -75,11 +77,11 @@ class RecordingParameters:
     MODEL_PATH = f'./models/TrackingEnv/{EXPERIMENT_NAME}{TIME}'
     GIFS_PATH = f'./models/TrackingEnv/{EXPERIMENT_NAME}{TIME}/gifs'
     
-    EVAL_INTERVAL = 50000
+    EVAL_INTERVAL = 100000
     SAVE_INTERVAL = 500000
     BEST_INTERVAL = 0
     GIF_INTERVAL = 200000
-    EVAL_EPISODES = 16
+    EVAL_EPISODES = 8
     
     # 按 Model.train 返回顺序命名（只影响 tensorboard / 打印标签，不影响训练）
     LOSS_NAME = [

@@ -53,7 +53,8 @@ class BattleConfig:
                  specific_tracker_strategy=None,
                  specific_target_strategy=None,
                  main_output_dir=None,
-                 obstacle_density=None):
+                 obstacle_density=None,
+                 debug=False):
         self.tracker_type = tracker_type or DEFAULT_TRACKER
         self.target_type = target_type or DEFAULT_TARGET
         self.tracker_model_path = tracker_model_path
@@ -67,6 +68,7 @@ class BattleConfig:
         self.specific_target_strategy = specific_target_strategy
         self.main_output_dir = main_output_dir
         self.obstacle_density = obstacle_density or ObstacleDensity.MEDIUM
+        self.debug = debug
 
         os.makedirs(output_dir, exist_ok=True)
         # 删除 mission 相关
@@ -121,7 +123,8 @@ def run_battle_batch(args):
                 "tracker_type": config.tracker_type,
                 "target_type": config.target_type,
                 "tracker_strategy": config.specific_tracker_strategy or config.tracker_type,
-                "target_strategy": config.specific_target_strategy or config.target_type
+                "target_strategy": config.specific_target_strategy or config.target_type,
+                "debug_info": {"error": str(e)} if config.debug else None
             })
 
     return batch_results
@@ -154,9 +157,22 @@ def run_single_episode(config, episode_idx, tracker_model, target_model, device,
         episode_reward = 0.0
         tracker_caught_target = False
         target_reached_exit = False
+        info = {}
 
-        save_gif = force_save_gif or (config.save_gif_freq > 0 and episode_idx % config.save_gif_freq == 0)
+        # 录制逻辑：Debug模式下默认录制所有帧，最后决定是否保存
+        should_record = force_save_gif or (config.save_gif_freq > 0 and episode_idx % config.save_gif_freq == 0) or config.debug
         episode_frames = []
+        
+        # === 统计数据初始化 ===
+        stats = {
+            'stuck_steps': 0,
+            'max_stuck_seq': 0,
+            'current_stuck_seq': 0,
+            'lost_steps': 0,
+            'min_obs_dist': 1.0, # Normalized 1.0 is max range
+            'collision': False,
+            'collision_type': None
+        }
 
         tracker_hidden = None
         target_hidden = None
@@ -170,13 +186,13 @@ def run_single_episode(config, episode_idx, tracker_model, target_model, device,
         if hasattr(target_policy_obj, 'reset'):
             target_policy_obj.reset()
 
-        if save_gif:
+        if should_record:
             try:
                 frame = env.render(mode='rgb_array')
                 if frame is not None:
                     episode_frames.append(frame)
             except Exception:
-                save_gif = False
+                should_record = False
 
         with torch.no_grad():
             while not done and episode_step < EnvParameters.EPISODE_LEN:
@@ -246,23 +262,150 @@ def run_single_episode(config, episode_idx, tracker_model, target_model, device,
                     tracker_obs, target_obs = step_obs
                 else:
                     tracker_obs = target_obs = step_obs
+                
+                # === 实时统计分析 ===
+                # tracker_obs: [vel, ang_vel, heading, dist, bearing, rel_vel, rel_ang_vel, fov_edge, in_fov, occluded, unobserved, radar...]
+                t_obs_arr = np.asarray(tracker_obs, dtype=np.float32).reshape(-1)
+                
+                # 1. Check Stuck (Velocity near -1.0)
+                # Normalized vel: -1.0 is 0 speed, 1.0 is max speed
+                if t_obs_arr[0] < -0.95:
+                    stats['current_stuck_seq'] += 1
+                else:
+                    stats['max_stuck_seq'] = max(stats['max_stuck_seq'], stats['current_stuck_seq'])
+                    stats['current_stuck_seq'] = 0
+                    
+                if t_obs_arr[0] < -0.95:
+                    stats['stuck_steps'] += 1
+                    
+                # 2. Check Lost (in_fov < 0.5)
+                if t_obs_arr[8] < 0.5:
+                    stats['lost_steps'] += 1
+                    
+                # 3. Check Obstacle Distance (Radar min)
+                # Radar indices 11 to 27
+                if len(t_obs_arr) >= 27:
+                    radar_vals = t_obs_arr[11:27]
+                    curr_min = np.min(radar_vals)
+                    if curr_min < stats['min_obs_dist']:
+                        stats['min_obs_dist'] = float(curr_min)
+                
+                # 4. Check Collision
+                if info.get('tracker_collision'):
+                    stats['collision'] = True
+                    stats['collision_type'] = "tracker_collision"
 
-                if save_gif:
+                if should_record:
                     try:
                         frame = env.render(mode='rgb_array')
                         if frame is not None:
                             episode_frames.append(frame)
                     except Exception:
-                        save_gif = False
+                        should_record = False
+
+        # 决定是否保存 GIF 和 Debug 数据
+        save_gif = False
+        
+        if config.debug:
+            # Debug模式：如果Tracker失败（没抓到），则保存
+            if not tracker_caught_target:
+                save_gif = True
+        else:
+            # 普通模式：按频率保存
+            if force_save_gif or (config.save_gif_freq > 0 and episode_idx % config.save_gif_freq == 0):
+                save_gif = True
+
+        save_dir = config.run_dir if config.run_dir else (config.main_output_dir or config.output_dir)
 
         if save_gif and len(episode_frames) > 1:
             try:
-                # 优先使用 run_dir (具体对战文件夹)，其次 main_output_dir (评估根目录)，最后 output_dir
-                save_dir = config.run_dir if config.run_dir else (config.main_output_dir or config.output_dir)
-                gif_path = os.path.join(save_dir, f"episode_{episode_idx:03d}.gif")
+                # Debug模式下文件名加前缀区分
+                if config.debug:
+                    gif_path = os.path.join(save_dir, f"debug_fail_episode_{episode_idx:03d}.gif")
+                else:
+                    gif_path = os.path.join(save_dir, f"episode_{episode_idx:03d}.gif")
                 make_gif(episode_frames, gif_path, fps=EnvParameters.N_ACTIONS // 2)
             except Exception:
                 pass
+        
+        # 构造简化的 Debug 信息
+        debug_info = None
+        if config.debug and not tracker_caught_target:
+            try:
+                final_state = env.get_privileged_state()
+                obstacles_summary = "Unknown"
+                if hasattr(env, 'obstacles'):
+                    obstacles_summary = []
+                    for o in env.obstacles:
+                        if hasattr(o, 'to_dict'):
+                            obstacles_summary.append(o.to_dict())
+                        else:
+                            obstacles_summary.append(str(o))
+                
+                # 安全获取位置信息
+                tracker_st = final_state.get('tracker', {})
+                target_st = final_state.get('target', {})
+
+                def get_pos(obj):
+                    if isinstance(obj, dict):
+                        return obj.get('pos', obj.get('position'))
+                    return getattr(obj, 'pos', getattr(obj, 'position', None))
+
+                t_pos = get_pos(tracker_st)
+                g_pos = get_pos(target_st)
+
+                dist = -1.0
+                if t_pos is not None and g_pos is not None:
+                    dist = float(np.linalg.norm(np.array(t_pos) - np.array(g_pos)))
+
+                # 计算衍生指标
+                max_range = EnvParameters.FOV_RANGE
+                min_dist_px = (stats['min_obs_dist'] + 1.0) * 0.5 * max_range
+                
+                # 判定主要原因
+                cause = "Timeout"
+                details = []
+                
+                if stats['collision']:
+                    cause = "Collision"
+                    details.append("Crashed into obstacle")
+                elif max(stats['max_stuck_seq'], stats['current_stuck_seq']) > 30:
+                    cause = "Stuck"
+                    details.append(f"Stuck for {max(stats['max_stuck_seq'], stats['current_stuck_seq'])} consecutive steps")
+                elif stats['lost_steps'] > episode_step * 0.6:
+                    cause = "Lost Target"
+                    details.append(f"Target invisible for {stats['lost_steps']/max(1, episode_step):.1%} of time")
+                elif min_dist_px < 15.0:
+                    cause = "Trapped/Close Obstacle"
+                    details.append(f"Got very close to obstacle ({min_dist_px:.1f}px)")
+
+                debug_info = {
+                    "episode_id": episode_idx,
+                    "reason": info.get('reason', 'timeout' if truncated else 'unknown'),
+                    "failure_cause": cause,
+                    "details": "; ".join(details),
+                    "metrics": {
+                        "stuck_steps": stats['stuck_steps'],
+                        "max_stuck_seq": max(stats['max_stuck_seq'], stats['current_stuck_seq']),
+                        "lost_steps": stats['lost_steps'],
+                        "min_obs_dist_px": min_dist_px,
+                        "total_steps": episode_step
+                    },
+                    "distance": dist,
+                    "obstacle_density": config.obstacle_density,
+                    "obstacles": obstacles_summary,
+                    # 保存原始状态的字符串表示，以便排查结构问题
+                    "tracker_raw": str(tracker_st),
+                    "target_raw": str(target_st)
+                }
+                
+                if t_pos is not None:
+                    debug_info["tracker_pos"] = np.array(t_pos).tolist()
+                if g_pos is not None:
+                    debug_info["target_pos"] = np.array(g_pos).tolist()
+
+            except Exception as e:
+                print(f"Failed to construct debug info: {e}")
 
         return {
             "episode_id": episode_idx,
@@ -273,7 +416,8 @@ def run_single_episode(config, episode_idx, tracker_model, target_model, device,
             "tracker_type": config.tracker_type,
             "target_type": config.target_type,
             "tracker_strategy": tracker_strategy,
-            "target_strategy": target_strategy
+            "target_strategy": target_strategy,
+            "debug_info": debug_info
         }
 
     finally:
@@ -462,7 +606,8 @@ def run_strategy_evaluation(base_config):
                 specific_tracker_strategy=tracker_strategy if base_config.tracker_type == "all" else None,
                 specific_target_strategy=target_strategy if base_config.target_type == "all" else None,
                 main_output_dir=main_evaluation_dir,
-                obstacle_density=base_config.obstacle_density)
+                obstacle_density=base_config.obstacle_density,
+                debug=base_config.debug)
             results, run_dir = run_battle(config, strategy_name=f"{tracker_strategy}_vs_{target_strategy}")
 
             if results is not None:
@@ -564,6 +709,18 @@ def run_battle(config, strategy_name=None):
         print("No successful episodes completed!")
         return None, None
 
+    # 汇总并保存 Debug 信息
+    if config.debug:
+        debug_failures = [r['debug_info'] for r in results if r.get('debug_info') is not None]
+        if debug_failures:
+            debug_path = os.path.join(config.run_dir, "debug_failures.json")
+            try:
+                with open(debug_path, 'w') as f:
+                    json.dump(debug_failures, f, indent=2)
+                print(f"Saved {len(debug_failures)} failure records to {debug_path}")
+            except Exception as e:
+                print(f"Failed to save debug failures: {e}")
+
     df = pd.DataFrame(results)
 
     avg_steps = float(df["steps"].mean()) if len(df) > 0 else 0.0
@@ -640,10 +797,10 @@ Examples:
         """
     )
     
-    parser.add_argument('--tracker', type=str, default="policy",
+    parser.add_argument('--tracker', type=str, default="CBF",
                        choices=list(TRACKER_TYPE_CHOICES),
                        help=f'Tracker type: {", ".join(TRACKER_TYPE_CHOICES)}')
-    parser.add_argument('--target', type=str, default="all",
+    parser.add_argument('--target', type=str, default="APF",
                        choices=list(TARGET_TYPE_CHOICES),
                        help=f'Target type: {", ".join(TARGET_TYPE_CHOICES)}')
     
@@ -653,9 +810,9 @@ Examples:
     parser.add_argument('--target_model', type=str, default=None,
                        help='Path to target model (required when --target=policy)')
     
-    parser.add_argument('--episodes', type=int, default=10,
+    parser.add_argument('--episodes', type=int, default=50,
                        help='Number of episodes to run')
-    parser.add_argument('--save_gif_freq', type=int, default=5,
+    parser.add_argument('--save_gif_freq', type=int, default=10,
                        help='Save GIF every N episodes (0 to disable)')
     parser.add_argument('--output_dir', type=str, default='./scrimp_battle',
                        help='Output directory for results')
@@ -668,6 +825,9 @@ Examples:
                        default=ObstacleDensity.DENSE,
                        choices=ObstacleDensity.ALL_LEVELS,
                        help='Obstacle density level (none/sparse/medium/dense)')
+    
+    parser.add_argument('--debug', action='store_true', default=True,
+                       help='Enable debug mode: save GIFs and detailed data for failed tracker episodes')
     
     args = parser.parse_args()
     
@@ -686,7 +846,8 @@ Examples:
         output_dir=args.output_dir,
         seed=args.seed,
         state_space=args.state_space,
-        obstacle_density=args.obstacles
+        obstacle_density=args.obstacles,
+        debug=args.debug
     )
 
     if config.tracker_type == "all" or config.target_type == "all":

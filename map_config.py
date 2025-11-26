@@ -13,8 +13,8 @@ class EnvParameters:
 
     # 视场与观测配置（重新设计）
     # Tracker：有限视场、雷达 360°；Target：全局视角 + 360° 雷达
-    FOV_ANGLE = 110.0          # 追踪者视场角（度）
-    FOV_RANGE = 320.0          # 追踪者最大可见距离（像素）
+    FOV_ANGLE = 120         # 追踪者视场角（度）
+    FOV_RANGE = 250         # 追踪者最大可见距离（像素）
     RADAR_RAYS = 16            # 360° 雷达射线数
     MAX_UNOBSERVED_STEPS = 80  # 最长未观测时间归一化上限
 
@@ -50,12 +50,12 @@ height = 640
 pixel_size = 4
 # target 略慢，tracker 稍快
 target_speed = 2.0
-tracker_speed = 2.5
+tracker_speed = 3
 
 # 转向限制（度/step）
 max_turn_deg = 10.0
 target_max_turn_deg = 12.0
-tracker_max_turn_deg = 10.0
+tracker_max_turn_deg = 8
 
 # 捕获逻辑（保持接口，但参数更“紧凑”）
 capture_radius = 42.0
@@ -84,7 +84,7 @@ trail_max_len = 120
 trail_width = 2
 
 # 增大墙体厚度：视觉更清晰，也让边界遮挡更合理
-wall_thickness = 6  # <-- 原来是 4
+wall_thickness = 6  
 
 # 障碍物颜色（深灰略带透明）
 OBSTACLE_COLOR = (70, 70, 80, 255)

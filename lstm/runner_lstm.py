@@ -9,6 +9,7 @@ from util import set_global_seeds, update_perf, get_opponent_id_one_hot
 from env import TrackingEnv
 from rule_policies import TRACKER_POLICY_REGISTRY, TARGET_POLICY_REGISTRY
 from policymanager import PolicyManager
+from cbf_controller import CBFTracker  # 新增：CBF imitation teacher
 
 
 @ray.remote(num_cpus=1, num_gpus=SetupParameters.NUM_GPU / max((TrainingParameters.N_ENVS + 1), 1))
@@ -29,7 +30,10 @@ class Runner(object):
         self.policy_manager = None
         self.current_opponent_policy = None
         self.current_opponent_id = -1
-        
+
+        # 新增：一个 CBF imitation teacher 实例（复用）
+        self.cbf_teacher = CBFTracker()
+
         if TrainingParameters.OPPONENT_TYPE in {"random", "random_nonexpert"}:
             self.policy_manager = PolicyManager()
 
@@ -53,22 +57,22 @@ class Runner(object):
         if TrainingParameters.OPPONENT_TYPE == "policy":
             dummy_context = np.zeros(NetParameters.CONTEXT_LEN, dtype=np.float32)
             critic_obs = np.concatenate([target_obs, dummy_context])
-            
+
             opp_action, _, new_hidden, _, _ = self.opponent_model.evaluate(
                 target_obs, critic_obs, self.opponent_hidden, greedy=True
             )
             self.opponent_hidden = new_hidden
             return opp_action
-            
+
         elif TrainingParameters.OPPONENT_TYPE in {"random", "random_nonexpert"}:
             if self.policy_manager and self.current_opponent_policy:
                 return self.policy_manager.get_action(
-                    self.current_opponent_policy, 
-                    target_obs, 
+                    self.current_opponent_policy,
+                    target_obs,
                     privileged_state
                 )
             return np.zeros(2, dtype=np.float32)
-            
+
         else:
             raise ValueError(f"Unsupported OPPONENT_TYPE: {TrainingParameters.OPPONENT_TYPE}")
 
@@ -185,7 +189,7 @@ class Runner(object):
                     ep_len = 0
                     episodes += 1
                     episode_start = True
-                    
+
                     obs_tuple = self.env.reset()
                     if isinstance(obs_tuple, tuple) and len(obs_tuple) == 2:
                         try:
@@ -233,21 +237,25 @@ class Runner(object):
             if self.current_opponent_policy is None and self.policy_manager:
                 self.current_opponent_policy, self.current_opponent_id = self.policy_manager.sample_policy("target")
 
+            # 每个 episode 开始前，重置 CBF teacher 的内部状态（记忆等）
+            if hasattr(self.cbf_teacher, "reset"):
+                self.cbf_teacher.reset()
+
             episode_reward = 0.0
             ep_len = 0
             episodes = 0
 
             for i in range(n_steps):
-                # 使用APF专家策略生成tracker动作
                 critic_full = np.concatenate([tracker_obs, get_opponent_id_one_hot(self.current_opponent_id)])
-                teacher_name = "APF" if "APF" in TRACKER_POLICY_REGISTRY else sorted(TRACKER_POLICY_REGISTRY.keys())[0]
-                policy_fn = TRACKER_POLICY_REGISTRY.get(teacher_name)
-                if not policy_fn:
-                    raise ValueError("No tracker policy found (APF or default).")
-                expert_pair = policy_fn(tracker_obs)
+
+                # 使用 CBFTracker 作为 imitation teacher
+                privileged_state = None
+                if hasattr(self.env, "get_privileged_state"):
+                    privileged_state = self.env.get_privileged_state()
+                expert_pair = self.cbf_teacher.get_action(tracker_obs, privileged_state=privileged_state)
                 normalized = np.asarray(expert_pair, dtype=np.float32)
                 pre_tanh = Model.to_pre_tanh(normalized)
-                
+
                 # 对手动作
                 target_action = self._get_opponent_action(target_obs, tracker_obs)
 
@@ -282,6 +290,8 @@ class Runner(object):
                         self.policy_manager.update_win_rate(self.current_opponent_policy, win)
                         self.policy_manager.reset()
                         self.current_opponent_policy, self.current_opponent_id = self.policy_manager.sample_policy("target")
+
+                    # 重置环境和 teacher
                     obs_tuple = self.env.reset()
                     if isinstance(obs_tuple, tuple) and len(obs_tuple) == 2:
                         try:
@@ -292,6 +302,10 @@ class Runner(object):
                     else:
                         tracker_obs = obs_tuple[0] if isinstance(obs_tuple, tuple) else obs_tuple
                         target_obs = tracker_obs
+
+                    if hasattr(self.cbf_teacher, "reset"):
+                        self.cbf_teacher.reset()
+
                     episode_reward = 0.0
                     ep_len = 0
                     episodes += 1

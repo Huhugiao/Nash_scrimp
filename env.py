@@ -255,7 +255,10 @@ class TrackingEnv(gym.Env):
             ]
         max_radar_range = float(EnvParameters.FOV_RANGE)
         pad = float(getattr(map_config, 'agent_radius', self.pixel_size * 0.5))
+        
+        # Use Numba accelerated batch ray casting (handled inside env_lib)
         dists = env_lib.ray_distances_multi(center, angles, max_radar_range, padding=pad)
+            
         readings = (np.asarray(dists, dtype=np.float32) / max_radar_range) * 2.0 - 1.0
         return readings
 
@@ -831,7 +834,7 @@ class TrackingEnv(gym.Env):
     def _get_fov_points(self, force_recompute=False):
         """
         获取 FOV 扇形点集，用于渲染。
-        使用自适应射线投射（Adaptive Raycasting）来优化锯齿并减少计算量。
+        使用 Warp 批量射线投射来优化计算。
         """
         if self._fov_cache_valid and self._fov_cache is not None and not force_recompute:
             return self._fov_cache
@@ -847,52 +850,17 @@ class TrackingEnv(gym.Env):
         fov_half = math.radians(EnvParameters.FOV_ANGLE / 2.0)
         max_range = EnvParameters.FOV_RANGE
 
-        # 1. 基础射线扫描 (较稀疏)
-        base_rays = 48
-        angles = np.linspace(heading_rad - fov_half, heading_rad + fov_half, base_rays)
+        # Use fixed number of rays for GPU batching (faster than adaptive CPU recursion)
+        num_rays = 64
+        angles = np.linspace(heading_rad - fov_half, heading_rad + fov_half, num_rays)
         
-        # 缓存射线计算结果
-        def cast_ray(angle):
-            dist = env_lib.ray_distance_grid((cx_world, cy_world), angle, max_range, padding=0.0)
-            return angle, dist
+        # Use Numba accelerated batch ray casting
+        dists = env_lib.ray_distances_multi((cx_world, cy_world), angles, max_range, padding=0.0)
 
-        rays = [cast_ray(a) for a in angles]
-        
-        # 2. 自适应细分 (Adaptive Subdivision)
-        # 如果相邻射线的落点距离过大（说明遇到了边缘），则在中间插入新射线
-        refined_rays = []
-        edge_threshold = 12.0  # 边缘检测阈值（像素）
-        
-        def subdivide(a1, d1, a2, d2, depth):
-            if depth > 3: # 最大递归深度
-                return
-            
-            # 计算两点在空间中的距离
-            p1x, p1y = d1 * math.cos(a1), d1 * math.sin(a1)
-            p2x, p2y = d2 * math.cos(a2), d2 * math.sin(a2)
-            gap = math.hypot(p1x - p2x, p1y - p2y)
-            
-            if gap > edge_threshold:
-                mid_angle = (a1 + a2) * 0.5
-                mid_angle, mid_dist = cast_ray(mid_angle)
-                
-                # 递归检查左半边
-                subdivide(a1, d1, mid_angle, mid_dist, depth + 1)
-                refined_rays.append((mid_angle, mid_dist))
-                # 递归检查右半边
-                subdivide(mid_angle, mid_dist, a2, d2, depth + 1)
-
-        for i in range(len(rays) - 1):
-            a1, d1 = rays[i]
-            a2, d2 = rays[i+1]
-            refined_rays.append((a1, d1))
-            subdivide(a1, d1, a2, d2, 0)
-            
-        refined_rays.append(rays[-1])
-
-        # 3. 生成多边形顶点
         pts = [(cx, cy)]
-        for angle, dist in refined_rays:
+        for i in range(num_rays):
+            dist = dists[i]
+            angle = angles[i]
             px = cx + dist * ss * math.cos(angle)
             py = cy + dist * ss * math.sin(angle)
             pts.append((px, py))

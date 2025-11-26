@@ -8,6 +8,20 @@ try:
 except ImportError:
     pygame = None
 
+# --- Numba Acceleration ---
+try:
+    from numba import njit, prange
+    NUMBA_AVAILABLE = True
+    print("Numba detected. Ray casting will be accelerated.")
+except ImportError:
+    NUMBA_AVAILABLE = False
+    print("Numba not found. Using slower pure Python ray casting.")
+    # Dummy decorators
+    def njit(*args, **kwargs):
+        def decorator(func): return func
+        return decorator
+    def prange(*args): return range(*args)
+
 # === Occupancy grid cache ===
 _OCC_GRID = None
 _OCC_CELL = None
@@ -81,6 +95,98 @@ def _mark_segment(grid, cell, x1, y1, x2, y2, thick):
             if _dist2_point_to_segment(cx, cy, x1, y1, x2, y2) <= r2:
                 grid[iy, ix] = True
 
+# --- Numba Kernels ---
+@njit(fastmath=True)
+def _numba_ray_cast_kernel(ox, oy, angle, max_range, grid, cell_size, nx, ny, pad_cells):
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+    
+    # Avoid division by zero
+    if abs(cos_a) < 1e-9: cos_a = 1e-9 if cos_a >= 0 else -1e-9
+    if abs(sin_a) < 1e-9: sin_a = 1e-9 if sin_a >= 0 else -1e-9
+
+    # World to Grid
+    gx = ox / cell_size
+    gy = oy / cell_size
+    ix = int(gx)
+    iy = int(gy)
+
+    # Check bounds (start point)
+    if ix < 0 or ix >= nx or iy < 0 or iy >= ny:
+        return 0.0
+
+    # Check start point collision
+    if pad_cells > 0:
+        x1 = max(0, ix - pad_cells)
+        x2 = min(nx, ix + pad_cells + 1)
+        y1 = max(0, iy - pad_cells)
+        y2 = min(ny, iy + pad_cells + 1)
+        if np.any(grid[y1:y2, x1:x2]):
+            return 0.0
+    else:
+        if grid[iy, ix]:
+            return 0.0
+
+    # DDA Setup
+    step_x = 1 if cos_a > 0 else -1
+    step_y = 1 if sin_a > 0 else -1
+
+    cell_x = float(ix)
+    cell_y = float(iy)
+
+    if step_x > 0:
+        dist_to_vx = (cell_x + 1.0 - gx) * cell_size
+    else:
+        dist_to_vx = (gx - cell_x) * cell_size
+
+    if step_y > 0:
+        dist_to_vy = (cell_y + 1.0 - gy) * cell_size
+    else:
+        dist_to_vy = (gy - cell_y) * cell_size
+
+    tMaxX = dist_to_vx / abs(cos_a)
+    tMaxY = dist_to_vy / abs(sin_a)
+
+    tDeltaX = cell_size / abs(cos_a)
+    tDeltaY = cell_size / abs(sin_a)
+
+    dist = 0.0
+    
+    while dist <= max_range:
+        if tMaxX < tMaxY:
+            dist = tMaxX
+            tMaxX += tDeltaX
+            ix += step_x
+        else:
+            dist = tMaxY
+            tMaxY += tDeltaY
+            iy += step_y
+
+        if ix < 0 or ix >= nx or iy < 0 or iy >= ny:
+            break
+            
+        # Check collision
+        if pad_cells > 0:
+            x1 = max(0, ix - pad_cells)
+            x2 = min(nx, ix + pad_cells + 1)
+            y1 = max(0, iy - pad_cells)
+            y2 = min(ny, iy + pad_cells + 1)
+            if np.any(grid[y1:y2, x1:x2]):
+                return min(dist, max_range)
+        else:
+            if grid[iy, ix]:
+                return min(dist, max_range)
+
+    return max_range
+
+@njit(fastmath=True)
+def _numba_ray_cast_batch(ox, oy, angles, max_range, grid, cell_size, nx, ny, pad_cells):
+    n = len(angles)
+    res = np.empty(n, dtype=np.float32)
+    for i in range(n):
+        res[i] = _numba_ray_cast_kernel(ox, oy, angles[i], max_range, grid, cell_size, nx, ny, pad_cells)
+    return res
+
 def build_occupancy(width=None, height=None, cell=None, obstacles=None):
     """根据当前地图和障碍构建占据栅格，用于快速射线/碰撞查询。"""
     global _OCC_GRID, _OCC_CELL, _OCC_W, _OCC_H, _OCC_VALID
@@ -123,15 +229,24 @@ def _occ_any_with_pad(ix, iy, pad_cells):
 
 def ray_distance_grid(origin, angle_rad, max_range, padding=0.0):
     """
-    在占据栅格上沿方向 angle_rad 执行 DDA 射线，返回最近障碍距离或 max_range。
-    注意：为了避免“起点所在 cell 提前命中”的问题，我们显式跳过起始 cell，
-    从穿出当前 cell 边界之后才开始检测占据情况。
+    在占据栅格上沿方向 angle_rad 执行 DDA 射线。
+    如果 Numba 可用，使用加速内核。
     """
     if not _occ_available():
         return _trace_ray_for_fov(origin, angle_rad, max_range)
 
     ox, oy = float(origin[0]), float(origin[1])
+    
+    if NUMBA_AVAILABLE:
+        nx, ny = _OCC_GRID.shape[1], _OCC_GRID.shape[0]
+        pad_cells = int(math.ceil(float(padding) / float(_OCC_CELL)))
+        return float(_numba_ray_cast_kernel(ox, oy, float(angle_rad), float(max_range), 
+                                          _OCC_GRID, float(_OCC_CELL), nx, ny, pad_cells))
+
+    # Fallback to pure Python DDA
     cos_a, sin_a = math.cos(angle_rad), math.sin(angle_rad)
+    # 为了避免“起点所在 cell 提前命中”的问题，我们显式跳过起始 cell，
+    # 从穿出当前 cell 边界之后才开始检测占据情况。
     eps = 1e-12
     cos_a = cos_a if abs(cos_a) > eps else (eps if cos_a >= 0 else -eps)
     sin_a = sin_a if abs(sin_a) > eps else (eps if sin_a >= 0 else -eps)
@@ -202,6 +317,15 @@ def ray_distance_grid(origin, angle_rad, max_range, padding=0.0):
     return float(max_range)
 
 def ray_distances_multi(origin, angles_rad, max_range, padding=0.0):
+    if NUMBA_AVAILABLE and _occ_available():
+        ox, oy = float(origin[0]), float(origin[1])
+        nx, ny = _OCC_GRID.shape[1], _OCC_GRID.shape[0]
+        pad_cells = int(math.ceil(float(padding) / float(_OCC_CELL)))
+        # Ensure angles is numpy array
+        angles_arr = np.asarray(angles_rad, dtype=np.float64)
+        return _numba_ray_cast_batch(ox, oy, angles_arr, float(max_range), 
+                                   _OCC_GRID, float(_OCC_CELL), nx, ny, pad_cells)
+    
     return np.array([ray_distance_grid(origin, ang, max_range, padding) for ang in angles_rad],
                     dtype=np.float32)
 
