@@ -1,12 +1,14 @@
 import numpy as np
 import torch
 import ray
+from collections import deque
 from mha.alg_parameters_mha import *
 from mha.model_mha import Model
-from util import set_global_seeds, get_opponent_id_one_hot
+from util import set_global_seeds
 from env import TrackingEnv
 from policymanager import PolicyManager
-from cbf_controller import CBFTracker
+from rule_policies import CBFTracker
+
 
 @ray.remote(num_cpus=1, num_gpus=SetupParameters.NUM_GPU / max((TrainingParameters.N_ENVS + 1), 1))
 class Runner(object):
@@ -22,42 +24,63 @@ class Runner(object):
         self.policy_manager = PolicyManager() if TrainingParameters.OPPONENT_TYPE in {"random", "random_nonexpert"} else None
         self.current_opponent_policy = None
         self.current_opponent_id = -1
+        # 用 rule_policies.CBFTracker
         self.cbf_teacher = CBFTracker()
         
-        self.reset_env()
-        self.agent_history = None # (actor_hist, critic_hist)
+        self.tracker_obs = None
+        self.target_obs = None
+        self.agent_history = None
         self.opponent_history = None
+        
+        self.reset_env()
 
     def reset_env(self):
-        obs_tuple = self.env.reset()
-        if isinstance(obs_tuple, tuple) and len(obs_tuple) == 2:
-            try:
-                self.tracker_obs, self.target_obs = obs_tuple[0]
-            except Exception:
-                self.tracker_obs = obs_tuple[0]
-                self.target_obs = obs_tuple[0]
-        else:
-            self.tracker_obs = obs_tuple[0] if isinstance(obs_tuple, tuple) else obs_tuple
-            self.target_obs = self.tracker_obs
+        obs_result, info = self.env.reset()
+        self._parse_obs(obs_result)
         self.agent_history = None
         self.opponent_history = None
 
-    def _get_opponent_action(self, target_obs, tracker_obs):
+    def _parse_obs(self, obs_result):
+        if isinstance(obs_result, tuple) and len(obs_result) == 2:
+            self.tracker_obs = np.asarray(obs_result[0], dtype=np.float32)
+            self.target_obs = np.asarray(obs_result[1], dtype=np.float32)
+        else:
+            obs = np.asarray(obs_result, dtype=np.float32)
+            self.tracker_obs = obs
+            self.target_obs = obs[:NetParameters.CRITIC_VECTOR_LEN]
+
+    def _get_opponent_action(self):
         if TrainingParameters.OPPONENT_TYPE == "policy":
-            # Critic input: Global view [Target(24)]
-            critic_obs = target_obs
             opp_action, _, new_hist, _, _ = self.opponent_model.evaluate(
-                target_obs, critic_obs, self.opponent_history, greedy=True
+                self.target_obs, self.target_obs, self.opponent_history, greedy=True
             )
             self.opponent_history = new_hist
             return opp_action
         elif TrainingParameters.OPPONENT_TYPE in {"random", "random_nonexpert"}:
             if self.policy_manager and self.current_opponent_policy:
-                return self.policy_manager.get_action(self.current_opponent_policy, target_obs)
-            return np.zeros(2, dtype=np.float32)
-        return np.zeros(2, dtype=np.float32)
+                return self.policy_manager.get_action(self.current_opponent_policy, self.target_obs)
+        return np.zeros(NetParameters.ACTION_DIM, dtype=np.float32)
 
-    def run(self, model_weights, opponent_weights, total_steps, policy_manager_state=None):
+    def _get_expert_action(self):
+        """使用与 evaluate.py 相同接口的 CBFTracker 规则策略"""
+        try:
+            # 构建与 evaluate 一致的 actor_obs 和 privileged_state
+            actor_obs = np.asarray(self.tracker_obs, dtype=np.float32)
+            privileged_state = self.env.get_privileged_state() if hasattr(self.env, "get_privileged_state") else None
+
+            # rule_policies.CBFTracker.get_action(actor_obs, privileged_state)
+            if hasattr(self.cbf_teacher, "get_action"):
+                expert_action = self.cbf_teacher.get_action(actor_obs, privileged_state)
+            else:
+                expert_action = self.cbf_teacher(actor_obs, privileged_state)
+
+            expert_action = np.asarray(expert_action, dtype=np.float32).reshape(NetParameters.ACTION_DIM)
+            # 归一化到 [-1, 1]
+            return np.clip(expert_action, -1.0, 1.0).astype(np.float32)
+        except Exception:
+            return np.zeros(NetParameters.ACTION_DIM, dtype=np.float32)
+
+    def run(self, model_weights, opponent_weights, total_steps, policy_manager_state=None, il_prob=0.0):
         with torch.no_grad():
             self.agent_model.set_weights(model_weights)
             if opponent_weights and self.opponent_model:
@@ -65,9 +88,12 @@ class Runner(object):
             if self.policy_manager and policy_manager_state:
                 for name, history in policy_manager_state.items():
                     if name in self.policy_manager.win_history:
-                        self.policy_manager.win_history[name] = list(history)
+                        self.policy_manager.win_history[name] = deque(
+                            history, maxlen=TrainingParameters.ADAPTIVE_SAMPLING_WINDOW
+                        )
 
             n_steps = TrainingParameters.N_STEPS
+            
             data = {
                 'actor_obs': np.zeros((n_steps, NetParameters.ACTOR_VECTOR_LEN), dtype=np.float32),
                 'critic_obs': np.zeros((n_steps, NetParameters.CRITIC_VECTOR_LEN), dtype=np.float32),
@@ -76,8 +102,14 @@ class Runner(object):
                 'actions': np.zeros((n_steps, NetParameters.ACTION_DIM), dtype=np.float32),
                 'logp': np.zeros(n_steps, dtype=np.float32),
                 'dones': np.zeros(n_steps, dtype=np.bool_),
-                'episode_starts': np.zeros(n_steps, dtype=np.bool_)
+                'episode_starts': np.zeros(n_steps, dtype=np.bool_),
+                # expert 只作标签，不控制环境
+                'expert_actions': np.zeros((n_steps, NetParameters.ACTION_DIM), dtype=np.float32),
+                'is_expert_step': np.zeros(n_steps, dtype=np.bool_),
+                'episode_indices': np.zeros(n_steps, dtype=np.int32),
+                'episode_success': [],
             }
+            
             performance_dict = {'per_r': [], 'per_episode_len': [], 'win': []}
 
             if self.current_opponent_policy is None and self.policy_manager:
@@ -87,23 +119,36 @@ class Runner(object):
             ep_len = 0
             episodes = 0
             episode_start = True
+            current_episode_start_idx = 0
 
             for i in range(n_steps):
-                # Global God-View: Target Obs
-                critic_obs_full = self.target_obs
+                data['episode_indices'][i] = episodes
+                critic_obs = self.target_obs
                 
+                # 1) agent 决策（始终用于控制环境）
                 agent_action, agent_pre_tanh, new_hist, v_pred, log_prob = self.agent_model.step(
-                    self.tracker_obs, critic_obs_full, self.agent_history
+                    self.tracker_obs, critic_obs, self.agent_history
                 )
                 self.agent_history = new_hist
+
+                # 2) expert 动作，只作为 IL 标签（DAgger）：是否记录由 il_prob 决定
+                record_expert = (np.random.rand() < il_prob)
+                if record_expert:
+                    expert_action = self._get_expert_action()
+                    data['expert_actions'][i] = expert_action
+                    data['is_expert_step'][i] = True
+                else:
+                    data['is_expert_step'][i] = False
+
+                execute_action = agent_action  # 环境永远执行 agent_action
+
+                target_action = self._get_opponent_action()
                 
-                target_action = self._get_opponent_action(self.target_obs, self.tracker_obs)
-                
-                obs_result, reward, terminated, truncated, info = self.env.step((agent_action, target_action))
+                obs_result, reward, terminated, truncated, info = self.env.step((execute_action, target_action))
                 done = terminated or truncated
                 
                 data['actor_obs'][i] = self.tracker_obs
-                data['critic_obs'][i] = critic_obs_full
+                data['critic_obs'][i] = critic_obs
                 data['values'][i] = v_pred
                 data['actions'][i] = agent_pre_tanh
                 data['logp'][i] = log_prob
@@ -111,137 +156,68 @@ class Runner(object):
                 data['dones'][i] = done
                 data['episode_starts'][i] = episode_start
                 
-                if isinstance(obs_result, tuple) and len(obs_result) == 2:
-                    self.tracker_obs, self.target_obs = obs_result
-                else:
-                    self.tracker_obs = obs_result
-                    self.target_obs = obs_result
-                    
-                episode_reward += float(reward)
-                ep_len += 1
                 episode_start = False
+                episode_reward += reward
+                ep_len += 1
+                
+                self._parse_obs(obs_result)
                 
                 if done:
+                    win = info.get('reason') == 'tracker_caught_target' if isinstance(info, dict) else False
+                    
+                    data['episode_success'].append({
+                        'start_idx': current_episode_start_idx,
+                        'end_idx': i + 1,
+                        'success': win,
+                        'reward': episode_reward,
+                        'length': ep_len,
+                        # DAgger 模式下不再有“整条 expert episode”的概念，这里统一设 False，仅保留字段以兼容
+                        'use_expert': False,
+                    })
+                    
                     performance_dict['per_r'].append(episode_reward)
                     performance_dict['per_episode_len'].append(ep_len)
-                    win = 1 if info.get('reason') == 'tracker_caught_target' else 0
-                    performance_dict['win'].append(win)
+                    performance_dict['win'].append(1 if win else 0)
                     
-                    if self.policy_manager:
+                    if self.policy_manager and self.current_opponent_policy:
                         self.policy_manager.update_win_rate(self.current_opponent_policy, win)
-                        self.policy_manager.reset()
-                        self.current_opponent_policy, self.current_opponent_id = self.policy_manager.sample_policy("target")
-                        
+                        self.current_opponent_policy, self.current_opponent_id = \
+                            self.policy_manager.sample_policy("target")
+                    
+                    episodes += 1
                     episode_reward = 0.0
                     ep_len = 0
-                    episodes += 1
                     episode_start = True
+                    current_episode_start_idx = i + 1
+                    
                     self.reset_env()
+                    if hasattr(self.cbf_teacher, "reset"):
+                        self.cbf_teacher.reset()
 
-            # Compute returns
-            critic_obs_last = self.target_obs
-            # For value estimation of last step, we need history.
-            last_value = self.agent_model.evaluate(self.tracker_obs, critic_obs_last, self.agent_history)[3]
+            # 3) GAE 计算
+            last_value = self.agent_model.evaluate(
+                self.tracker_obs, self.target_obs, self.agent_history
+            )[3]
             
-            # GAE
             advantages = np.zeros_like(data['rewards'])
             lastgaelam = 0.0
             for t in reversed(range(n_steps)):
                 if t == n_steps - 1:
-                    next_non_terminal = 1.0 - data['dones'][t]
-                    next_value = last_value
+                    nextnonterminal = 1.0 - float(data['dones'][t])
+                    nextvalues = last_value
                 else:
-                    next_non_terminal = 1.0 - data['dones'][t + 1]
-                    next_value = data['values'][t + 1]
-                delta = data['rewards'][t] + TrainingParameters.GAMMA * next_value * next_non_terminal - data['values'][t]
-                lastgaelam = delta + TrainingParameters.GAMMA * TrainingParameters.LAM * next_non_terminal * lastgaelam
-                advantages[t] = lastgaelam
+                    nextnonterminal = 1.0 - float(data['dones'][t])
+                    nextvalues = data['values'][t + 1]
+                delta = data['rewards'][t] + TrainingParameters.GAMMA * nextvalues * nextnonterminal - data['values'][t]
+                advantages[t] = lastgaelam = delta + TrainingParameters.GAMMA * TrainingParameters.LAM * nextnonterminal * lastgaelam
+            
             data['returns'] = advantages + data['values']
             
-            new_pm_state = {k: list(v) for k, v in self.policy_manager.win_history.items()} if self.policy_manager else None
-            return data, n_steps, episodes, performance_dict, new_pm_state
-
-    def imitation(self, model_weights, opponent_weights, total_steps):
-        with torch.no_grad():
-            self.agent_model.set_weights(model_weights)
-            if opponent_weights and self.opponent_model:
-                self.opponent_model.set_weights(opponent_weights)
-                
-            n_steps = TrainingParameters.N_STEPS
-            actor_obs_arr = np.zeros((n_steps, NetParameters.ACTOR_VECTOR_LEN), dtype=np.float32)
-            critic_obs_arr = np.zeros((n_steps, NetParameters.CRITIC_VECTOR_LEN), dtype=np.float32)
-            actions = np.zeros((n_steps, NetParameters.ACTION_DIM), dtype=np.float32)
+            pm_state = {k: list(v) for k, v in self.policy_manager.win_history.items()} if self.policy_manager else None
             
-            # Added for segmentation
-            dones = np.zeros(n_steps, dtype=np.bool_)
-            episode_starts = np.zeros(n_steps, dtype=np.bool_)
-            
-            performance_dict = {'per_r': [], 'per_episode_len': [], 'win': []}
-            
-            if self.current_opponent_policy is None and self.policy_manager:
-                self.current_opponent_policy, self.current_opponent_id = self.policy_manager.sample_policy("target")
-            
-            self.reset_env()
-            if hasattr(self.cbf_teacher, "reset"): self.cbf_teacher.reset()
-            
-            episodes = 0
-            episode_reward = 0.0
-            ep_len = 0
-            episode_start = True # Track start
-            
-            for i in range(n_steps):
-                critic_full = self.target_obs
-                
-                privileged = self.env.get_privileged_state() if hasattr(self.env, "get_privileged_state") else None
-                expert_pair = self.cbf_teacher.get_action(self.tracker_obs, privileged_state=privileged)
-                normalized = np.asarray(expert_pair, dtype=np.float32)
-                pre_tanh = Model.to_pre_tanh(normalized)
-                
-                target_action = self._get_opponent_action(self.target_obs, self.tracker_obs)
-                
-                next_obs, reward, terminated, truncated, info = self.env.step((normalized, target_action))
-                done = terminated or truncated
-                
-                actor_obs_arr[i] = self.tracker_obs
-                critic_obs_arr[i] = critic_full
-                actions[i] = pre_tanh
-                dones[i] = done
-                episode_starts[i] = episode_start
-                
-                episode_reward += float(reward)
-                ep_len += 1
-                episode_start = False
-                
-                if isinstance(next_obs, tuple) and len(next_obs) == 2:
-                    self.tracker_obs, self.target_obs = next_obs
-                else:
-                    self.tracker_obs = next_obs
-                    self.target_obs = next_obs
-                    
-                if done:
-                    performance_dict['per_r'].append(episode_reward)
-                    performance_dict['per_episode_len'].append(ep_len)
-                    win = 1 if info.get('reason') == 'tracker_caught_target' else 0
-                    performance_dict['win'].append(win)
-                    
-                    if self.policy_manager:
-                        self.policy_manager.update_win_rate(self.current_opponent_policy, win)
-                        self.policy_manager.reset()
-                        self.current_opponent_policy, self.current_opponent_id = self.policy_manager.sample_policy("target")
-                        
-                    self.reset_env()
-                    if hasattr(self.cbf_teacher, "reset"): self.cbf_teacher.reset()
-                    episode_reward = 0.0
-                    ep_len = 0
-                    episodes += 1
-                    episode_start = True
-                    
             return {
-                'actor_obs': actor_obs_arr,
-                'critic_obs': critic_obs_arr,
-                'actions': actions,
-                'dones': dones,
-                'episode_starts': episode_starts,
+                'data': data,
                 'performance': performance_dict,
-                'episodes': episodes
+                'episodes': episodes,
+                'policy_manager_state': pm_state
             }

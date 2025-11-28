@@ -21,6 +21,10 @@ class TrainingParameters:
     
     MINIBATCH_SIZE = 64
     N_EPOCHS = 10
+
+    # --- Add TBPTT / sequence training step for MLP to match MHA flow ---
+    # sequence length to split long rollouts into for training
+    TBPTT_STEPS = 32
     
     VALUE_CLIP_RANGE = 0.2
     CLIP_RANGE = 0.2
@@ -51,6 +55,7 @@ class NetParameters:
     
     # MLP Specific
     HIDDEN_DIM = 256
+    CONTEXT_WINDOW = TrainingParameters.TBPTT_STEPS
 
 class RecordingParameters:
     EXPERIMENT_PROJECT = "AvoidMaker_MLP"
@@ -66,9 +71,9 @@ class RecordingParameters:
     TENSORBOARD = True
     TXT_LOG = True
     
-    SUMMARY_PATH = f'./runs/TrackingEnv/{EXPERIMENT_NAME}{TIME}'
-    MODEL_PATH = f'./models/TrackingEnv/{EXPERIMENT_NAME}{TIME}'
-    GIFS_PATH = f'./models/TrackingEnv/{EXPERIMENT_NAME}{TIME}/gifs'
+    SUMMARY_PATH = f'./models/{EXPERIMENT_NAME}{TIME}'
+    MODEL_PATH = f'./models/{EXPERIMENT_NAME}{TIME}'
+    GIFS_PATH = f'./models/{EXPERIMENT_NAME}{TIME}/gifs'
     
     EVAL_INTERVAL = 100000
     SAVE_INTERVAL = 500000

@@ -15,7 +15,7 @@ import json
 from collections import defaultdict
 
 from env import TrackingEnv
-from lstm.model_lstm import Model  # 从lstm模块导入
+from mlp.model_mlp import Model  # 从lstm模块导入
 from lstm.alg_parameters import *  # 使用通用参数
 from util import make_gif, get_opponent_id_one_hot
 from policymanager import PolicyManager
@@ -797,15 +797,15 @@ Examples:
         """
     )
     
-    parser.add_argument('--tracker', type=str, default="CBF",
+    parser.add_argument('--tracker', type=str, default="policy",
                        choices=list(TRACKER_TYPE_CHOICES),
                        help=f'Tracker type: {", ".join(TRACKER_TYPE_CHOICES)}')
-    parser.add_argument('--target', type=str, default="APF",
+    parser.add_argument('--target', type=str, default="all",
                        choices=list(TARGET_TYPE_CHOICES),
                        help=f'Target type: {", ".join(TARGET_TYPE_CHOICES)}')
     
     parser.add_argument('--tracker_model', type=str, 
-                       default='./models/TrackingEnv/lstm_ppo_11-24-16-33/best_model/tracker_net_checkpoint.pkl',
+                       default='./models/TrackingEnv/mlp_ppo_11-28-13-36/best_model/checkpoint.pth',
                        help='Path to tracker model (required when --tracker=policy)')
     parser.add_argument('--target_model', type=str, default=None,
                        help='Path to target model (required when --target=policy)')

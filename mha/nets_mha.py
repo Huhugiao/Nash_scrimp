@@ -96,7 +96,8 @@ class ProtectingNetMHA(nn.Module):
         self.critic_radar_embed = nn.Linear(critic_radar_dim, self.hidden_dim // 2)
 
         # Learnable Positional Encoding
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.context_window, self.hidden_dim))
+        # Fix: Initialize with small random noise instead of zeros
+        self.pos_embed = nn.Parameter(torch.randn(1, self.context_window, self.hidden_dim) * 0.02)
 
         # Transformer Encoders
         self.actor_transformer = nn.ModuleList([
@@ -122,12 +123,26 @@ class ProtectingNetMHA(nn.Module):
         )
         
         self.apply(self._init_weights)
+        
+        # Prevent vanishing gradients:
+        # 1. Initialize policy head with small gain (0.01) to keep actions centered/un-saturated initially
+        # This prevents Tanh from saturating early, which kills gradients.
+        nn.init.orthogonal_(self.policy_head[1].weight, gain=0.01)
+        nn.init.constant_(self.policy_head[1].bias, 0.0)
+        
+        # 2. Initialize value head with gain 1.0
+        nn.init.orthogonal_(self.value_head[1].weight, gain=1.0)
+        nn.init.constant_(self.value_head[1].bias, 0.0)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            nn.init.orthogonal_(module.weight, gain=nn.init.calculate_gain('relu'))
+            # Use sqrt(2) for hidden layers (GELU/ReLU) to maintain variance
+            nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0.0)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.constant_(module.bias, 0.0)
+            nn.init.constant_(module.weight, 1.0)
 
     def forward(self, actor_obs, critic_obs):
         # actor_obs: (B, T, 27)
@@ -172,7 +187,11 @@ class ProtectingNetMHA(nn.Module):
         # --- Heads ---
         # We return sequences. The caller (PPO) handles slicing or indexing.
         policy_mean = self.policy_head(x_actor)
-        policy_log_std = self.log_std.unsqueeze(0).unsqueeze(0).expand(B, T, -1)
+        
+        # Clamp log_std to prevent collapsing to 0 (vanishing) or exploding
+        clamped_log_std = self.log_std.clamp(-20, 2)
+        policy_log_std = clamped_log_std.unsqueeze(0).unsqueeze(0).expand(B, T, -1)
+        
         value = self.value_head(x_critic)
         
         return policy_mean, value, policy_log_std

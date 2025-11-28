@@ -12,10 +12,8 @@ except ImportError:
 try:
     from numba import njit, prange
     NUMBA_AVAILABLE = True
-    print("Numba detected. Ray casting will be accelerated.")
 except ImportError:
     NUMBA_AVAILABLE = False
-    print("Numba not found. Using slower pure Python ray casting.")
     # Dummy decorators
     def njit(*args, **kwargs):
         def decorator(func): return func
@@ -342,27 +340,22 @@ def reward_calculate(tracker, target, tracker_collision=False, target_collision=
     reward = 0.0
     terminated = False
 
-    try:
-        # 1) 距离 shaping：越近越好
-        dx = (tracker['x'] + map_config.pixel_size * 0.5) - (target['x'] + map_config.pixel_size * 0.5)
-        dy = (tracker['y'] + map_config.pixel_size * 0.5) - (target['y'] + map_config.pixel_size * 0.5)
-        dist = math.hypot(dx, dy)
+    # 1) 距离 shaping：越近越好
+    dx = (tracker['x'] + map_config.pixel_size * 0.5) - (target['x'] + map_config.pixel_size * 0.5)
+    dy = (tracker['y'] + map_config.pixel_size * 0.5) - (target['y'] + map_config.pixel_size * 0.5)
+    dist = math.hypot(dx, dy)
 
-        max_ref_dist = float(getattr(map_config.EnvParameters, 'FOV_RANGE', max(map_config.width, map_config.height)))
-        d_norm = max(0.0, min(dist / max_ref_dist, 1.0))  # [0,1]
-        w_dist = 0.02  # 距离奖励权重（可调）
-        reward += w_dist * (1.0 - d_norm)
+    max_ref_dist = float(getattr(map_config.EnvParameters, 'FOV_RANGE', max(map_config.width, map_config.height)))
+    d_norm = max(0.0, min(dist / max_ref_dist, 1.0))  # [0,1]
+    w_dist = 0.02  # 距离奖励权重（可调）
+    reward += w_dist * (1.0 - d_norm)
 
-        # 2) 捕获进度 shaping：在捕获扇区内时稍微加分
-        if capture_required_steps > 0 and capture_progress > 0:
-            frac = float(capture_progress) / float(capture_required_steps)
-            frac = max(0.0, min(frac, 1.0))
-            w_cap = 0.05  # 捕获进度奖励权重（可调）
-            reward += w_cap * frac
-
-    except Exception:
-        # 任何异常不影响主流程
-        pass
+    # # 2) 捕获进度 shaping：在捕获扇区内时稍微加分
+    # if capture_required_steps > 0 and capture_progress > 0:
+    #     frac = float(capture_progress) / float(capture_required_steps)
+    #     frac = max(0.0, min(frac, 1.0))
+    #     w_cap = 0.05  # 捕获进度奖励权重（可调）
+    #     reward += w_cap * frac
 
     # 3) 时间惩罚：鼓励更快结束
     time_penalty = 0.001  # 每步小惩罚（可调）

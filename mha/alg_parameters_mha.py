@@ -4,7 +4,7 @@ from map_config import EnvParameters
 class SetupParameters:
     SEED = 1234
     NUM_GPU = 1
-    USE_GPU_LOCAL = False
+    USE_GPU_LOCAL = True
     USE_GPU_GLOBAL = True
     PRETRAINED_TARGET_PATH = None
     PRETRAINED_TRACKER_PATH = None
@@ -14,12 +14,13 @@ class TrainingParameters:
     LR_FINAL = 3e-5
     LR_SCHEDULE = 'cosine'
     
-    N_ENVS = 4
-    N_STEPS = 512        # Steps per environment rollout
-    N_MAX_STEPS = 6e7    # Total training steps
-    LOG_EPOCH_STEPS = int(2e5)
+    N_ENVS = 3
+    N_STEPS = 1024        # Steps per environment rollout
+    N_MAX_STEPS = 7e7    # Total training steps
+    LOG_EPOCH_STEPS = 5e4
     
-    MINIBATCH_SIZE = 512
+    MINIBATCH_SIZE = 64 
+    
     # For MHA, this defines the sequence length for training (Context Window)
     TBPTT_STEPS = 32     
     N_EPOCHS = 4
@@ -75,9 +76,10 @@ class RecordingParameters:
     MODEL_PATH = f'./models/TrackingEnv/{EXPERIMENT_NAME}{TIME}'
     GIFS_PATH = f'./models/TrackingEnv/{EXPERIMENT_NAME}{TIME}/gifs'
     
-    EVAL_INTERVAL = 400000
-    SAVE_INTERVAL = 500000
+    EVAL_INTERVAL = 100000   # 降低评估间隔
+    SAVE_INTERVAL = 200000   # 降低保存间隔
     BEST_INTERVAL = 0
+    GIF_INTERVAL = 200000    # 添加 GIF 间隔
     EVAL_EPISODES = 16
     
     LOSS_NAME = [

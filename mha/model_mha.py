@@ -1,7 +1,5 @@
 import numpy as np
 import torch
-from torch.cuda.amp.autocast_mode import autocast
-from torch.cuda.amp.grad_scaler import GradScaler
 from typing import Optional, Tuple, List
 
 from mha.alg_parameters_mha import NetParameters, TrainingParameters
@@ -37,14 +35,9 @@ class Model(object):
         self.network = ProtectingNetMHA().to(device)
         
         if global_model:
-            self.net_optimizer = torch.optim.Adam(
-                self.network.parameters(),
-                lr=TrainingParameters.lr
-            )
-            self.net_scaler = GradScaler()
+            self.net_optimizer = torch.optim.Adam(self.network.parameters(), lr=TrainingParameters.lr)
         else:
             self.net_optimizer = None
-            self.net_scaler = None
             
         self.network.train()
         self.current_lr = TrainingParameters.lr
@@ -168,108 +161,119 @@ class Model(object):
             mask = torch.as_tensor(mask, dtype=torch.float32, device=self.device)
             
         valid_steps = mask.sum().clamp_min(1.0)
-        
-        # 1. Compute RL Gradients
-        with autocast():
-            policy_mean, new_values, policy_log_std = self.network(actor_obs, critic_obs)
-            new_values = new_values.squeeze(-1)
-            
-            # Calculate losses
-            new_action_log_probs = self._log_prob_from_pre_tanh(actions, policy_mean, policy_log_std)
-            
-            raw_advantages = returns - values
-            # Normalize advantages
-            valid_mask = mask > 0
-            if valid_mask.sum() > 1:
-                adv_mean = raw_advantages[valid_mask].mean()
-                adv_std = raw_advantages[valid_mask].std()
-                advantages = (raw_advantages - adv_mean) / (adv_std + 1e-8)
-            else:
-                advantages = raw_advantages
-            advantages = advantages * mask
-            
-            ratio = torch.exp(new_action_log_probs - old_log_probs)
-            surr1 = ratio * advantages
-            surr2 = torch.clamp(ratio, 1.0 - TrainingParameters.CLIP_RANGE, 
-                                1.0 + TrainingParameters.CLIP_RANGE) * advantages
-            policy_loss = -torch.min(surr1, surr2).sum() / valid_steps
-            
-            entropy = (0.5 * (1.0 + np.log(2 * np.pi)) + policy_log_std).sum(dim=-1)
-            entropy_loss = -entropy.sum() / valid_steps
-            
-            value_clipped = values + torch.clamp(new_values - values, 
-                                                 -TrainingParameters.VALUE_CLIP_RANGE,
-                                                 TrainingParameters.VALUE_CLIP_RANGE)
-            v_loss1 = (new_values - returns) ** 2
-            v_loss2 = (value_clipped - returns) ** 2
-            value_loss = torch.max(v_loss1, v_loss2).sum() / valid_steps
-            
-            total_loss = policy_loss + TrainingParameters.EX_VALUE_COEF * value_loss + TrainingParameters.ENTROPY_COEF * entropy_loss
-            
-        self.net_scaler.scale(total_loss).backward()
-        
-        # 2. Gradient Projection (if IL data provided)
+
+        # --- 1. Compute IL Gradients (if available) ---
+        il_grads = {}
+        il_loss_value = None
         if il_batch is not None:
-            self.net_scaler.unscale_(self.net_optimizer)
-            
-            # Store RL gradients
-            rl_grads = {}
-            for name, param in self.network.named_parameters():
-                if param.grad is not None:
-                    rl_grads[name] = param.grad.clone()
-            
-            # Zero grads to compute IL gradients
-            self.net_optimizer.zero_grad(set_to_none=True)
-            
-            # Prepare IL data
             il_actor = torch.as_tensor(il_batch['actor_obs'], dtype=torch.float32, device=self.device)
             il_critic = torch.as_tensor(il_batch['critic_obs'], dtype=torch.float32, device=self.device)
             il_actions = torch.as_tensor(il_batch['actions'], dtype=torch.float32, device=self.device)
             il_mask = torch.as_tensor(il_batch['mask'], dtype=torch.float32, device=self.device) if 'mask' in il_batch else None
-            
-            with autocast():
-                mean, _, log_std = self.network(il_actor, il_critic)
-                il_log_prob = self._log_prob_from_pre_tanh(il_actions, mean, log_std)
-                if il_mask is not None:
-                    il_loss = -(il_log_prob * il_mask).sum() / il_mask.sum().clamp_min(1.0)
-                else:
-                    il_loss = -il_log_prob.mean()
-            
-            self.net_scaler.scale(il_loss).backward()
-            
-            # Manually unscale IL gradients because unscale_() can only be called once per step
-            current_scale = self.net_scaler.get_scale()
-            inv_scale = 1.0 / current_scale
-            for param in self.network.parameters():
-                if param.grad is not None:
-                    param.grad.data.mul_(inv_scale)
-            
-            # Project RL gradients onto IL gradients
-            for name, param in self.network.named_parameters():
-                if param.grad is not None and name in rl_grads:
-                    g_il = param.grad
-                    g_rl = rl_grads[name]
-                    # Project RL gradient
-                    param.grad = get_grad_projection(g_rl, g_il)
-                elif name in rl_grads:
-                    # If no IL gradient, keep RL gradient
-                    param.grad = rl_grads[name]
-        else:
-            self.net_scaler.unscale_(self.net_optimizer)
 
+            mean_il, _, log_std_il = self.network(il_actor, il_critic)
+            
+            # 修复：使用 MSE Loss
+            # mean_il 是 pre_tanh，expert_actions 是 tanh 后的值
+            # 所以比较 tanh(mean_il) 和 expert_actions
+            pred_actions = torch.tanh(mean_il)  # 预测动作
+            
+            # MSE Loss
+            mse = ((pred_actions - il_actions) ** 2).sum(dim=-1)  # (B, T)
+            
+            if il_mask is not None:
+                il_loss = (mse * il_mask).sum() / il_mask.sum().clamp_min(1.0)
+            else:
+                il_loss = mse.mean()
+
+            il_loss_value = float(il_loss.item())
+            
+            # 只有 loss 合理时才计算梯度
+            if torch.isfinite(il_loss) and il_loss_value > 0:
+                il_loss.backward()
+                
+                for name, param in self.network.named_parameters():
+                    if param.grad is not None:
+                        il_grads[name] = param.grad.clone()
+                
+                self.net_optimizer.zero_grad(set_to_none=True)
+        
+        # --- 2. Compute RL Gradients ---
+        mean, value, log_std = self.network(actor_obs, critic_obs)
+        new_values = value.squeeze(-1) # (Batch, Seq)
+        
+        # Recover pre_tanh from actions
+        action_pre_tanh = torch.atanh(torch.clamp(actions, -1.0 + 1e-7, 1.0 - 1e-7))
+        new_action_log_probs = self._log_prob_from_pre_tanh(action_pre_tanh, mean, log_std)
+        
+        raw_advantages = returns - values
+        # Normalize advantages
+        valid_mask = mask > 0
+        if valid_mask.sum() > 1:
+            adv_mean = raw_advantages[valid_mask].mean()
+            adv_std = raw_advantages[valid_mask].std()
+            advantages = (raw_advantages - adv_mean) / (adv_std + 1e-5)
+        else:
+            advantages = raw_advantages
+        advantages = advantages * mask
+        
+        ratio = torch.exp(new_action_log_probs - old_log_probs)
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1.0 - TrainingParameters.CLIP_RANGE, 
+                            1.0 + TrainingParameters.CLIP_RANGE) * advantages
+        policy_loss = -torch.min(surr1, surr2).sum() / valid_steps
+        
+        entropy = (0.5 * (1.0 + np.log(2 * np.pi)) + log_std).sum(dim=-1)
+        entropy_loss = -(entropy * mask).sum() / valid_steps
+        
+        value_clipped = values + torch.clamp(new_values - values, 
+                                             -TrainingParameters.VALUE_CLIP_RANGE,
+                                             TrainingParameters.VALUE_CLIP_RANGE)
+        v_loss1 = (new_values - returns) ** 2
+        v_loss2 = (value_clipped - returns) ** 2
+        value_loss = (torch.max(v_loss1, v_loss2) * mask).sum() / valid_steps
+        
+        total_loss = policy_loss + TrainingParameters.EX_VALUE_COEF * value_loss + TrainingParameters.ENTROPY_COEF * entropy_loss
+
+        # Check for invalid loss before backward
+        if not torch.isfinite(total_loss):
+            return {'losses': [float('nan')] * 10, 'il_loss': il_loss_value}
+
+        total_loss.backward() 
+        
+        # Gradient Clipping
         grad_norm = torch.nn.utils.clip_grad_norm_(self.network.parameters(), TrainingParameters.MAX_GRAD_NORM)
-        self.net_scaler.step(self.net_optimizer)
-        self.net_scaler.update()
+
+        # --- 3. Gradient Projection (RL projected onto IL) ---
+        for name, param in self.network.named_parameters():
+            g_rl = param.grad
+            g_il = il_grads.get(name)
+            
+            if g_rl is None and g_il is None:
+                continue
+            elif g_il is None:
+                pass 
+            elif g_rl is None:
+                param.grad = g_il.clone()
+            else:
+                projected = get_grad_projection(g_rl, g_il)
+                param.grad = projected
+
+        self.net_optimizer.step()
         
-        approx_kl = ((old_log_probs - new_action_log_probs) * mask).sum() / valid_steps
-        clipfrac = ((ratio - 1.0).abs() > TrainingParameters.CLIP_RANGE).float().sum() / valid_steps
+        # Calculate metrics for logging
+        with torch.no_grad():
+            log_ratio = new_action_log_probs - old_log_probs
+            approx_kl = ((torch.exp(log_ratio) - 1) - log_ratio).mean()
+            clipfrac = ((ratio - 1.0).abs() > TrainingParameters.CLIP_RANGE).float().mean()
+
+        losses = [total_loss.item(), policy_loss.item(), entropy_loss.item(), value_loss.item(),
+                0.0, approx_kl.item(), 0.0, clipfrac.item(), float(grad_norm), 0.0]
         
-        return [
-            total_loss.item(), policy_loss.item(), entropy_loss.item(), value_loss.item(),
-            0.0, approx_kl.item(), 0.0, clipfrac.item(), grad_norm.item(), 0.0
-        ]
+        return {'losses': losses, 'il_loss': il_loss_value}
 
     def imitation_train(self, actor_obs, critic_obs, optimal_actions):
+        """单独的 IL 训练，使用 MSE loss"""
         self.net_optimizer.zero_grad(set_to_none=True)
         
         actor_obs = torch.as_tensor(actor_obs, dtype=torch.float32, device=self.device)
@@ -279,23 +283,22 @@ class Model(object):
         if actor_obs.dim() == 2:
             actor_obs = actor_obs.unsqueeze(1)
             critic_obs = critic_obs.unsqueeze(1)
+            optimal_actions = optimal_actions.unsqueeze(1)
             
-        with autocast():
-            mean, _, log_std = self.network(actor_obs, critic_obs)
-            # mean is (B, 1, ActionDim)
-            mean = mean.squeeze(1)
-            log_std = log_std.squeeze(1)
-            
-            log_prob = self._log_prob_from_pre_tanh(optimal_actions, mean, log_std)
-            loss = -log_prob.mean()
-            
-        self.net_scaler.scale(loss).backward()
-        self.net_scaler.unscale_(self.net_optimizer)
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.network.parameters(), TrainingParameters.MAX_GRAD_NORM)
-        self.net_scaler.step(self.net_optimizer)
-        self.net_scaler.update()
+        mean, _, log_std = self.network(actor_obs, critic_obs)
         
-        return [loss.item(), grad_norm.item()]
+        # MSE: 比较 tanh(mean) 和 expert_actions
+        pred_actions = torch.tanh(mean)
+        il_loss = ((pred_actions - optimal_actions) ** 2).mean()
+            
+        if torch.isfinite(il_loss):
+            il_loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.network.parameters(), TrainingParameters.MAX_GRAD_NORM)
+            self.net_optimizer.step()
+        else:
+            grad_norm = 0.0
+        
+        return [float(il_loss.item()), float(grad_norm)]
 
     def set_weights(self, weights):
         self.network.load_state_dict(weights)
