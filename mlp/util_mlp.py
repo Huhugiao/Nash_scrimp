@@ -17,7 +17,7 @@ try:
 except Exception:
     wandb = None
 
-from lstm.alg_parameters import *  # 使用通用参数
+from mlp.alg_parameters_mlp import *  # 使用 MLP 通用参数
 from map_config import EnvParameters
 
 
@@ -175,17 +175,19 @@ def update_perf(one_ep, perf):
 
 def build_critic_observation(actor_obs, opponent_strategy=None, policy_manager=None):
     """构建critic观测：actor_obs + opponent_id context"""
-    from lstm.alg_parameters import NetParameters  # 确保导入
+    from mlp.alg_parameters_mlp import NetParameters  # 确保导入 MLP 参数
     
     actor_vec = np.asarray(actor_obs, dtype=np.float32).reshape(-1)
     
     # 不再强制填充，使用实际观测长度
     # Tracker: 27维, Target: 24维
     
-    context = np.zeros(NetParameters.CONTEXT_LEN, dtype=np.float32)
-    if opponent_strategy is not None and policy_manager is not None:
-        policy_id = policy_manager.get_policy_id(opponent_strategy)
-        if policy_id is not None and policy_id >= 0:
-            context = get_opponent_id_one_hot(policy_id)
-
-    return np.concatenate([actor_vec, context], axis=0)
+    # 注意：这里已经去掉了 CONTEXT_LEN 的依赖，因为 MLP 版本用 CTDE
+    # 如果还需要 context，必须确保 NetParameters 里有定义
+    # 但根据之前的修改，MLP 应该不再使用这个函数或者这个函数应该被重写
+    # 这里保留原逻辑但指向正确的参数文件
+    
+    # 实际上 MLP 的 build_critic_observation 已经在 evaluate_mlp.py 中重写了
+    # 这个 util 函数可能是给旧代码用的，但为了安全，我们指向 mlp 参数
+    
+    return actor_vec # 暂时直接返回，因为 MLP 不用这个

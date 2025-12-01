@@ -10,21 +10,11 @@ class ProtectingNetMLP(nn.Module):
         self.hidden_dim = NetParameters.HIDDEN_DIM
         
         # --- Actor Network ---
-        # Input: 27 dims
-        # Scalar features: indices 0-10 (11 dims)
-        # Radar features: indices 11-26 (16 dims)
-        
-        self.actor_scalar_enc = nn.Sequential(
-            nn.Linear(11, self.hidden_dim // 2),
-            nn.Tanh()
-        )
-        self.actor_radar_enc = nn.Sequential(
-            nn.Linear(16, self.hidden_dim // 2),
-            nn.Tanh()
-        )
-        
-        # Fused backbone
+        # Input: 27 dims (Direct Concatenation of Scalar + Radar)
+        # Structure: 3 Hidden Layers
         self.actor_backbone = nn.Sequential(
+            nn.Linear(NetParameters.ACTOR_VECTOR_LEN, self.hidden_dim),
+            nn.Tanh(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.Tanh(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
@@ -34,22 +24,12 @@ class ProtectingNetMLP(nn.Module):
         self.policy_mean = nn.Linear(self.hidden_dim, NetParameters.ACTION_DIM)
         self.log_std = nn.Parameter(torch.zeros(NetParameters.ACTION_DIM))
         
-        # --- Critic Network ---
-        # Input: 27 dims + Context
-        # Scalar features: indices 0-10 + Context (indices 27+)
-        # Radar features: indices 11-26
-        
-        critic_scalar_dim = 11 + NetParameters.CONTEXT_LEN
-        self.critic_scalar_enc = nn.Sequential(
-            nn.Linear(critic_scalar_dim, self.hidden_dim // 2),
-            nn.Tanh()
-        )
-        self.critic_radar_enc = nn.Sequential(
-            nn.Linear(16, self.hidden_dim // 2),
-            nn.Tanh()
-        )
-        
+        # --- Critic Network (CTDE) ---
+        # Input: 51 dims (Tracker Obs + Target Obs)
+        # Structure: 3 Hidden Layers
         self.critic_backbone = nn.Sequential(
+            nn.Linear(NetParameters.CRITIC_VECTOR_LEN, self.hidden_dim),
+            nn.Tanh(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.Tanh(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
@@ -58,6 +38,19 @@ class ProtectingNetMLP(nn.Module):
         
         self.value_head = nn.Linear(self.hidden_dim, 1)
         
+        # --- Q-Network ---
+        # Input: Critic Obs (51) + Action (2) = 53 dims
+        # Structure: 3 Hidden Layers
+        self.q_backbone = nn.Sequential(
+            nn.Linear(NetParameters.CRITIC_VECTOR_LEN + NetParameters.ACTION_DIM, self.hidden_dim),
+            nn.Tanh(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.Tanh(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.Tanh(),
+            nn.Linear(self.hidden_dim, 1)
+        )
+
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -68,32 +61,30 @@ class ProtectingNetMLP(nn.Module):
 
     def forward(self, actor_obs, critic_obs):
         # --- Actor Forward ---
-        a_scalar = actor_obs[..., :11]
-        a_radar = actor_obs[..., 11:27]
-        
-        a_s_emb = self.actor_scalar_enc(a_scalar)
-        a_r_emb = self.actor_radar_enc(a_radar)
-        
-        # Fuse
-        a_feat = torch.cat([a_s_emb, a_r_emb], dim=-1)
-        a_out = self.actor_backbone(a_feat)
-        
+        # actor_obs: [Batch, 27]
+        a_out = self.actor_backbone(actor_obs)
         mean = self.policy_mean(a_out)
         
-        # --- Critic Forward ---
-        # Critic obs: [Tracker(27), Context(N)]
-        c_scalar = torch.cat([critic_obs[..., :11], critic_obs[..., 27:]], dim=-1)
-        c_radar = critic_obs[..., 11:27]
-        
-        c_s_emb = self.critic_scalar_enc(c_scalar)
-        c_r_emb = self.critic_radar_enc(c_radar)
-        
-        c_feat = torch.cat([c_s_emb, c_r_emb], dim=-1)
-        c_out = self.critic_backbone(c_feat)
-        
-        value = self.value_head(c_out)
-        
-        # Expand log_std to match batch size if needed, though usually broadcasted
+        # Expand log_std to match batch size
         log_std = self.log_std.expand_as(mean)
         
+        # --- Critic Forward ---
+        # critic_obs: [Batch, 51]
+        c_out = self.critic_backbone(critic_obs)
+        value = self.value_head(c_out)
+        
         return mean, value, log_std
+
+    def forward_q(self, critic_obs, action):
+        # Flatten inputs to handle [Batch, Seq, Dim] or [Batch, Dim]
+        state_flat = critic_obs.reshape(-1, critic_obs.shape[-1])
+        action_flat = action.reshape(-1, action.shape[-1])
+        
+        # Concatenate State + Action
+        q_in = torch.cat([state_flat, action_flat], dim=-1)
+        
+        # Forward
+        q_val = self.q_backbone(q_in)
+        
+        # Reshape back to original batch structure
+        return q_val.view(*critic_obs.shape[:-1], 1)

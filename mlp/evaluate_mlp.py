@@ -1,4 +1,8 @@
 import os
+import sys
+# Add project root to sys.path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 # 设置SDL为dummy模式，避免在多进程或无显示环境中初始化图形界面导致错误
 os.environ["SDL_VIDEODRIVER"] = "dummy"
 
@@ -17,8 +21,8 @@ from collections import defaultdict
 from env import TrackingEnv
 from mlp.model_mlp import Model
 from mlp.alg_parameters_mlp import *  # Use MLP-specific parameters
-from util import make_gif, get_opponent_id_one_hot
-from policymanager import PolicyManager
+from mlp.util_mlp import make_gif
+from mlp.policymanager_mlp import PolicyManager
 from rule_policies import CBFTracker, GreedyTarget, TRACKER_POLICY_REGISTRY, TARGET_POLICY_REGISTRY
 
 # Simplified choices derived from registries
@@ -201,11 +205,11 @@ def run_single_episode(config, episode_idx, tracker_model, target_model, device,
                 tracker_opp_strategy = tracker_strategy if config.tracker_type != "policy" else None
 
                 tracker_critic_obs = build_critic_observation(
-                    tracker_actor_obs, target_opp_strategy, policy_manager
+                    tracker_actor_obs, target_actor_obs
                 )
 
                 target_critic_obs = build_critic_observation(
-                    target_actor_obs, tracker_opp_strategy, policy_manager
+                    target_actor_obs, tracker_actor_obs
                 )
 
                 t_action = _get_tracker_action(
@@ -465,21 +469,16 @@ def _get_target_action(config, model, policy_obj, strategy, actor_obs, critic_ob
         return action, None, None
 
 
-def build_critic_observation(actor_obs, opponent_strategy=None, policy_manager=None):
+def build_critic_observation(actor_obs, other_obs):
+    """
+    构建critic观测 (CTDE): Self Obs + Other Obs (God View)
+    """
     actor_vec = np.asarray(actor_obs, dtype=np.float32).reshape(-1)
-    if actor_vec.shape[0] < NetParameters.ACTOR_VECTOR_LEN:
-        pad = NetParameters.ACTOR_VECTOR_LEN - actor_vec.shape[0]
-        actor_vec = np.pad(actor_vec, (0, pad), mode="constant")
-    elif actor_vec.shape[0] > NetParameters.ACTOR_VECTOR_LEN:
-        actor_vec = actor_vec[:NetParameters.ACTOR_VECTOR_LEN]
-
-    context = np.zeros(NetParameters.CONTEXT_LEN, dtype=np.float32)
-    if opponent_strategy is not None and policy_manager is not None:
-        policy_id = policy_manager.get_policy_id(opponent_strategy)
-        if policy_id is not None and policy_id >= 0:
-            context = get_opponent_id_one_hot(policy_id)
-
-    return np.concatenate([actor_vec, context], axis=0)
+    other_vec = np.asarray(other_obs, dtype=np.float32).reshape(-1)
+    
+    # Ensure shapes match expected lengths if needed, or just concat
+    # For simplicity in evaluation, we assume shapes are correct from env
+    return np.concatenate([actor_vec, other_vec], axis=0)
 
 
 def analyze_strategy_performance(df):
@@ -638,8 +637,8 @@ def run_battle(config, strategy_name=None):
     config.run_dir = os.path.join(config.output_dir, run_name)
     os.makedirs(config.run_dir, exist_ok=True)
 
-    np.random.seed(config.seed)
-    torch.manual_seed(config.seed)
+    from mlp.util_mlp import set_global_seeds
+    set_global_seeds(config.seed)
 
     num_processes = min(multiprocessing.cpu_count() // 2, 6)
     batch_size = max(10, config.episodes // max(num_processes, 1))
@@ -745,7 +744,7 @@ Available Strategies:
                        help=f'Target type: {", ".join(TARGET_TYPE_CHOICES)}')
 
     parser.add_argument('--tracker_model', type=str,
-                       default='./models/TrackingEnv/mlp_ppo_11-28-13-36/best_model/checkpoint.pth',
+                       default='./models/mlp_ppo_oneop_rl_12-01-16-19/best_model/checkpoint.pth',
                        help='Path to tracker model (required when --tracker=policy)')
     parser.add_argument('--target_model', type=str, default=None,
                        help='Path to target model (required when --target=policy)')

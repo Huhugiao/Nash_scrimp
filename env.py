@@ -462,6 +462,8 @@ class TrackingEnv(gym.Env):
 
         reward, terminated, truncated, info = env_lib.reward_calculate(
             self.tracker, self.target,
+            prev_tracker=self.prev_tracker_pos,
+            prev_target=self.prev_target_pos,
             tracker_collision=bool(tracker_corrected),
             target_collision=bool(target_corrected),
             sector_captured=bool(sector_captured),

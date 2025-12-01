@@ -87,7 +87,7 @@ def _parse_observation(observation):
             'radar': obs[11:27].astype(np.float64)
         }
     else:
-        raise ValueError(f"Unexpected observation dimension: {obs.shape[0]}, expected 24 or 27")
+        raise ValueError(f"Unexpected observation dimension: {obs.shape[0]}, expected 24 (target) or 27 (tracker)")
 
 
 # ============================================================================
@@ -463,9 +463,6 @@ class APFTarget:
 
     def get_action(self, observation):
         parsed = _parse_observation(observation)
-        if parsed.get('obs_type') != 'target':
-            raise ValueError("APF target policy requires target observation")
-
         # 1. Repulsive force from Tracker
         cur_pos = np.array([parsed['self_x'], parsed['self_y']])
         tracker_pos = np.array([parsed['tracker_x'], parsed['tracker_y']])

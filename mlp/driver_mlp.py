@@ -25,27 +25,16 @@ from mlp.alg_parameters_mlp import *
 from env import TrackingEnv
 from mlp.model_mlp import Model
 from mlp.runner_mlp import Runner
-from util import set_global_seeds, make_gif, get_opponent_id_one_hot
+from mlp.util_mlp import set_global_seeds, make_gif, write_to_tensorboard
 from rule_policies import TARGET_POLICY_REGISTRY
-from policymanager import PolicyManager
+from mlp.policymanager_mlp import PolicyManager
 
-IL_INITIAL_PROB = 1.0
-IL_FINAL_PROB = 0.05
-IL_DECAY_STEPS = 3e6
 
-IL_PHASE1_NEW_RATIO = 0.6
-IL_PHASE2_NEW_RATIO = 0.3
-
-PURE_RL_SWITCH = 0
-if PURE_RL_SWITCH:
-	IL_INITIAL_PROB = 0.0
-	IL_FINAL_PROB = 0.0
-	IL_DECAY_STEPS = 1.0
 
 if not ray.is_initialized():
 	ray.init(num_gpus=SetupParameters.NUM_GPU)
 
-print("Welcome to SCRIMP with MLP - Training Tracker!")
+print("Welcome to TrackerMaker with MLP - Training Tracker!")
 if TrainingParameters.OPPONENT_TYPE in {"random", "random_nonexpert"}:
 	available = sorted(list(TARGET_POLICY_REGISTRY.keys()))
 	weights = TrainingParameters.RANDOM_OPPONENT_WEIGHTS.get("target", {})
@@ -53,7 +42,7 @@ if TrainingParameters.OPPONENT_TYPE in {"random", "random_nonexpert"}:
 	print(f"  Available target policies: {', '.join(available)}")
 	print(f"  Sampling weights: {weights}")
 	print(f"  Adaptive sampling: {'ENABLED' if TrainingParameters.ADAPTIVE_SAMPLING else 'DISABLED'}")
-print(f"IL probability will cosine anneal from {IL_INITIAL_PROB*100:.1f}% to {IL_FINAL_PROB*100:.1f}% over {IL_DECAY_STEPS:.0f} steps")
+print(f"IL probability is FIXED at {TrainingParameters.IL_INITIAL_PROB*100:.1f}% (relies on Q-filter)")
 
 def_attr = lambda name, default: getattr(RecordingParameters, name, default)
 MODEL_PATH = def_attr('MODEL_PATH', './models/TrackingEnv/mlp')
@@ -66,11 +55,11 @@ BEST_INTERVAL = int(def_attr('BEST_INTERVAL', 0))
 GIF_INTERVAL = int(def_attr('GIF_INTERVAL', 200000))
 EVAL_EPISODES = int(def_attr('EVAL_EPISODES', 16))
 
-def get_cosine_annealing_il_prob(current_step):
-	if current_step >= IL_DECAY_STEPS:
-		return IL_FINAL_PROB
-	cosine_decay = 0.5 * (1 + math.cos(math.pi * current_step / IL_DECAY_STEPS))
-	return IL_FINAL_PROB + (IL_INITIAL_PROB - IL_FINAL_PROB) * cosine_decay
+# def get_cosine_annealing_il_prob(current_step):
+# 	if current_step >= IL_DECAY_STEPS:
+# 		return IL_FINAL_PROB
+# 	cosine_decay = 0.5 * (1 + math.cos(math.pi * current_step / IL_DECAY_STEPS))
+# 	return IL_FINAL_PROB + (IL_INITIAL_PROB - IL_FINAL_PROB) * cosine_decay
 
 def get_scheduled_lr(current_step):
 	final_lr = getattr(TrainingParameters, 'LR_FINAL', TrainingParameters.lr)
@@ -222,22 +211,7 @@ def sample_il_data_mixed(all_il_segments, il_buffer, batch_size, new_ratio=0.5):
 			samples.extend(random.sample(available, n_extra))
 	return samples if samples else None
 
-def compute_adaptive_new_ratio(recent_il_losses, recent_win_rates, phase):
-	base_ratio = IL_PHASE1_NEW_RATIO if phase == 1 else IL_PHASE2_NEW_RATIO
-	if len(recent_il_losses) < 10 or len(recent_win_rates) < 10:
-		return base_ratio
-	avg_loss = float(np.mean(recent_il_losses))
-	avg_win = float(np.mean(recent_win_rates))
-	adjustment = 0.0
-	if avg_loss > 2.0:
-		adjustment += 0.1
-	elif avg_loss < 0.5:
-		adjustment -= 0.1
-	if avg_win < 0.2:
-		adjustment -= 0.15
-	elif avg_win > 0.5:
-		adjustment += 0.1
-	return np.clip(base_ratio + adjustment, 0.2, 0.8)
+
 
 def compute_performance_stats(performance_dict):
 	stats = {}
@@ -250,12 +224,11 @@ def compute_performance_stats(performance_dict):
 			stats[f'{key}_std'] = 0.0
 	return stats
 
-def format_train_log(curr_steps, curr_episodes, il_prob, train_stats, il_buffer_size):
+def format_train_log(curr_steps, curr_episodes, il_prob, train_stats):
 	parts = [
 		f"[TRAIN] step={curr_steps:,}",
 		f"ep={curr_episodes:,}",
-		f"ILp={il_prob*100:5.1f}%",
-		f"IL_buf={il_buffer_size}"
+		f"ILp={il_prob*100:5.1f}%"
 	]
 	if train_stats:
 		parts.append(f"Rew={train_stats.get('per_r_mean', 0):.2f}±{train_stats.get('per_r_std', 0):.2f}")
@@ -293,11 +266,11 @@ def evaluate_single_agent(eval_env, agent_model, opponent_model, device):
 			current_policy, current_opponent_id = eval_pm.sample_policy("target")
 			eval_pm.reset()
 		while not done and ep_len < EnvParameters.EPISODE_LEN:
-			critic_obs = np.concatenate([tracker_obs, get_opponent_id_one_hot(current_opponent_id)], axis=0)
+			critic_obs = np.concatenate([tracker_obs, target_obs], axis=0)
 			agent_action, _, _, _ = agent_model.evaluate(tracker_obs, critic_obs, greedy=True)
 			if TrainingParameters.OPPONENT_TYPE == "policy" and opponent_model:
-				dummy_context = np.zeros(NetParameters.CONTEXT_LEN, dtype=np.float32)
-				opp_critic = np.concatenate([target_obs, dummy_context], axis=0)
+				# Target Critic sees Target Obs + Tracker Obs (Symmetric CTDE)
+				opp_critic = np.concatenate([target_obs, tracker_obs], axis=0)
 				target_action, _, _, _ = opponent_model.evaluate(target_obs, opp_critic, greedy=True)
 			elif eval_pm and current_policy:
 				target_action = eval_pm.get_action(current_policy, target_obs)
@@ -334,11 +307,10 @@ def _record_eval_gif(eval_env, agent_model, opponent_model, device, gif_path):
 		pass
 	with torch.no_grad():
 		while not done and ep_len < EnvParameters.EPISODE_LEN:
-			critic_obs = np.concatenate([tracker_obs, get_opponent_id_one_hot(current_opponent_id)], axis=0)
+			critic_obs = np.concatenate([tracker_obs, target_obs], axis=0)
 			agent_action, _, _, _ = agent_model.evaluate(tracker_obs, critic_obs, greedy=True)
 			if TrainingParameters.OPPONENT_TYPE == "policy" and opponent_model:
-				dummy_context = np.zeros(NetParameters.CONTEXT_LEN, dtype=np.float32)
-				opp_critic = np.concatenate([target_obs, dummy_context], axis=0)
+				opp_critic = np.concatenate([target_obs, tracker_obs], axis=0)
 				target_action, _, _, _ = opponent_model.evaluate(target_obs, opp_critic, greedy=True)
 			elif eval_pm and current_policy:
 				target_action = eval_pm.get_action(current_policy, target_obs)
@@ -357,7 +329,6 @@ def _record_eval_gif(eval_env, agent_model, opponent_model, device, gif_path):
 	if len(frames) > 1:
 		os.makedirs(os.path.dirname(gif_path), exist_ok=True)
 		make_gif(frames, gif_path, fps=EnvParameters.N_ACTIONS // 2)
-		print(f"GIF saved: {gif_path}")
 
 def main():
 	model_dict = None
@@ -387,24 +358,24 @@ def main():
 	curr_steps = int(model_dict.get('step', 0)) if model_dict else 0
 	curr_episodes = int(model_dict.get('episode', 0)) if model_dict else 0
 	best_perf = float(model_dict.get('reward', -1e9)) if model_dict else -1e9
-	il_buffer = deque(maxlen=10000)
+	# il_buffer removed
 	epoch_perf_buffer = {'per_r': [], 'per_episode_len': [], 'win': []}
 	epoch_loss_buffer = []
+	epoch_opponents = []
 	last_test_t = 0
 	last_model_t = 0
 	last_best_t = 0
 	last_gif_t = 0
 	last_train_log_t = 0
-	phase = 1
-	IL_LOSS_THRESHOLD = 0.5
-	recent_il_losses = deque(maxlen=100)
+	# phase removed
+	# recent_il_losses removed
 	recent_win_rates = deque(maxlen=100)
 	il_action_errors = deque(maxlen=500)
 	os.makedirs(MODEL_PATH, exist_ok=True)
 	os.makedirs(GIFS_PATH, exist_ok=True)
 	try:
 		while curr_steps < TrainingParameters.N_MAX_STEPS:
-			il_prob = 1.0 if phase == 1 else get_cosine_annealing_il_prob(curr_steps)
+			il_prob = TrainingParameters.IL_INITIAL_PROB # Use configured probability
 			new_lr = get_scheduled_lr(curr_steps)
 			training_model.update_learning_rate(new_lr)
 			model_weights = training_model.get_weights()
@@ -420,7 +391,8 @@ def main():
 			for result in results:
 				rl_data = extract_rl_data_from_rollout(result)
 				all_rl_segments.extend(build_segments_from_rollout(rl_data, NetParameters.CONTEXT_WINDOW))
-				il_segments = extract_il_data_from_rollout(result, phase=phase)
+				# No phase argument needed now
+				il_segments = extract_il_data_from_rollout(result, phase=1) 
 				all_il_segments.extend(il_segments)
 				perf = result['performance']
 				epoch_perf_buffer['per_r'].extend(perf['per_r'])
@@ -437,11 +409,17 @@ def main():
 				if global_pm and result['policy_manager_state']:
 					for name, history in result['policy_manager_state'].items():
 						global_pm.win_history[name] = deque(history, maxlen=TrainingParameters.ADAPTIVE_SAMPLING_WINDOW)
-			il_buffer.extend(all_il_segments)
+				if 'completed_opponents' in result and result['completed_opponents']:
+					epoch_opponents.extend(result['completed_opponents'])
+			# il_buffer.extend(all_il_segments) removed
 			curr_steps += TrainingParameters.N_ENVS * TrainingParameters.N_STEPS
 			curr_episodes += total_new_episodes
-			adaptive_new_ratio = compute_adaptive_new_ratio(recent_il_losses, recent_win_rates, phase)
+			
+			# Simplify IL sampling: only use fresh data (all_il_segments)
+			
 			batch_il_losses = []
+			batch_q_losses = []
+			il_filter_ratios = []
 			if all_rl_segments:
 				random.shuffle(all_rl_segments)
 				for _ in range(TrainingParameters.N_EPOCHS):
@@ -451,58 +429,103 @@ def main():
 						if not batch_segments:
 							continue
 						batch = collate_segments(batch_segments)
+						
+						# Sample IL data from fresh segments only
 						il_batch = None
-						if phase == 1:
-							il_samples = sample_il_data_mixed(all_il_segments, il_buffer, TrainingParameters.MINIBATCH_SIZE, adaptive_new_ratio)
-						else:
-							il_samples = sample_il_data_mixed(all_il_segments, il_buffer, TrainingParameters.MINIBATCH_SIZE // 2, adaptive_new_ratio)
-						if il_samples:
-							il_batch = collate_il_segments(il_samples)
+						if all_il_segments:
+							# Use MINIBATCH_SIZE for IL batch size (1:1 ratio with RL batch size)
+							il_samples = random.sample(all_il_segments, min(len(all_il_segments), TrainingParameters.MINIBATCH_SIZE))
+							il_batch_raw = collate_il_segments(il_samples)
+							
+							# flatten IL batch to per-sample arrays
+							il_batch = {
+								'actor_obs': il_batch_raw['actor_obs'].reshape(-1, NetParameters.ACTOR_VECTOR_LEN),
+								'critic_obs': il_batch_raw['critic_obs'].reshape(-1, NetParameters.CRITIC_VECTOR_LEN),
+								'actions': il_batch_raw['actions'].reshape(-1, NetParameters.ACTION_DIM),
+								'mask': il_batch_raw['mask'].reshape(-1)
+							}
+						
+						# flatten RL batch to per-sample arrays (merge batch and time dims)
+						B = batch['actor_obs'].shape[0]
+						T = batch['actor_obs'].shape[1]
+						actor_flat = batch['actor_obs'].reshape(-1, NetParameters.ACTOR_VECTOR_LEN)
+						critic_flat = batch['critic_obs'].reshape(-1, NetParameters.CRITIC_VECTOR_LEN)
+						returns_flat = batch['returns'].reshape(-1)
+						values_flat = batch['values'].reshape(-1)
+						actions_flat = batch['actions'].reshape(-1, NetParameters.ACTION_DIM)
+						old_logp_flat = batch['old_log_probs'].reshape(-1)
+						mask_flat = batch['mask'].reshape(-1)
+						
+						# call train with flattened per-sample data
 						result = training_model.train(
-							batch['actor_obs'], batch['critic_obs'],
-							batch['returns'], batch['values'],
-							batch['actions'], batch['old_log_probs'],
-							batch['mask'], il_batch=il_batch
+							actor_flat, critic_flat,
+							returns_flat, values_flat,
+							actions_flat, old_logp_flat,
+							mask_flat, il_batch=il_batch
+							, writer=global_summary, global_step=curr_steps, perf_dict=None
 						)
 						if isinstance(result, dict):
 							epoch_loss_buffer.append(result.get('losses', []))
 							if result.get('il_loss') is not None:
 								batch_il_losses.append(float(result['il_loss']))
+							if result.get('q_loss') is not None:
+								batch_q_losses.append(float(result['q_loss']))
+							if result.get('il_filter_ratio') is not None:
+								il_filter_ratios.append(float(result['il_filter_ratio']))
 						elif isinstance(result, (list, tuple)):
 							epoch_loss_buffer.append(result)
-			if not batch_il_losses and (all_il_segments or len(il_buffer) > 0):
-				il_samples = sample_il_data_mixed(all_il_segments, il_buffer, TrainingParameters.MINIBATCH_SIZE, new_ratio=0.5)
-				il_batch = collate_il_segments(il_samples) if il_samples else None
-				if il_batch is not None:
-					il_result = training_model.imitation_train(il_batch['actor_obs'], il_batch['critic_obs'], il_batch['actions'])
-					if isinstance(il_result, (list, tuple)) and il_result:
-						batch_il_losses.append(float(il_result[0]))
-			if batch_il_losses:
-				recent_il_losses.append(float(np.mean(batch_il_losses)))
+			
+			# No separate imitation_train call needed if we mix in every batch
+			
 			if curr_steps - last_train_log_t >= TrainingParameters.LOG_EPOCH_STEPS:
 				last_train_log_t = curr_steps
 				train_stats = compute_performance_stats(epoch_perf_buffer) if epoch_perf_buffer['per_r'] else {}
-				avg_il_loss = float(np.mean(recent_il_losses)) if recent_il_losses else 0.0
+				avg_il_loss = float(np.mean(batch_il_losses)) if batch_il_losses else 0.0
+				avg_q_loss = float(np.mean(batch_q_losses)) if batch_q_losses else 0.0
 				avg_il_error = float(np.mean(il_action_errors)) if il_action_errors else 0.0
-				log_str = format_train_log(curr_steps, curr_episodes, il_prob, train_stats, len(il_buffer))
-				log_str += f" | phase={phase} | IL_loss={avg_il_loss:.4f} | IL_err={avg_il_error:.4f} | new_ratio={adaptive_new_ratio:.2f}"
+				avg_filter_ratio = float(np.mean(il_filter_ratios)) if il_filter_ratios else 0.0
+				
+				# Opponent Stats
+				opp_counts = {}
+				for opp in epoch_opponents:
+					opp_counts[opp] = opp_counts.get(opp, 0) + 1
+				total_opps = len(epoch_opponents)
+				sorted_opps = sorted(opp_counts.items(), key=lambda x: x[1], reverse=True)
+				
+				opp_str = ""
+				if sorted_opps:
+					top1 = sorted_opps[0]
+					opp_str = f" | Top1={top1[0]}({top1[1]/total_opps*100:.0f}%)"
+					if len(sorted_opps) > 1:
+						top2 = sorted_opps[1]
+						opp_str += f" Top2={top2[0]}({top2[1]/total_opps*100:.0f}%)"
+
+				log_str = format_train_log(curr_steps, curr_episodes, il_prob, train_stats)
+				log_str += f" | IL_loss={avg_il_loss:.4f} | Filter={avg_filter_ratio:.2f}{opp_str}"
 				print(log_str)
 				if global_summary:
-					if train_stats:
-						global_summary.add_scalar('perf/reward', train_stats.get('per_r_mean', 0), curr_steps)
-						global_summary.add_scalar('perf/win_rate', train_stats.get('win_mean', 0), curr_steps)
-					global_summary.add_scalar('train/il_prob', il_prob, curr_steps)
-					global_summary.add_scalar('train/il_buffer_size', len(il_buffer), curr_steps)
-					global_summary.add_scalar('train/lr', new_lr, curr_steps)
-					global_summary.add_scalar('train/il_loss', avg_il_loss, curr_steps)
-					global_summary.add_scalar('train/il_action_error', avg_il_error, curr_steps)
-					global_summary.add_scalar('train/il_new_ratio', adaptive_new_ratio, curr_steps)
-					global_summary.add_scalar('train/phase', phase, curr_steps)
-				if phase == 1 and len(recent_il_losses) >= 20 and avg_il_loss < IL_LOSS_THRESHOLD:
-					phase = 2
-					print(f"[PHASE] Switch to phase 2 (mixed IL+RL) at step={curr_steps}, avg_il_loss={avg_il_loss:.4f}")
+					# Use the refactored write_to_tensorboard
+					from mlp.util_mlp import write_to_tensorboard
+					write_to_tensorboard(global_summary, curr_steps, performance_dict=epoch_perf_buffer, 
+										 mb_loss=epoch_loss_buffer, imitation_loss=[avg_il_loss, 0.0], q_loss=avg_q_loss, evaluate=False)
+					global_summary.add_scalar('Train/LR', new_lr, curr_steps)
+					
+					# Log Filter Ratio
+					if il_filter_ratios:
+						avg_filter_ratio = float(np.mean(il_filter_ratios))
+						global_summary.add_scalar('Train/IL_Filter_Kept_Ratio', avg_filter_ratio, curr_steps)
+					
+					# Log Opponent Distribution
+					if total_opps > 0:
+						for opp, count in opp_counts.items():
+							global_summary.add_scalar(f'Train/Opponent_{opp}', count / total_opps, curr_steps)
+					else:
+						pass
+
 				epoch_perf_buffer = {'per_r': [], 'per_episode_len': [], 'win': []}
 				epoch_loss_buffer = []
+				epoch_opponents = []  # Reset opponent buffer
+				il_filter_ratios = []
 			if curr_steps - last_test_t >= EVAL_INTERVAL:
 				last_test_t = curr_steps
 				eval_reward, eval_win_rate = evaluate_single_agent(eval_env, training_model, opponent_model, global_device)

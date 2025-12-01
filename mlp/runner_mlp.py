@@ -3,9 +3,9 @@ import torch
 import ray
 from mlp.alg_parameters_mlp import *
 from mlp.model_mlp import Model
-from util import set_global_seeds, get_opponent_id_one_hot
+from mlp.util_mlp import set_global_seeds
 from env import TrackingEnv
-from policymanager import PolicyManager
+from mlp.policymanager_mlp import PolicyManager
 from cbf_controller import CBFTracker
 
 @ray.remote(num_cpus=1, num_gpus=SetupParameters.NUM_GPU / max((TrainingParameters.N_ENVS + 1), 1))
@@ -43,8 +43,8 @@ class Runner(object):
 
     def _get_opponent_action(self, target_obs, tracker_obs):
         if TrainingParameters.OPPONENT_TYPE == "policy":
-            dummy_context = np.zeros(NetParameters.CONTEXT_LEN, dtype=np.float32)
-            critic_obs = np.concatenate([target_obs, dummy_context])
+            # Target Critic sees Target Obs + Tracker Obs
+            critic_obs = np.concatenate([target_obs, tracker_obs])
             opp_action, _, _, _ = self.opponent_model.evaluate(target_obs, critic_obs, greedy=True)
             return opp_action
         elif TrainingParameters.OPPONENT_TYPE in {"random", "random_nonexpert"}:
@@ -93,10 +93,11 @@ class Runner(object):
             episodes = 0
             episode_start = True
             current_episode_idx = 0
+            completed_opponents = []
 
             for i in range(n_steps):
                 data['episode_indices'][i] = episodes
-                critic_obs_full = np.concatenate([self.tracker_obs, get_opponent_id_one_hot(self.current_opponent_id)])
+                critic_obs_full = np.concatenate([self.tracker_obs, self.target_obs])
                 
                 agent_action, agent_pre_tanh, v_pred, log_prob = self.agent_model.step(self.tracker_obs, critic_obs_full)
                 
@@ -141,6 +142,9 @@ class Runner(object):
                     performance_dict['per_r'].append(episode_reward)
                     performance_dict['per_episode_len'].append(ep_len)
                     performance_dict['win'].append(win)
+                    
+                    # Track opponent
+                    completed_opponents.append(self.current_opponent_policy)
 
                     if self.policy_manager:
                         self.policy_manager.update_win_rate(self.current_opponent_policy, win)
@@ -153,7 +157,8 @@ class Runner(object):
                         'success': bool(win),
                         'reward': episode_reward,
                         'length': ep_len,
-                        'use_expert': False
+                        'use_expert': False,
+                        'opponent': completed_opponents[-1]
                     })
                     
                     episodes += 1
@@ -164,7 +169,7 @@ class Runner(object):
                     self.reset_env()
 
             # Last value for GAE
-            critic_obs_last = np.concatenate([self.tracker_obs, get_opponent_id_one_hot(self.current_opponent_id)])
+            critic_obs_last = np.concatenate([self.tracker_obs, self.target_obs])
             last_value = self.agent_model.evaluate(self.tracker_obs, critic_obs_last)[2]
             
             advantages = np.zeros_like(data['rewards'])
@@ -181,8 +186,30 @@ class Runner(object):
                 advantages[t] = lastgaelam
             data['returns'] = advantages + data['values']
 
+            # Collect opponent name for each completed episode
+            log_info = []
+            for _ in range(episodes):
+                # We need to know which opponent was played.
+                # Since multiple episodes can happen in one run, and opponent changes after each episode,
+                # we need to track it.
+                # However, the current loop structure makes it hard to map episodes to opponents exactly 
+                # if we don't store them as they complete.
+                # Let's modify the loop to store opponent name when episode completes.
+                pass 
+
+            # Actually, I need to modify the loop above (lines 130-170) to append to log_info.
+            # But I can't see lines 130-170 here. I need to view them or rewrite the loop.
+            # Wait, I can just modify the return statement if I had the info.
+            # I'll use a new list `completed_opponents` and append to it inside the loop.
+            
             pm_state = {k: list(v) for k, v in self.policy_manager.win_history.items()} if self.policy_manager else None
-            return {'data': data, 'performance': performance_dict, 'episodes': episodes, 'policy_manager_state': pm_state}
+            return {
+                'data': data,
+                'performance': performance_dict,
+                'episodes': episodes,
+                'policy_manager_state': pm_state,
+                'completed_opponents': completed_opponents
+            }
 
     def imitation(self, model_weights, opponent_weights, total_steps):
         # keep imitation simpler: return arrays for IL pretraining
@@ -202,8 +229,9 @@ class Runner(object):
             episodes = 0
             episode_reward = 0.0
             ep_len = 0
+            completed_opponents = []
             for i in range(n_steps):
-                critic_full = np.concatenate([self.tracker_obs, get_opponent_id_one_hot(self.current_opponent_id)])
+                critic_full = np.concatenate([self.tracker_obs, self.target_obs])
                 privileged = self.env.get_privileged_state() if hasattr(self.env, "get_privileged_state") else None
                 expert_pair = self.cbf_teacher.get_action(self.tracker_obs, privileged_state=privileged)
                 normalized = np.asarray(expert_pair, dtype=np.float32)
