@@ -19,7 +19,9 @@ class Model(object):
     def _angle_limit() -> float:
         try:
             map_cfg = importlib.import_module('map_config')
-            limit = float(getattr(map_cfg, 'max_turn_deg', 45.0))
+            # Try new parameter first, then fallback
+            limit = float(getattr(map_cfg, 'tracker_max_angular_speed', 
+                          getattr(map_cfg, 'max_turn_deg', 45.0)))
         except Exception:
             limit = 45.0
         return max(1.0, limit)
@@ -114,52 +116,17 @@ class Model(object):
         return action[0].cpu().numpy(), pre_tanh[0].cpu().numpy(), \
                float(value.item()), float(log_prob.item())
 
-    def train(self, actor_obs, critic_obs, returns, values, actions, old_log_probs, mask=None, il_batch=None,
+    def train(self, actor_obs=None, critic_obs=None, returns=None, values=None, actions=None, old_log_probs=None, mask=None, il_batch=None,
               writer=None, global_step=None, perf_dict=None):
         """
         Simplified MLP trainer — inputs must be sample-flattened:
-          actor_obs: (N, actor_dim)
-          critic_obs: (N, critic_dim)
-          returns, values, old_log_probs, mask: (N,)
-          actions: (N, action_dim)  (pre-tanh)
+          actor_obs: (N, actor_dim) or None
+          critic_obs: (N, critic_dim) or None
+          returns, values, old_log_probs, mask: (N,) or None
+          actions: (N, action_dim)  (pre-tanh) or None
         il_batch (optional) should be a dict with flattened arrays of same sample-first shapes.
         """
         self.net_optimizer.zero_grad(set_to_none=True)
-
-        # Convert to tensors — expect flattened per-sample inputs
-        actor_obs = torch.as_tensor(actor_obs, dtype=torch.float32, device=self.device)
-        critic_obs = torch.as_tensor(critic_obs, dtype=torch.float32, device=self.device)
-        returns = torch.as_tensor(returns, dtype=torch.float32, device=self.device)
-        values = torch.as_tensor(values, dtype=torch.float32, device=self.device)
-        actions = torch.as_tensor(actions, dtype=torch.float32, device=self.device)
-        old_log_probs = torch.as_tensor(old_log_probs, dtype=torch.float32, device=self.device)
-
-        # Ensure dimensions are sample-first (N, dim) or (N,)
-        if actor_obs.dim() == 1:
-            actor_obs = actor_obs.unsqueeze(0)
-        if critic_obs.dim() == 1:
-            critic_obs = critic_obs.unsqueeze(0)
-        if returns.dim() == 0:
-            returns = returns.unsqueeze(0)
-        if values.dim() == 0:
-            values = values.unsqueeze(0)
-        if old_log_probs.dim() == 0:
-            old_log_probs = old_log_probs.unsqueeze(0)
-        if actions.dim() == 1:
-            actions = actions.unsqueeze(0)
-        if mask is None:
-            mask = torch.ones_like(returns, dtype=torch.float32, device=self.device)
-        else:
-            mask = torch.as_tensor(mask, dtype=torch.float32, device=self.device)
-            if mask.dim() == 0:
-                mask = mask.unsqueeze(0)
-
-        # final shapes:
-        # actor_obs: (N, actor_dim)
-        # critic_obs: (N, critic_dim)
-        # returns, values, old_log_probs, mask: (N,)
-        # actions: (N, action_dim)
-        N = actor_obs.shape[0]
 
         # 1. Compute IL Gradients
         il_grads = None
@@ -213,64 +180,119 @@ class Model(object):
             self.net_optimizer.zero_grad(set_to_none=True)
 
         # 2. Compute RL Gradients
-        # PPO forward + loss computation (flattened)
-        mean_flat, value_flat, log_std_flat = self.network(actor_obs, critic_obs)
-        new_values = value_flat.squeeze(-1)  # (N,)
-        new_action_log_probs = self._log_prob_from_pre_tanh(actions, mean_flat, log_std_flat)  # (N,)
-
-        raw_advantages = returns - values.squeeze(-1)
-        valid_mask = mask > 0
-        if valid_mask.sum() > 1:
-            advantages = ((raw_advantages - raw_advantages[valid_mask].mean()) /
-                          (raw_advantages[valid_mask].std() + 1e-8))
-        else:
-            advantages = raw_advantages * 0.0
-
-        advantages = advantages * mask
-
-        ratio = torch.exp(new_action_log_probs - old_log_probs)
-        surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1.0 - TrainingParameters.CLIP_RANGE,
-                            1.0 + TrainingParameters.CLIP_RANGE) * advantages
-        policy_loss = -torch.min(surr1, surr2).sum() / mask.sum().clamp_min(1.0)
-
-        entropy = (0.5 * (1.0 + np.log(2 * np.pi)) + log_std_flat).sum(dim=-1)
-        entropy_loss = -(entropy * mask).sum() / mask.sum().clamp_min(1.0)
-
-        value_clipped = values.squeeze(-1) + torch.clamp(new_values - values.squeeze(-1),
-                                             -TrainingParameters.VALUE_CLIP_RANGE,
-                                             TrainingParameters.VALUE_CLIP_RANGE)
-        v_loss1 = (new_values - returns) ** 2
-        v_loss2 = (value_clipped - returns) ** 2
-        value_loss = (torch.max(v_loss1, v_loss2) * mask).sum() / mask.sum().clamp_min(1.0)
-
-        total_loss = policy_loss + TrainingParameters.EX_VALUE_COEF * value_loss + TrainingParameters.ENTROPY_COEF * entropy_loss
+        rl_grads = None
+        total_loss = 0.0
+        policy_loss = 0.0
+        entropy_loss = 0.0
+        value_loss = 0.0
         q_loss_value = None
-        if TrainingParameters.USE_Q_CRITIC:
-            agent_actions_flat = torch.tanh(actions).reshape(-1, actions.shape[-1])
-            returns_flat = returns.reshape(-1)
-            q_pred_flat = self.network.forward_q(critic_obs, agent_actions_flat).squeeze(-1)
-            q_loss = ((q_pred_flat - returns_flat) ** 2 * mask.reshape(-1)).sum() / mask.reshape(-1).sum().clamp_min(1.0)
-            total_loss = total_loss + TrainingParameters.Q_LOSS_COEF * q_loss
-            q_loss_value = float(q_loss.item())
+        approx_kl = 0.0
+        clipfrac = 0.0
+        grad_norm = 0.0
+        adv_mean = 0.0
+        adv_std = 0.0
 
-        total_loss.backward()
-        
-        # 3. Gradient Projection
-        if il_grads is not None:
-            # Flatten gradients for projection
-            g_il_flat = torch.cat([g.view(-1) for g in il_grads])
+        if actor_obs is not None:
+            # Convert to tensors — expect flattened per-sample inputs
+            actor_obs = torch.as_tensor(actor_obs, dtype=torch.float32, device=self.device)
+            critic_obs = torch.as_tensor(critic_obs, dtype=torch.float32, device=self.device)
+            returns = torch.as_tensor(returns, dtype=torch.float32, device=self.device)
+            values = torch.as_tensor(values, dtype=torch.float32, device=self.device)
+            actions = torch.as_tensor(actions, dtype=torch.float32, device=self.device)
+            old_log_probs = torch.as_tensor(old_log_probs, dtype=torch.float32, device=self.device)
+
+            # Ensure dimensions are sample-first (N, dim) or (N,)
+            if actor_obs.dim() == 1: actor_obs = actor_obs.unsqueeze(0)
+            if critic_obs.dim() == 1: critic_obs = critic_obs.unsqueeze(0)
+            if returns.dim() == 0: returns = returns.unsqueeze(0)
+            if values.dim() == 0: values = values.unsqueeze(0)
+            if old_log_probs.dim() == 0: old_log_probs = old_log_probs.unsqueeze(0)
+            if actions.dim() == 1: actions = actions.unsqueeze(0)
+            if mask is None:
+                mask = torch.ones_like(returns, dtype=torch.float32, device=self.device)
+            else:
+                mask = torch.as_tensor(mask, dtype=torch.float32, device=self.device)
+                if mask.dim() == 0: mask = mask.unsqueeze(0)
+
+            # PPO forward + loss computation (flattened)
+            mean_flat, value_flat, log_std_flat = self.network(actor_obs, critic_obs)
+            new_values = value_flat.squeeze(-1)  # (N,)
+            new_action_log_probs = self._log_prob_from_pre_tanh(actions, mean_flat, log_std_flat)  # (N,)
+
+            raw_advantages = returns - values.squeeze(-1)
+            valid_mask = mask > 0
+            if valid_mask.sum() > 1:
+                adv_std = float(raw_advantages[valid_mask].std().item())
+                adv_mean = float(raw_advantages[valid_mask].mean().item())
+                advantages = ((raw_advantages - adv_mean) / (adv_std + 1e-8))
+            else:
+                advantages = raw_advantages * 0.0
+
+            advantages = advantages * mask
+
+            ratio = torch.exp(new_action_log_probs - old_log_probs)
+            surr1 = ratio * advantages
+            surr2 = torch.clamp(ratio, 1.0 - TrainingParameters.CLIP_RANGE,
+                                1.0 + TrainingParameters.CLIP_RANGE) * advantages
+            policy_loss_t = -torch.min(surr1, surr2).sum() / mask.sum().clamp_min(1.0)
             
+            # If Pure IL mode, we do NOT want PPO to update the policy.
+            # But we DO want Value/Q losses to update the critic/q-net.
+            if TrainingParameters.TRAINING_MODE == "il":
+                policy_loss = 0.0
+                policy_loss_t = policy_loss_t * 0.0
+            else:
+                policy_loss = policy_loss_t.item()
+
+            entropy = (0.5 * (1.0 + np.log(2 * np.pi)) + log_std_flat).sum(dim=-1)
+            entropy_loss_t = -(entropy * mask).sum() / mask.sum().clamp_min(1.0)
+            
+            if TrainingParameters.TRAINING_MODE == "il":
+                entropy_loss = 0.0
+                entropy_loss_t = entropy_loss_t * 0.0
+            else:
+                entropy_loss = entropy_loss_t.item()
+
+            value_clipped = values.squeeze(-1) + torch.clamp(new_values - values.squeeze(-1),
+                                                 -TrainingParameters.VALUE_CLIP_RANGE,
+                                                 TrainingParameters.VALUE_CLIP_RANGE)
+            v_loss1 = (new_values - returns) ** 2
+            v_loss2 = (value_clipped - returns) ** 2
+            value_loss_t = (torch.max(v_loss1, v_loss2) * mask).sum() / mask.sum().clamp_min(1.0)
+            value_loss = value_loss_t.item()
+
+            total_loss_t = policy_loss_t + TrainingParameters.EX_VALUE_COEF * value_loss_t + TrainingParameters.ENTROPY_COEF * entropy_loss_t
+            
+            if TrainingParameters.USE_Q_CRITIC:
+                agent_actions_flat = torch.tanh(actions).reshape(-1, actions.shape[-1])
+                returns_flat = returns.reshape(-1)
+                q_pred_flat = self.network.forward_q(critic_obs, agent_actions_flat).squeeze(-1)
+                q_loss = ((q_pred_flat - returns_flat) ** 2 * mask.reshape(-1)).sum() / mask.reshape(-1).sum().clamp_min(1.0)
+                total_loss_t = total_loss_t + TrainingParameters.Q_LOSS_COEF * q_loss
+                q_loss_value = float(q_loss.item())
+
+            total_loss_t.backward()
+            total_loss = total_loss_t.item()
+            
+            # Save RL gradients
             rl_grads = []
             for param in self.network.parameters():
                 if param.grad is not None:
-                    rl_grads.append(param.grad)
+                    rl_grads.append(param.grad.clone())
                 else:
                     rl_grads.append(torch.zeros_like(param))
+            
+            with torch.no_grad():
+                approx_kl = (old_log_probs - new_action_log_probs).mean().item()
+                clipfrac = (torch.abs(ratio - 1.0) > TrainingParameters.CLIP_RANGE).float().mean().item()
+
+        # 3. Gradient Projection and Update
+        if il_grads is not None and rl_grads is not None:
+            # Flatten gradients for projection
+            g_il_flat = torch.cat([g.view(-1) for g in il_grads])
             g_rl_flat = torch.cat([g.view(-1) for g in rl_grads])
             
             # Project RL gradient onto orthogonal complement of IL gradient
-            # if they conflict (dot product < 0)
             dot_prod = torch.dot(g_rl_flat, g_il_flat)
             if dot_prod < 0:
                 il_norm_sq = torch.dot(g_il_flat, g_il_flat)
@@ -278,7 +300,6 @@ class Model(object):
                     proj = (dot_prod / il_norm_sq) * g_il_flat
                     g_rl_flat = g_rl_flat - proj
             
-            # Combine gradients: g_final = g_il + g_rl_projected
             g_final_flat = g_il_flat + g_rl_flat
             
             # Unflatten and set gradients
@@ -287,24 +308,28 @@ class Model(object):
                 numel = param.numel()
                 param.grad = g_final_flat[idx:idx+numel].view(param.shape)
                 idx += numel
+        elif il_grads is not None:
+            # Only IL gradients
+             for i, param in enumerate(self.network.parameters()):
+                param.grad = il_grads[i]
+        elif rl_grads is not None:
+            # Only RL gradients (already in param.grad, do nothing)
+            pass
+        else:
+            # No gradients (should not happen if at least one batch is provided)
+            pass
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.network.parameters(), TrainingParameters.MAX_GRAD_NORM)
+        if il_grads is not None or rl_grads is not None:
+            grad_norm = float(torch.nn.utils.clip_grad_norm_(self.network.parameters(), TrainingParameters.MAX_GRAD_NORM).item())
+            
+            for name, param in self.network.named_parameters():
+                if param.grad is not None:
+                    param.grad = torch.nan_to_num(param.grad)
 
-        for name, param in self.network.named_parameters():
-            if param.grad is not None:
-                param.grad = torch.nan_to_num(param.grad)
+            self.net_optimizer.step()
 
-        self.net_optimizer.step()
-
-        # logging metrics
-        with torch.no_grad():
-            approx_kl = (old_log_probs - new_action_log_probs).mean()
-            clipfrac = (torch.abs(ratio - 1.0) > TrainingParameters.CLIP_RANGE).float().mean()
-
-        losses = [total_loss.item(), policy_loss.item(), entropy_loss.item(), value_loss.item(),
-                  float(raw_advantages[valid_mask].std().item()) if valid_mask.any() else 0.0,
-                  approx_kl.item(), 0.0, clipfrac.item(), float(grad_norm),
-                  float(raw_advantages[valid_mask].mean().item()) if valid_mask.any() else 0.0]
+        losses = [total_loss, policy_loss, entropy_loss, value_loss,
+                  adv_std, approx_kl, 0.0, clipfrac, grad_norm, adv_mean]
         return {'losses': losses, 'il_loss': il_loss_value, 'q_loss': q_loss_value, 'il_filter_ratio': il_filter_ratio}
 
     def imitation_train(self, actor_obs, critic_obs, optimal_actions, writer=None, global_step=None):

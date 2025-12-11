@@ -69,8 +69,8 @@ class Runner(object):
 
             n_steps = TrainingParameters.N_STEPS
             data = {
-                'actor_obs': np.zeros((n_steps, NetParameters.ACTOR_VECTOR_LEN), dtype=np.float32),
-                'critic_obs': np.zeros((n_steps, NetParameters.CRITIC_VECTOR_LEN), dtype=np.float32),
+                'actor_obs': np.zeros((n_steps, NetParameters.ACTOR_RAW_LEN), dtype=np.float32),
+                'critic_obs': np.zeros((n_steps, NetParameters.CRITIC_RAW_LEN), dtype=np.float32),
                 'rewards': np.zeros(n_steps, dtype=np.float32),
                 'values': np.zeros(n_steps, dtype=np.float32),
                 'actions': np.zeros((n_steps, NetParameters.ACTION_DIM), dtype=np.float32),

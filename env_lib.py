@@ -742,3 +742,148 @@ def agent_move(agent, action, moving_size, role=None):
                                0, map_config.height - map_config.pixel_size))
 
     return _resolve_obstacle_collision(old_state, agent)
+
+def agent_move_accel(agent, lin_acc, ang_acc, max_speed, max_ang_speed, role=None):
+    """
+    Acceleration-based movement update.
+    Updates agent state (x, y, theta, v, w) in place.
+    """
+    old_state = dict(agent)
+    
+    # Update velocities
+    agent['v'] = float(agent.get('v', 0.0) + lin_acc)
+    agent['w'] = float(agent.get('w', 0.0) + ang_acc)
+    
+    # Clip velocities
+    # Assuming forward only for now as per original logic
+    agent['v'] = float(np.clip(agent['v'], 0.0, max_speed))
+    agent['w'] = float(np.clip(agent['w'], -max_ang_speed, max_ang_speed))
+    
+    # Update pose
+    # Note: w is in degrees/step
+    new_theta = (agent['theta'] + agent['w']) % 360.0
+    agent['theta'] = float(new_theta)
+    
+    rad_theta = math.radians(new_theta)
+    agent['x'] = float(np.clip(agent['x'] + agent['v'] * math.cos(rad_theta),
+                               0, map_config.width - map_config.pixel_size))
+    agent['y'] = float(np.clip(agent['y'] + agent['v'] * math.sin(rad_theta),
+                               0, map_config.height - map_config.pixel_size))
+                               
+    return _resolve_obstacle_collision(old_state, agent)
+# ============================================================================
+# Hard Mask Safety Parameters (Moved from cbf_controller.py)
+# ============================================================================
+HARD_MASK_SAFETY_MULTIPLIER = 2.5
+HARD_MASK_CHECK_WINDOW = 1
+HARD_MASK_EMERGENCY_BRAKE = True
+
+def _normalize_angle(angle_deg: float):
+    """Normalize angle to [-180, 180] range."""
+    angle_deg = angle_deg % 360.0
+    if angle_deg > 180.0:
+        angle_deg -= 360.0
+    return float(angle_deg)
+
+def apply_hard_mask(action, radar, current_heading_deg, role='tracker', safety_dist=None):
+    """
+    Hard Mask Function: Force collision avoidance based on radar.
+    (Moved here to avoid circular dependency with cbf_controller/cvxpy)
+    """
+    if safety_dist is None:
+        safety_dist = float(getattr(map_config, 'agent_radius', 8.0)) * HARD_MASK_SAFETY_MULTIPLIER
+
+    if hasattr(action, '__len__'):
+        angle_norm = float(action[0])
+        speed_norm = float(action[1])
+    else:
+        return action
+
+    # Max turn capabilities
+    if role == 'tracker':
+        max_turn = float(getattr(map_config, 'tracker_max_angular_speed', 10.0))
+    else:
+        max_turn = float(getattr(map_config, 'target_max_angular_speed', 12.0))
+        
+    angle_delta = angle_norm * max_turn
+    target_heading = _normalize_angle(current_heading_deg + angle_delta)
+    
+    if len(radar) == 0:
+        return (angle_norm, speed_norm)
+
+    num_rays = len(radar)
+    angle_step = 360.0 / num_rays
+    
+    th_360 = target_heading % 360.0
+    center_idx = int(round(th_360 / angle_step)) % num_rays
+    
+    max_range = float(getattr(map_config, 'FOV_RANGE', 250.0))
+    dists = (radar + 1.0) * 0.5 * max_range
+    
+    # Check safety
+    is_safe = True
+    for i in range(-HARD_MASK_CHECK_WINDOW, HARD_MASK_CHECK_WINDOW + 1):
+        idx = (center_idx + i) % num_rays
+        if dists[idx] <= safety_dist:
+            is_safe = False
+            break
+            
+    if is_safe:
+        return (angle_norm, speed_norm)
+        
+    # Search for safe direction
+    safe_indices = []
+    for i in range(num_rays):
+        window_safe = True
+        for w in range(-HARD_MASK_CHECK_WINDOW, HARD_MASK_CHECK_WINDOW + 1):
+            if dists[(i + w) % num_rays] <= safety_dist:
+                window_safe = False
+                break
+        if window_safe:
+            safe_indices.append(i)
+    
+    if not safe_indices:
+        if HARD_MASK_EMERGENCY_BRAKE:
+            best_idx = -1
+            max_avg_dist = -1.0
+            
+            for i in range(num_rays):
+                avg_dist = 0
+                for w in range(-HARD_MASK_CHECK_WINDOW, HARD_MASK_CHECK_WINDOW + 1):
+                    avg_dist += dists[(i + w) % num_rays]
+                if avg_dist > max_avg_dist:
+                    max_avg_dist = avg_dist
+                    best_idx = i
+            
+            if best_idx != -1:
+                best_ray_angle = best_idx * angle_step
+                needed_turn = _normalize_angle(best_ray_angle - current_heading_deg)
+                clamped_turn = np.clip(needed_turn, -max_turn, max_turn)
+                new_angle_norm = clamped_turn / (max_turn + 1e-6)
+                return (float(new_angle_norm), -1.0)
+        return (angle_norm, -1.0)
+
+    best_idx = -1
+    min_diff = 1000.0
+    
+    for idx in safe_indices:
+        ray_angle = idx * angle_step
+        diff = abs(_normalize_angle(ray_angle - target_heading))
+        if diff < min_diff:
+            min_diff = diff
+            best_idx = idx
+            
+    best_ray_angle = best_idx * angle_step
+    needed_turn = _normalize_angle(best_ray_angle - current_heading_deg)
+    clamped_turn = np.clip(needed_turn, -max_turn, max_turn)
+    new_angle_norm = clamped_turn / (max_turn + 1e-6)
+    
+    turn_magnitude = abs(needed_turn)
+    if turn_magnitude > 60.0:
+        new_speed_norm = -1.0
+    elif turn_magnitude > 30.0:
+        new_speed_norm = min(speed_norm, 0.0) 
+    else:
+        new_speed_norm = float(speed_norm)
+    
+    return (float(new_angle_norm), float(new_speed_norm))

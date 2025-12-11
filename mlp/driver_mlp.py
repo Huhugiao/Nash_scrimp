@@ -101,8 +101,8 @@ def collate_segments(batch_segments):
 		raise ValueError("Empty segment batch")
 	max_len = max(len(s['actor_obs']) for s in batch_segments)
 	batch = {
-		'actor_obs': np.zeros((batch_size, max_len, NetParameters.ACTOR_VECTOR_LEN), dtype=np.float32),
-		'critic_obs': np.zeros((batch_size, max_len, NetParameters.CRITIC_VECTOR_LEN), dtype=np.float32),
+		'actor_obs': np.zeros((batch_size, max_len, NetParameters.ACTOR_RAW_LEN), dtype=np.float32),
+		'critic_obs': np.zeros((batch_size, max_len, NetParameters.CRITIC_RAW_LEN), dtype=np.float32),
 		'returns': np.zeros((batch_size, max_len), dtype=np.float32),
 		'values': np.zeros((batch_size, max_len), dtype=np.float32),
 		'actions': np.zeros((batch_size, max_len, NetParameters.ACTION_DIM), dtype=np.float32),
@@ -125,8 +125,8 @@ def collate_il_segments(batch_segments):
 		return None
 	max_len = NetParameters.CONTEXT_WINDOW
 	batch = {
-		'actor_obs': np.zeros((len(batch_segments), max_len, NetParameters.ACTOR_VECTOR_LEN), dtype=np.float32),
-		'critic_obs': np.zeros((len(batch_segments), max_len, NetParameters.CRITIC_VECTOR_LEN), dtype=np.float32),
+		'actor_obs': np.zeros((len(batch_segments), max_len, NetParameters.ACTOR_RAW_LEN), dtype=np.float32),
+		'critic_obs': np.zeros((len(batch_segments), max_len, NetParameters.CRITIC_RAW_LEN), dtype=np.float32),
 		'actions': np.zeros((len(batch_segments), max_len, NetParameters.ACTION_DIM), dtype=np.float32),
 		'mask': np.zeros((len(batch_segments), max_len), dtype=np.float32),
 	}
@@ -439,8 +439,8 @@ def main():
 							
 							# flatten IL batch to per-sample arrays
 							il_batch = {
-								'actor_obs': il_batch_raw['actor_obs'].reshape(-1, NetParameters.ACTOR_VECTOR_LEN),
-								'critic_obs': il_batch_raw['critic_obs'].reshape(-1, NetParameters.CRITIC_VECTOR_LEN),
+								'actor_obs': il_batch_raw['actor_obs'].reshape(-1, NetParameters.ACTOR_RAW_LEN),
+								'critic_obs': il_batch_raw['critic_obs'].reshape(-1, NetParameters.CRITIC_RAW_LEN),
 								'actions': il_batch_raw['actions'].reshape(-1, NetParameters.ACTION_DIM),
 								'mask': il_batch_raw['mask'].reshape(-1)
 							}
@@ -448,22 +448,32 @@ def main():
 						# flatten RL batch to per-sample arrays (merge batch and time dims)
 						B = batch['actor_obs'].shape[0]
 						T = batch['actor_obs'].shape[1]
-						actor_flat = batch['actor_obs'].reshape(-1, NetParameters.ACTOR_VECTOR_LEN)
-						critic_flat = batch['critic_obs'].reshape(-1, NetParameters.CRITIC_VECTOR_LEN)
+						actor_flat = batch['actor_obs'].reshape(-1, NetParameters.ACTOR_RAW_LEN)
+						critic_flat = batch['critic_obs'].reshape(-1, NetParameters.CRITIC_RAW_LEN)
 						returns_flat = batch['returns'].reshape(-1)
 						values_flat = batch['values'].reshape(-1)
 						actions_flat = batch['actions'].reshape(-1, NetParameters.ACTION_DIM)
 						old_logp_flat = batch['old_log_probs'].reshape(-1)
 						mask_flat = batch['mask'].reshape(-1)
 						
-						# call train with flattened per-sample data
-						result = training_model.train(
-							actor_flat, critic_flat,
-							returns_flat, values_flat,
-							actions_flat, old_logp_flat,
-							mask_flat, il_batch=il_batch
-							, writer=global_summary, global_step=curr_steps, perf_dict=None
-						)
+						# Prepare arguments based on TRAINING_MODE
+						train_args = {
+							'writer': global_summary,
+							'global_step': curr_steps,
+							'perf_dict': None,
+							'il_batch': il_batch,
+							'actor_obs': actor_flat,
+							'critic_obs': critic_flat,
+							'returns': returns_flat,
+							'values': values_flat,
+							'actions': actions_flat,
+							'old_log_probs': old_logp_flat,
+							'mask': mask_flat
+						}
+						
+						# call train
+						result = training_model.train(**train_args)
+
 						if isinstance(result, dict):
 							epoch_loss_buffer.append(result.get('losses', []))
 							if result.get('il_loss') is not None:

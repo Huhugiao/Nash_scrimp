@@ -14,10 +14,8 @@ from map_config import EnvParameters
 # Tunable Parameters (可调参数)
 # ============================================================================
 
-# Hard Mask Safety Parameters (硬掩码安全参数)
-HARD_MASK_SAFETY_MULTIPLIER = 2.5  # Increased to 2.5 for robust collision avoidance
-HARD_MASK_CHECK_WINDOW = 1         # Check +/- 1 ray around direction (Cone check)
-HARD_MASK_EMERGENCY_BRAKE = True   # 当所有方向都被堵死时是否紧急刹车
+# Hard Mask Safety Parameters (moved to env_lib.py)
+from env_lib import apply_hard_mask, HARD_MASK_SAFETY_MULTIPLIER, HARD_MASK_CHECK_WINDOW, HARD_MASK_EMERGENCY_BRAKE
 
 # CBF Controller Parameters (CBF控制器参数)
 CBF_SAFE_DISTANCE = 16.0           
@@ -57,117 +55,6 @@ def _normalize_angle(angle_deg: float):
         angle_deg -= 360.0
     return float(angle_deg)
 
-def apply_hard_mask(action, radar, current_heading_deg, role='tracker', safety_dist=None):
-    """
-    硬掩码函数：基于雷达读数强制避障
-    如果动作指向的方向有近距离障碍物，则强制偏转到最近的安全方向。
-    """
-    if safety_dist is None:
-        safety_dist = float(getattr(map_config, 'agent_radius', 8.0)) * HARD_MASK_SAFETY_MULTIPLIER
-
-    # 1. 解析动作 (angle_norm, speed_norm)
-    if isinstance(action, (tuple, list)):
-        angle_norm, speed_norm = float(action[0]), float(action[1])
-    else:
-        angle_norm, speed_norm = float(action[0]), float(action[1])
-
-    # 获取最大转向能力
-    if role == 'tracker':
-        max_turn = float(getattr(map_config, 'tracker_max_turn_deg', 10.0))
-    else:
-        max_turn = float(getattr(map_config, 'target_max_turn_deg', 10.0))
-        
-    angle_delta = angle_norm * max_turn
-    
-    # 2. 计算目标全局角度
-    target_heading = _normalize_angle(current_heading_deg + angle_delta)
-    
-    if len(radar) == 0:
-        return action
-
-    # 3. 映射到雷达射线
-    num_rays = len(radar)
-    angle_step = 360.0 / num_rays
-    
-    # 将角度映射到 [0, 360) 并找到最近索引
-    th_360 = target_heading % 360.0
-    center_idx = int(round(th_360 / angle_step)) % num_rays
-    
-    # 计算实际距离
-    max_range = float(EnvParameters.FOV_RANGE)
-    dists = (radar + 1.0) * 0.5 * max_range
-    
-    # --- Improved Safety Check: Check window of rays ---
-    is_safe = True
-    for i in range(-HARD_MASK_CHECK_WINDOW, HARD_MASK_CHECK_WINDOW + 1):
-        idx = (center_idx + i) % num_rays
-        if dists[idx] <= safety_dist:
-            is_safe = False
-            break
-            
-    if is_safe:
-        return (angle_norm, speed_norm)
-        
-    # 4. 搜索最近的安全方向
-    # A direction is safe only if it AND its neighbors are safe
-    safe_indices = []
-    for i in range(num_rays):
-        # Check window around i
-        window_safe = True
-        for w in range(-HARD_MASK_CHECK_WINDOW, HARD_MASK_CHECK_WINDOW + 1):
-            if dists[(i + w) % num_rays] <= safety_dist:
-                window_safe = False
-                break
-        if window_safe:
-            safe_indices.append(i)
-    
-    if not safe_indices:
-        # 如果所有方向都被堵死 (Trapped)
-        if HARD_MASK_EMERGENCY_BRAKE:
-            # 优化：转向最开阔的方向 (Max average distance in window)
-            best_idx = -1
-            max_avg_dist = -1.0
-            
-            for i in range(num_rays):
-                avg_dist = 0
-                for w in range(-HARD_MASK_CHECK_WINDOW, HARD_MASK_CHECK_WINDOW + 1):
-                    avg_dist += dists[(i + w) % num_rays]
-                if avg_dist > max_avg_dist:
-                    max_avg_dist = avg_dist
-                    best_idx = i
-            
-            best_ray_angle = best_idx * angle_step
-            needed_turn = _normalize_angle(best_ray_angle - current_heading_deg)
-            clamped_turn = np.clip(needed_turn, -max_turn, max_turn)
-            new_angle_norm = clamped_turn / (max_turn + 1e-6)
-            
-            # 强制刹车 (speed -1.0) 但允许转向
-            return (float(new_angle_norm), -1.0)
-        else:
-            return action
-
-    # 寻找角度差最小的安全索引
-    best_idx = -1
-    min_diff = 1000.0
-    
-    for idx in safe_indices:
-        ray_angle = idx * angle_step
-        diff = abs(_normalize_angle(ray_angle - target_heading))
-        if diff < min_diff:
-            min_diff = diff
-            best_idx = idx
-            
-    # 5. 生成修正后的动作
-    best_ray_angle = best_idx * angle_step
-    needed_turn = _normalize_angle(best_ray_angle - current_heading_deg)
-    
-    # 限制转向幅度
-    clamped_turn = np.clip(needed_turn, -max_turn, max_turn)
-    
-    # 归一化回动作空间
-    new_angle_norm = clamped_turn / (max_turn + 1e-6)
-    
-    return (float(new_angle_norm), float(speed_norm))
 
 
 # ============================================================================
@@ -193,7 +80,7 @@ class CBFController:
         if max_turn_rate is not None:
             self.max_turn_rate = max_turn_rate
         else:
-            max_turn_deg = float(getattr(map_config, "tracker_max_turn_deg", 10.0))
+            max_turn_deg = float(getattr(map_config, "tracker_max_angular_speed", 10.0))
             dt = 1.0 / 40.0
             self.max_turn_rate = math.radians(max_turn_deg) / dt
             
@@ -391,6 +278,7 @@ class CBFTracker:
         self.recovery_mode = False
         self.recovery_timer = 0
         self.recovery_target_global_angle = 0.0
+        self.last_u = np.zeros(2)
 
     def reset(self):
         """重置策略状态（清除记忆）"""
@@ -412,7 +300,12 @@ class CBFTracker:
             归一化动作 (angle_norm, speed_norm)
         """
         obs = np.asarray(observation, dtype=np.float64)
-        if obs.shape[0] != 27:
+        # 允许 27 (旧) 或 75 (新) 或 动态计算的维度
+        # Tracker scalar (11) + Radar (RADAR_RAYS)
+        expected_dim = 11 + EnvParameters.RADAR_RAYS
+        if obs.shape[0] != expected_dim and obs.shape[0] != 27:
+             # Fallback or error? For now, if not matching expected, return 0
+             # But let's be flexible if it matches the new config
              return np.zeros(2)
 
         # 1. Stuck Detection & Recovery Logic
@@ -428,7 +321,13 @@ class CBFTracker:
         heading_rad = math.radians(heading_deg)
 
         # 3. 处理雷达（局部坐标系）
-        radar_norm = obs[11:27]
+        # 自动适配雷达维度
+        radar_start = 11
+        radar_end = radar_start + EnvParameters.RADAR_RAYS
+        if obs.shape[0] == 27: # Backward compatibility
+             radar_end = 27
+        
+        radar_norm = obs[radar_start:radar_end]
         max_range = float(EnvParameters.FOV_RANGE)
         n_rays = len(radar_norm)
         
@@ -468,7 +367,8 @@ class CBFTracker:
         
         # 6. Calculate Reference Control
         max_speed = float(getattr(map_config, 'tracker_speed', 2.4))
-        max_turn_deg = float(getattr(map_config, "tracker_max_turn_deg", 10.0))
+        max_speed = float(getattr(map_config, 'tracker_speed', 2.4))
+        max_turn_deg = float(getattr(map_config, "tracker_max_angular_speed", 10.0))
         dt = 1.0 / 40.0
         phys_max_w = math.radians(max_turn_deg) / dt
         
@@ -552,12 +452,65 @@ class CBFTracker:
 
         v_cmd, w_cmd = u_star[0], u_star[1]
         
-        # 7. 转换为动作
+        # 7. 转换为动作 (Velocity Command)
         angle_delta_deg = math.degrees(w_cmd * dt)
         angle_out = float(np.clip(angle_delta_deg, -max_turn_deg, max_turn_deg))
         speed_factor = min(v_cmd / max_speed, 1.0) if max_speed > 0 else 0.0
         
-        raw_action = Model.to_normalized_action((angle_out, speed_factor))
-        
         # 8. 应用硬掩码（安全层）
-        return apply_hard_mask(raw_action, radar_norm, heading_deg, role='tracker')
+        # raw_vel_action: (angle_norm, speed_norm)
+        raw_vel_action = Model.to_normalized_action((angle_out, speed_factor))
+        safe_vel_action = apply_hard_mask(raw_vel_action, radar_norm, heading_deg, role='tracker')
+        
+        # 9. Convert to Acceleration
+        # safe_vel_action is (angle_norm, speed_norm)
+        safe_angle_norm, safe_speed_norm = safe_vel_action
+        
+        # Recover desired values
+        desired_angle_delta = safe_angle_norm * max_turn_deg
+        desired_speed = safe_speed_norm * max_speed # safe_speed_norm is [-1, 1]?
+        # Model.to_normalized_action maps speed [0, 1] -> [-1, 1].
+        # So safe_speed_norm is [-1, 1].
+        # desired_speed = (safe_speed_norm + 1) / 2 * max_speed?
+        # Wait, apply_hard_mask returns what Model.to_normalized_action returns.
+        # Model.to_normalized_action returns [-1, 1].
+        # So yes.
+        desired_speed = (safe_speed_norm + 1.0) / 2.0 * max_speed
+        
+        # Desired Heading
+        desired_heading_deg = heading_deg + desired_angle_delta
+        
+        # Current State
+        current_vel = (obs[0] + 1.0) / 2.0 * max_speed
+        current_w_norm = obs[1]
+        current_w = current_w_norm * max_turn_deg # deg/step
+        
+        # Calculate Acceleration
+        # Linear P-controller
+        Kp_v = 2.0
+        lin_acc = Kp_v * (desired_speed - current_vel)
+        max_acc = float(getattr(map_config, 'tracker_max_acc', 0.1))
+        lin_acc = np.clip(lin_acc, -max_acc, max_acc)
+        lin_acc_norm = lin_acc / max_acc
+        
+        # Angular PD-controller
+        max_ang_acc = float(getattr(map_config, 'tracker_max_ang_acc', 2.0))
+        angle_diff = _normalize_angle(desired_heading_deg - heading_deg)
+        
+        # Tuned Gains (same as rule_policies.py)
+        Kp_heading = 4.0
+        Kd_heading = 0.5
+        
+        desired_w = Kp_heading * angle_diff
+        if current_w != 0.0:
+            desired_w -= Kd_heading * current_w
+            
+        desired_w = np.clip(desired_w, -max_turn_deg, max_turn_deg)
+        
+        Kp_w = 2.0
+        ang_acc = Kp_w * (desired_w - current_w)
+        
+        ang_acc = np.clip(ang_acc, -max_ang_acc, max_ang_acc)
+        ang_acc_norm = ang_acc / max_ang_acc
+        
+        return np.array([ang_acc_norm, lin_acc_norm], dtype=np.float32)

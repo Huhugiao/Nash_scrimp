@@ -8,14 +8,14 @@ import random, math
 class EnvParameters:
     # 观测 / 动作接口保持不变
     N_ACTIONS = 48
-    EPISODE_LEN = 650
-    NUM_TARGET_POLICIES = 5  # Updated to match CONTEXT_LEN (Greedy, APF, DWA, Hiding, Random)
+    EPISODE_LEN = 449
+    NUM_TARGET_POLICIES = 4  # Updated to match CONTEXT_LEN (Greedy, APF, Hiding, Random)
 
     # 视场与观测配置（重新设计）
     # Tracker：有限视场、雷达 360°；Target：全局视角 + 360° 雷达
-    FOV_ANGLE = 120         # 追踪者视场角（度）
+    FOV_ANGLE = 90         # 追踪者视场角（度）
     FOV_RANGE = 250         # 追踪者最大可见距离（像素）
-    RADAR_RAYS = 16            # 360° 雷达射线数
+    RADAR_RAYS = 64            # 360° 雷达射线数
     MAX_UNOBSERVED_STEPS = 80  # 最长未观测时间归一化上限
 
 # ============================================================================
@@ -28,11 +28,10 @@ class ObstacleDensity:
     SPARSE = "sparse"
     MEDIUM = "medium"
     DENSE = "dense"
-    ULTRA = "ultra"
 
-    ALL_LEVELS = [NONE, SPARSE, MEDIUM, DENSE, ULTRA]
+    ALL_LEVELS = [NONE, SPARSE, MEDIUM, DENSE]
 
-DEFAULT_OBSTACLE_DENSITY = ObstacleDensity.MEDIUM
+DEFAULT_OBSTACLE_DENSITY = ObstacleDensity.DENSE
 current_obstacle_density = DEFAULT_OBSTACLE_DENSITY
 
 _jitter_px = 0
@@ -50,16 +49,22 @@ height = 640
 pixel_size = 4
 # target 略慢，tracker 稍快
 target_speed = 2.0
-tracker_speed = 3
+tracker_speed = 2.85
 
-# 转向限制（度/step）
-max_turn_deg = 10.0
-target_max_turn_deg = 12.0
-tracker_max_turn_deg = 8
+# 加速度限制 (pixels/step^2, degrees/step^2)
+tracker_max_acc = 0.1
+target_max_acc = 0.2  # Increased for agility
+tracker_max_ang_acc = 2.0
+target_max_ang_acc = 4.0  # Increased for agility
+
+# 物理极限 (Max Speed/Angular Speed)
+# tracker_speed defined above (2.4)
+tracker_max_angular_speed = 6.0 # degrees/step
+target_max_angular_speed = 12.0 # degrees/step
 
 # 捕获逻辑（保持接口，但参数更“紧凑”）
-capture_radius = 42.0
-capture_sector_angle_deg = 90.0
+capture_radius = 20
+capture_sector_angle_deg = 30
 capture_required_steps = 1
 CAPTURE_SECTOR_COLOR = (90, 220, 140, 50)
 
@@ -102,99 +107,102 @@ WALL_OBSTACLES = [
 # 设计成“城市场景”：几条主干道 + 巷战瓶颈，保持对称，但避免完全规则。
 # ============================================================================
 
-# 手动设定的均匀分布障碍物列表
+# ============================================================================
+# 均匀分布的障碍物设计 (Grid-based Uniform Distribution)
+# Map Size: 640x640
+# Expanded to reduce empty space at edges.
+# ============================================================================
 
 _SPARSE_OBSTACLES = [
-    # 左上
-    {'type': 'rect', 'x': 100, 'y': 100, 'w': 40, 'h': 40, 'color': OBSTACLE_COLOR},
-    # 右上
-    {'type': 'segment', 'x1': 480, 'y1': 120, 'x2': 540, 'y2': 180, 'thick': 8, 'color': OBSTACLE_COLOR},
-    # 左下
-    {'type': 'segment', 'x1': 120, 'y1': 480, 'x2': 180, 'y2': 540, 'thick': 8, 'color': OBSTACLE_COLOR},
-    # 右下
-    {'type': 'rect', 'x': 500, 'y': 500, 'w': 40, 'h': 40, 'color': OBSTACLE_COLOR},
-    # 中间偏离一点
-    {'type': 'circle', 'cx': 320, 'cy': 240, 'r': 20, 'color': OBSTACLE_COLOR},
+    # 3x3 Grid
+    # Centers: 80, 320, 560 (Spacing 240)
+    # Margins: ~60px
+    
+    # Row 1 (y=80)
+    {'type': 'rect', 'x': 60, 'y': 60, 'w': 40, 'h': 40, 'color': OBSTACLE_COLOR},
+    {'type': 'circle', 'cx': 320, 'cy': 80, 'r': 20, 'color': OBSTACLE_COLOR},
+    {'type': 'rect', 'x': 540, 'y': 60, 'w': 40, 'h': 40, 'color': OBSTACLE_COLOR},
+    
+    # Row 2 (y=320)
+    {'type': 'circle', 'cx': 80, 'cy': 320, 'r': 20, 'color': OBSTACLE_COLOR},
+    {'type': 'rect', 'x': 300, 'y': 300, 'w': 40, 'h': 40, 'color': OBSTACLE_COLOR}, # Center
+    {'type': 'circle', 'cx': 560, 'cy': 320, 'r': 20, 'color': OBSTACLE_COLOR},
+
+    # Row 3 (y=560)
+    {'type': 'rect', 'x': 60, 'y': 540, 'w': 40, 'h': 40, 'color': OBSTACLE_COLOR},
+    {'type': 'circle', 'cx': 320, 'cy': 560, 'r': 20, 'color': OBSTACLE_COLOR},
+    {'type': 'rect', 'x': 540, 'y': 540, 'w': 40, 'h': 40, 'color': OBSTACLE_COLOR},
 ]
 
 _MEDIUM_OBSTACLES = [
-    # 第一行
-    {'type': 'rect', 'x': 80, 'y': 80, 'w': 50, 'h': 50, 'color': OBSTACLE_COLOR},
-    {'type': 'segment', 'x1': 280, 'y1': 60, 'x2': 360, 'y2': 60, 'thick': 8, 'color': OBSTACLE_COLOR},
-    {'type': 'rect', 'x': 510, 'y': 80, 'w': 50, 'h': 50, 'color': OBSTACLE_COLOR},
-    
-    # 第二行
-    {'type': 'segment', 'x1': 60, 'y1': 240, 'x2': 140, 'y2': 320, 'thick': 8, 'color': OBSTACLE_COLOR},
-    {'type': 'circle', 'cx': 320, 'cy': 320, 'r': 25, 'color': OBSTACLE_COLOR}, # 中心圆
-    {'type': 'segment', 'x1': 500, 'y1': 320, 'x2': 580, 'y2': 240, 'thick': 8, 'color': OBSTACLE_COLOR},
+    # 4x4 Grid
+    # Centers: 80, 240, 400, 560 (Spacing 160)
+    # Margins: ~60px
 
-    # 第三行
-    {'type': 'rect', 'x': 80, 'y': 510, 'w': 50, 'h': 50, 'color': OBSTACLE_COLOR},
-    {'type': 'segment', 'x1': 280, 'y1': 580, 'x2': 360, 'y2': 580, 'thick': 8, 'color': OBSTACLE_COLOR},
-    {'type': 'rect', 'x': 510, 'y': 510, 'w': 50, 'h': 50, 'color': OBSTACLE_COLOR},
-    
-    # 补充一些中间的
-    {'type': 'segment', 'x1': 200, 'y1': 200, 'x2': 200, 'y2': 440, 'thick': 8, 'color': OBSTACLE_COLOR},
-    {'type': 'segment', 'x1': 440, 'y1': 200, 'x2': 440, 'y2': 440, 'thick': 8, 'color': OBSTACLE_COLOR},
+    # Row 1 (y=80)
+    {'type': 'rect', 'x': 60, 'y': 60, 'w': 40, 'h': 40, 'color': OBSTACLE_COLOR},
+    {'type': 'segment', 'x1': 240, 'y1': 50, 'x2': 240, 'y2': 110, 'thick': 10, 'color': OBSTACLE_COLOR},
+    {'type': 'segment', 'x1': 400, 'y1': 50, 'x2': 400, 'y2': 110, 'thick': 10, 'color': OBSTACLE_COLOR},
+    {'type': 'rect', 'x': 540, 'y': 60, 'w': 40, 'h': 40, 'color': OBSTACLE_COLOR},
+
+    # Row 2 (y=240)
+    {'type': 'segment', 'x1': 50, 'y1': 240, 'x2': 110, 'y2': 240, 'thick': 10, 'color': OBSTACLE_COLOR},
+    {'type': 'circle', 'cx': 240, 'cy': 240, 'r': 25, 'color': OBSTACLE_COLOR},
+    {'type': 'circle', 'cx': 400, 'cy': 240, 'r': 25, 'color': OBSTACLE_COLOR},
+    {'type': 'segment', 'x1': 530, 'y1': 240, 'x2': 590, 'y2': 240, 'thick': 10, 'color': OBSTACLE_COLOR},
+
+    # Row 3 (y=400)
+    {'type': 'segment', 'x1': 50, 'y1': 400, 'x2': 110, 'y2': 400, 'thick': 10, 'color': OBSTACLE_COLOR},
+    {'type': 'circle', 'cx': 240, 'cy': 400, 'r': 25, 'color': OBSTACLE_COLOR},
+    {'type': 'circle', 'cx': 400, 'cy': 400, 'r': 25, 'color': OBSTACLE_COLOR},
+    {'type': 'segment', 'x1': 530, 'y1': 400, 'x2': 590, 'y2': 400, 'thick': 10, 'color': OBSTACLE_COLOR},
+
+    # Row 4 (y=560)
+    {'type': 'rect', 'x': 60, 'y': 540, 'w': 40, 'h': 40, 'color': OBSTACLE_COLOR},
+    {'type': 'segment', 'x1': 240, 'y1': 530, 'x2': 240, 'y2': 590, 'thick': 10, 'color': OBSTACLE_COLOR},
+    {'type': 'segment', 'x1': 400, 'y1': 530, 'x2': 400, 'y2': 590, 'thick': 10, 'color': OBSTACLE_COLOR},
+    {'type': 'rect', 'x': 540, 'y': 540, 'w': 40, 'h': 40, 'color': OBSTACLE_COLOR},
 ]
 
 _DENSE_OBSTACLES = [
-    # 4x4 网格布局基础，去掉中心
-    # Row 1
-    {'type': 'rect', 'x': 60, 'y': 60, 'w': 40, 'h': 40, 'color': OBSTACLE_COLOR},
-    {'type': 'segment', 'x1': 200, 'y1': 50, 'x2': 200, 'y2': 110, 'thick': 10, 'color': OBSTACLE_COLOR},
-    {'type': 'segment', 'x1': 440, 'y1': 50, 'x2': 440, 'y2': 110, 'thick': 10, 'color': OBSTACLE_COLOR},
-    {'type': 'rect', 'x': 540, 'y': 60, 'w': 40, 'h': 40, 'color': OBSTACLE_COLOR},
+    # 5x5 Grid
+    # Centers: 70, 195, 320, 445, 570 (Spacing 125)
+    # Margins: ~50px
 
-    # Row 2
-    {'type': 'segment', 'x1': 50, 'y1': 200, 'x2': 110, 'y2': 200, 'thick': 10, 'color': OBSTACLE_COLOR},
-    {'type': 'circle', 'cx': 220, 'cy': 220, 'r': 20, 'color': OBSTACLE_COLOR},
-    {'type': 'circle', 'cx': 420, 'cy': 220, 'r': 20, 'color': OBSTACLE_COLOR},
-    {'type': 'segment', 'x1': 530, 'y1': 200, 'x2': 590, 'y2': 200, 'thick': 10, 'color': OBSTACLE_COLOR},
+    # Row 1 (y=70)
+    {'type': 'rect', 'x': 50, 'y': 50, 'w': 40, 'h': 40, 'color': OBSTACLE_COLOR},
+    {'type': 'segment', 'x1': 195, 'y1': 40, 'x2': 195, 'y2': 100, 'thick': 10, 'color': OBSTACLE_COLOR},
+    {'type': 'rect', 'x': 300, 'y': 50, 'w': 40, 'h': 40, 'color': OBSTACLE_COLOR},
+    {'type': 'segment', 'x1': 445, 'y1': 40, 'x2': 445, 'y2': 100, 'thick': 10, 'color': OBSTACLE_COLOR},
+    {'type': 'rect', 'x': 550, 'y': 50, 'w': 40, 'h': 40, 'color': OBSTACLE_COLOR},
 
-    # Row 3
-    {'type': 'segment', 'x1': 50, 'y1': 440, 'x2': 110, 'y2': 440, 'thick': 10, 'color': OBSTACLE_COLOR},
-    {'type': 'circle', 'cx': 220, 'cy': 420, 'r': 20, 'color': OBSTACLE_COLOR},
-    {'type': 'circle', 'cx': 420, 'cy': 420, 'r': 20, 'color': OBSTACLE_COLOR},
-    {'type': 'segment', 'x1': 530, 'y1': 440, 'x2': 590, 'y2': 440, 'thick': 10, 'color': OBSTACLE_COLOR},
+    # Row 2 (y=195)
+    {'type': 'segment', 'x1': 40, 'y1': 195, 'x2': 100, 'y2': 195, 'thick': 10, 'color': OBSTACLE_COLOR},
+    {'type': 'circle', 'cx': 195, 'cy': 195, 'r': 20, 'color': OBSTACLE_COLOR},
+    {'type': 'segment', 'x1': 320, 'y1': 165, 'x2': 320, 'y2': 225, 'thick': 10, 'color': OBSTACLE_COLOR},
+    {'type': 'circle', 'cx': 445, 'cy': 195, 'r': 20, 'color': OBSTACLE_COLOR},
+    {'type': 'segment', 'x1': 540, 'y1': 195, 'x2': 600, 'y2': 195, 'thick': 10, 'color': OBSTACLE_COLOR},
 
-    # Row 4
-    {'type': 'rect', 'x': 60, 'y': 540, 'w': 40, 'h': 40, 'color': OBSTACLE_COLOR},
-    {'type': 'segment', 'x1': 200, 'y1': 530, 'x2': 200, 'y2': 590, 'thick': 10, 'color': OBSTACLE_COLOR},
-    {'type': 'segment', 'x1': 440, 'y1': 530, 'x2': 440, 'y2': 590, 'thick': 10, 'color': OBSTACLE_COLOR},
-    {'type': 'rect', 'x': 540, 'y': 540, 'w': 40, 'h': 40, 'color': OBSTACLE_COLOR},
-    
-    # Center Cross
-    {'type': 'segment', 'x1': 280, 'y1': 320, 'x2': 360, 'y2': 320, 'thick': 10, 'color': OBSTACLE_COLOR},
-    {'type': 'segment', 'x1': 320, 'y1': 280, 'x2': 320, 'y2': 360, 'thick': 10, 'color': OBSTACLE_COLOR},
-]
+    # Row 3 (y=320)
+    {'type': 'rect', 'x': 50, 'y': 300, 'w': 40, 'h': 40, 'color': OBSTACLE_COLOR},
+    {'type': 'segment', 'x1': 165, 'y1': 320, 'x2': 225, 'y2': 320, 'thick': 10, 'color': OBSTACLE_COLOR},
+    {'type': 'rect', 'x': 300, 'y': 300, 'w': 40, 'h': 40, 'color': OBSTACLE_COLOR}, # Center
+    {'type': 'segment', 'x1': 415, 'y1': 320, 'x2': 475, 'y2': 320, 'thick': 10, 'color': OBSTACLE_COLOR},
+    {'type': 'rect', 'x': 550, 'y': 300, 'w': 40, 'h': 40, 'color': OBSTACLE_COLOR},
 
-_ULTRA_OBSTACLES = [
-    # 密集矩阵分布
-    # 外部一圈
-    {'type': 'rect', 'x': 50, 'y': 50, 'w': 60, 'h': 60, 'color': OBSTACLE_COLOR},
-    {'type': 'rect', 'x': 290, 'y': 40, 'w': 60, 'h': 40, 'color': OBSTACLE_COLOR},
-    {'type': 'rect', 'x': 530, 'y': 50, 'w': 60, 'h': 60, 'color': OBSTACLE_COLOR},
-    
-    {'type': 'rect', 'x': 40, 'y': 290, 'w': 40, 'h': 60, 'color': OBSTACLE_COLOR},
-    {'type': 'rect', 'x': 560, 'y': 290, 'w': 40, 'h': 60, 'color': OBSTACLE_COLOR},
-    
-    {'type': 'rect', 'x': 50, 'y': 530, 'w': 60, 'h': 60, 'color': OBSTACLE_COLOR},
-    {'type': 'rect', 'x': 290, 'y': 560, 'w': 60, 'h': 40, 'color': OBSTACLE_COLOR},
-    {'type': 'rect', 'x': 530, 'y': 530, 'w': 60, 'h': 60, 'color': OBSTACLE_COLOR},
+    # Row 4 (y=445)
+    {'type': 'segment', 'x1': 40, 'y1': 445, 'x2': 100, 'y2': 445, 'thick': 10, 'color': OBSTACLE_COLOR},
+    {'type': 'circle', 'cx': 195, 'cy': 445, 'r': 20, 'color': OBSTACLE_COLOR},
+    {'type': 'segment', 'x1': 320, 'y1': 415, 'x2': 320, 'y2': 475, 'thick': 10, 'color': OBSTACLE_COLOR},
+    {'type': 'circle', 'cx': 445, 'cy': 445, 'r': 20, 'color': OBSTACLE_COLOR},
+    {'type': 'segment', 'x1': 540, 'y1': 445, 'x2': 600, 'y2': 445, 'thick': 10, 'color': OBSTACLE_COLOR},
 
-    # 内部斜线阵列
-    {'type': 'segment', 'x1': 160, 'y1': 160, 'x2': 220, 'y2': 220, 'thick': 12, 'color': OBSTACLE_COLOR},
-    {'type': 'segment', 'x1': 420, 'y1': 160, 'x2': 480, 'y2': 220, 'thick': 12, 'color': OBSTACLE_COLOR},
-    {'type': 'segment', 'x1': 160, 'y1': 480, 'x2': 220, 'y2': 420, 'thick': 12, 'color': OBSTACLE_COLOR},
-    {'type': 'segment', 'x1': 420, 'y1': 480, 'x2': 480, 'y2': 420, 'thick': 12, 'color': OBSTACLE_COLOR},
-
-    # 中心复杂结构
-    {'type': 'circle', 'cx': 320, 'cy': 320, 'r': 30, 'color': OBSTACLE_COLOR},
-    {'type': 'segment', 'x1': 260, 'y1': 260, 'x2': 260, 'y2': 380, 'thick': 12, 'color': OBSTACLE_COLOR},
-    {'type': 'segment', 'x1': 380, 'y1': 260, 'x2': 380, 'y2': 380, 'thick': 12, 'color': OBSTACLE_COLOR},
-    {'type': 'segment', 'x1': 260, 'y1': 260, 'x2': 380, 'y2': 260, 'thick': 12, 'color': OBSTACLE_COLOR},
-    {'type': 'segment', 'x1': 260, 'y1': 380, 'x2': 380, 'y2': 380, 'thick': 12, 'color': OBSTACLE_COLOR},
+    # Row 5 (y=570)
+    {'type': 'rect', 'x': 50, 'y': 550, 'w': 40, 'h': 40, 'color': OBSTACLE_COLOR},
+    {'type': 'segment', 'x1': 195, 'y1': 540, 'x2': 195, 'y2': 600, 'thick': 10, 'color': OBSTACLE_COLOR},
+    {'type': 'rect', 'x': 300, 'y': 550, 'w': 40, 'h': 40, 'color': OBSTACLE_COLOR},
+    {'type': 'segment', 'x1': 445, 'y1': 540, 'x2': 445, 'y2': 600, 'thick': 10, 'color': OBSTACLE_COLOR},
+    {'type': 'rect', 'x': 550, 'y': 550, 'w': 40, 'h': 40, 'color': OBSTACLE_COLOR},
 ]
 
 OBSTACLE_PRESETS = {
@@ -202,7 +210,6 @@ OBSTACLE_PRESETS = {
     ObstacleDensity.SPARSE: _SPARSE_OBSTACLES,
     ObstacleDensity.MEDIUM: _MEDIUM_OBSTACLES,
     ObstacleDensity.DENSE: _DENSE_OBSTACLES,
-    ObstacleDensity.ULTRA: _ULTRA_OBSTACLES,
 }
 
 # 初始化障碍物
@@ -286,15 +293,6 @@ def set_speeds(tracker: float = None, target: float = None):
         tracker_speed = float(tracker)
     if target is not None:
         target_speed = float(target)
-
-def set_turn_limits(tracker_deg: float = None, target_deg: float = None, default_deg: float = None):
-    global tracker_max_turn_deg, target_max_turn_deg, max_turn_deg
-    if tracker_deg is not None:
-        tracker_max_turn_deg = float(tracker_deg)
-    if target_deg is not None:
-        target_max_turn_deg = float(target_deg)
-    if default_deg is not None:
-        max_turn_deg = float(default_deg)
 
 def set_capture_params(radius: float = None, sector_angle_deg: float = None, required_steps: int = None):
     global capture_radius, capture_sector_angle_deg, capture_required_steps

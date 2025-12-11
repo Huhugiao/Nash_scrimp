@@ -55,7 +55,8 @@ class TrackingEnv(gym.Env):
         self._best_distance = None
 
         # 观测空间保持不变：tracker(27), target(24) 打包成二元组
-        obs_dim = NetParameters.ACTOR_VECTOR_LEN
+        # 观测空间：tracker scalar (11) + radar (64) = 75
+        obs_dim = 11 + 64
         self.observation_space = spaces.Box(low=-1.0, high=1.0,
                                             shape=(obs_dim,), dtype=np.float32)
         self.action_space = spaces.Box(
@@ -80,8 +81,8 @@ class TrackingEnv(gym.Env):
         return tracker_obs, target_obs
 
     def _get_tracker_observation(self):
-        """Tracker 相对观测（27维），FOV / 雷达基于统一射线逻辑。"""
-        obs = np.zeros(27, dtype=np.float32)
+        """Tracker 相对观测（75维），FOV / 雷达基于统一射线逻辑。"""
+        obs = np.zeros(75, dtype=np.float32)
 
         # 1) 自身状态
         current_vel = self._get_velocity(self.tracker, self.prev_tracker_pos)
@@ -90,7 +91,8 @@ class TrackingEnv(gym.Env):
         normalized_vel = np.clip(vel_magnitude / (max_speed + 1e-6), 0, 1) * 2.0 - 1.0
 
         normalized_angular_vel = self._get_angular_velocity(
-            self.tracker, self.prev_tracker_pos, map_config.tracker_max_turn_deg
+            self.tracker, self.prev_tracker_pos, 
+            getattr(map_config, 'tracker_max_angular_speed', 10.0)
         )
         normalized_heading = (self.tracker['theta'] / 180.0) - 1.0
 
@@ -98,36 +100,85 @@ class TrackingEnv(gym.Env):
         obs[1] = normalized_angular_vel
         obs[2] = normalized_heading
 
-        # 2) 目标相对状态
-        relative_vec, distance = self._get_relative_position(self.tracker, self.target)
-        normalized_distance = np.clip((distance / self.fov_range) * 2.0 - 1.0, -1.0, 1.0)
-
-        absolute_angle = math.atan2(relative_vec[1], relative_vec[0])
-        rel_angle_deg = self._normalize_angle(
+        # 2) 计算可见性 & 确定目标参考状态
+        # 先计算真实相对信息用于判断可见性
+        true_rel_vec, true_dist = self._get_relative_position(self.tracker, self.target)
+        absolute_angle = math.atan2(true_rel_vec[1], true_rel_vec[0])
+        true_rel_angle_deg = self._normalize_angle(
             math.degrees(absolute_angle) - self.tracker['theta']
         )
-        normalized_bearing = np.clip(rel_angle_deg / 180.0, -1.0, 1.0)
-
-        target_vel = self._get_velocity(self.target, self.prev_target_pos)
-        relative_vel = target_vel - current_vel
-        relative_speed = float(np.linalg.norm(relative_vel))
-        max_relative_speed = max_speed * 2.0
-        normalized_relative_speed = np.clip(
-            (relative_speed / (max_relative_speed + 1e-6)) * 2.0 - 1.0, -1.0, 1.0
-        )
-
-        target_angular_vel = self._get_angular_velocity(
-            self.target, self.prev_target_pos,
-            getattr(map_config, 'target_max_turn_deg', 10.0)
-        )
-        relative_angular_vel = target_angular_vel - normalized_angular_vel
-        normalized_relative_angular_vel = np.clip(relative_angular_vel, -1.0, 1.0)
-
         fov_half = self.fov_angle * 0.5
-        fov_edge_angle = min(abs(rel_angle_deg + fov_half),
-                             abs(rel_angle_deg - fov_half))
-        normalized_fov_edge = np.clip((fov_edge_angle / fov_half) * 2.0 - 1.0,
-                                      -1.0, 1.0)
+        
+        # 调用可见性更新 (复用现有逻辑)
+        in_fov, occluded = self._update_visibility(true_rel_angle_deg, true_dist, fov_half)
+        
+        # 3) 构造用于观测的目标状态 (Last Known Position Logic)
+        obs_target_state = None
+        obs_target_vel = np.zeros(2, dtype=np.float32)
+        
+        is_visible = (in_fov > 0.5 and occluded < 0.5)
+        
+        if is_visible:
+            # 真实目标可见：使用真实状态
+            obs_target_state = self.target
+            obs_target_vel = self._get_velocity(self.target, self.prev_target_pos)
+        elif self.last_observed_target_pos is not None:
+            # 目标不可见但有记忆：使用最后一次观测到的位置 (Ghost)
+            # Ghost 视为静止，且没有角度信息(theta=0)
+            obs_target_state = {
+                'x': self.last_observed_target_pos[0] - self.pixel_size * 0.5,
+                'y': self.last_observed_target_pos[1] - self.pixel_size * 0.5,
+                'theta': 0.0 # 无法得知朝向
+            }
+            obs_target_vel = np.zeros(2, dtype=np.float32) # 假设Ghost静止
+        else:
+            # 目标不可见且无记忆：完全丢失
+            obs_target_state = None
+
+        # 4) 基于观测状态计算相对特征
+        if obs_target_state is not None:
+            # 有参考目标 (真实或Ghost)
+            rel_vec, distance = self._get_relative_position(self.tracker, obs_target_state)
+            normalized_distance = np.clip((distance / self.fov_range) * 2.0 - 1.0, -1.0, 1.0)
+            
+            abs_ang = math.atan2(rel_vec[1], rel_vec[0])
+            rel_ang = self._normalize_angle(math.degrees(abs_ang) - self.tracker['theta'])
+            normalized_bearing = np.clip(rel_ang / 180.0, -1.0, 1.0)
+            
+            # 相对速度
+            relative_vel = obs_target_vel - current_vel
+            relative_speed = float(np.linalg.norm(relative_vel))
+            max_relative_speed = max_speed * 2.0
+            normalized_relative_speed = np.clip(
+                (relative_speed / (max_relative_speed + 1e-6)) * 2.0 - 1.0, -1.0, 1.0
+            ) 
+            
+            # FOV Edge (基于观测到的角度)
+            fov_edge_angle = min(abs(rel_ang + fov_half), abs(rel_ang - fov_half))
+            normalized_fov_edge = np.clip((fov_edge_angle / fov_half) * 2.0 - 1.0, -1.0, 1.0)
+            
+            # 相对角速度 (Ghost视为0角速度)
+            if is_visible:
+                target_ang_vel = self._get_angular_velocity(
+                    self.target, self.prev_target_pos,
+                    getattr(map_config, 'target_max_angular_speed', 12.0)
+                )
+            else:
+                target_ang_vel = 0.0
+            
+            normalized_relative_angular_vel = np.clip(target_ang_vel - normalized_angular_vel, -1.0, 1.0)
+            
+        else:
+            # 没有任何目标信息
+            normalized_distance = -1.0 # 认为非常远? 或者 1.0? 通常 -1.0 代表 0 距离, 1.0 代表 max range. 
+            # 这里原逻辑: distance=0 -> -1.0; distance=max -> 1.0. 
+            # 如果没看到，设为 1.0 (最远) 或 0.0 (中间) 比较合理，或者保持原状。
+            # 为了让网络知道没东西，我们设为边界值 1.0 (超出视野)
+            normalized_distance = 1.0 
+            normalized_bearing = 0.0
+            normalized_relative_speed = 0.0
+            normalized_relative_angular_vel = 0.0
+            normalized_fov_edge = 1.0
 
         obs[3] = normalized_distance
         obs[4] = normalized_bearing
@@ -135,8 +186,7 @@ class TrackingEnv(gym.Env):
         obs[6] = normalized_relative_angular_vel
         obs[7] = normalized_fov_edge
 
-        # 3) 可见性 (in_fov, occluded, unobserved)
-        in_fov, occluded = self._update_visibility(rel_angle_deg, distance, fov_half)
+        # 5) 状态特征
         max_unobserved = float(EnvParameters.MAX_UNOBSERVED_STEPS)
         normalized_unobserved = np.clip(
             (self.steps_since_observed / max_unobserved) * 2.0 - 1.0,
@@ -146,8 +196,8 @@ class TrackingEnv(gym.Env):
         obs[9] = occluded
         obs[10] = normalized_unobserved
 
-        # 4) 雷达 16 维，360°
-        obs[11:27] = self._sense_agent_radar(
+        # 4) 雷达 64 维，360°
+        obs[11:11+64] = self._sense_agent_radar(
             self.tracker, num_rays=self.radar_rays, full_circle=True
         )
         return obs
@@ -160,12 +210,12 @@ class TrackingEnv(gym.Env):
             return np.array([dx, dy], dtype=np.float32)
         return np.zeros(2, dtype=np.float32)
 
-    def _get_angular_velocity(self, agent, prev_pos, max_turn_deg):
+    def _get_angular_velocity(self, agent, prev_pos, max_ang_speed):
         """计算归一化角速度"""
         if prev_pos is not None:
             prev_heading = prev_pos.get('theta', 0.0)
             angle_change = self._normalize_angle(agent['theta'] - prev_heading)
-            return np.clip(angle_change / (max_turn_deg + 1e-6), -1.0, 1.0)
+            return np.clip(angle_change / (max_ang_speed + 1e-6), -1.0, 1.0)
         return 0.0
 
     def _get_relative_position(self, from_agent, to_agent):
@@ -206,8 +256,8 @@ class TrackingEnv(gym.Env):
         return in_fov, occluded
 
     def _get_target_observation(self):
-        """Target 全局观测（24维），接口不变。"""
-        obs = np.zeros(24, dtype=np.float32)
+        """Target 全局观测（72维），接口不变。"""
+        obs = np.zeros(72, dtype=np.float32)
 
         obs[0] = (self.target['x'] / self.width) * 2.0 - 1.0
         obs[1] = (self.target['y'] / self.height) * 2.0 - 1.0
@@ -224,7 +274,7 @@ class TrackingEnv(gym.Env):
         obs[7] = np.clip((np.linalg.norm(tracker_vel) / (max_speed + 1e-6)) * 2.0 - 1.0,
                          -1.0, 1.0)
 
-        obs[8:24] = self._sense_agent_radar(
+        obs[8:8+64] = self._sense_agent_radar(
             self.target, num_rays=self.radar_rays, full_circle=True
         )
         return obs
@@ -313,14 +363,19 @@ class TrackingEnv(gym.Env):
             raise ValueError("action must contain exactly two elements")
         if np.all(np.abs(arr) <= 1.0 + 1e-6):
             if role == 'tracker':
-                max_turn = float(getattr(map_config, 'tracker_max_turn_deg', map_config.max_turn_deg))
+                max_acc = float(getattr(map_config, 'tracker_max_acc', 0.1))
+                max_ang_acc = float(getattr(map_config, 'tracker_max_ang_acc', 2.0))
             elif role == 'target':
-                max_turn = float(getattr(map_config, 'target_max_turn_deg', map_config.max_turn_deg))
+                max_acc = float(getattr(map_config, 'target_max_acc', 0.1))
+                max_ang_acc = float(getattr(map_config, 'target_max_ang_acc', 2.0))
             else:
-                max_turn = float(map_config.max_turn_deg)
-            angle_delta = float(np.clip(arr[0], -1.0, 1.0) * max_turn)
-            speed_factor = float(np.clip((arr[1] + 1.0) * 0.5, 0.0, 1.0))
-            return angle_delta, speed_factor
+                max_acc = 0.1
+                max_ang_acc = 2.0
+            
+            # Action[0] = Angular Acc, Action[1] = Linear Acc
+            ang_acc = float(np.clip(arr[0], -1.0, 1.0) * max_ang_acc)
+            lin_acc = float(np.clip(arr[1], -1.0, 1.0) * max_acc)
+            return ang_acc, lin_acc
         return float(arr[0]), float(arr[1])
 
     def _physical_to_control(self, physical_action, role):
@@ -328,11 +383,11 @@ class TrackingEnv(gym.Env):
             return None
         angle_delta, speed_factor = physical_action
         if role == 'tracker':
-            max_turn = float(getattr(map_config, 'tracker_max_turn_deg', map_config.max_turn_deg))
+            max_turn = float(getattr(map_config, 'tracker_max_angular_speed', 10.0))
         elif role == 'target':
-            max_turn = float(getattr(map_config, 'target_max_turn_deg', map_config.max_turn_deg))
+            max_turn = float(getattr(map_config, 'target_max_angular_speed', 12.0))
         else:
-            max_turn = float(map_config.max_turn_deg)
+            max_turn = 10.0
         angle_norm = 0.0 if max_turn <= 1e-6 else np.clip(angle_delta / max_turn, -1.0, 1.0)
         speed_norm = np.clip(speed_factor * 2.0 - 1.0, -1.0, 1.0)
         return (float(angle_norm), float(speed_norm))
@@ -343,13 +398,27 @@ class TrackingEnv(gym.Env):
         if action_physical is None:
             return True
 
-        angle_delta, speed_factor = action_physical
-        speed = speed_factor * (self.tracker_speed if role == 'tracker' else self.target_speed)
-
-        new_theta = (agent['theta'] + angle_delta) % 360.0
-        new_x = np.clip(agent['x'] + speed * math.cos(math.radians(new_theta)), 
+        ang_acc, lin_acc = action_physical
+        
+        # Simulate physics
+        sim_agent = agent.copy()
+        max_speed = self.tracker_speed if role == 'tracker' else self.target_speed
+        max_ang_speed = float(getattr(map_config, f'{role}_max_angular_speed', 10.0))
+        
+        # Update velocities
+        sim_agent['v'] = float(sim_agent.get('v', 0.0) + lin_acc)
+        sim_agent['w'] = float(sim_agent.get('w', 0.0) + ang_acc)
+        
+        # Clip
+        sim_agent['v'] = float(np.clip(sim_agent['v'], 0.0, max_speed))
+        sim_agent['w'] = float(np.clip(sim_agent['w'], -max_ang_speed, max_ang_speed))
+        
+        # Update pose
+        new_theta = (sim_agent['theta'] + sim_agent['w']) % 360.0
+        rad_theta = math.radians(new_theta)
+        new_x = np.clip(sim_agent['x'] + sim_agent['v'] * math.cos(rad_theta), 
                         0, self.width - self.pixel_size)
-        new_y = np.clip(agent['y'] + speed * math.sin(math.radians(new_theta)), 
+        new_y = np.clip(sim_agent['y'] + sim_agent['v'] * math.sin(rad_theta), 
                         0, self.height - self.pixel_size)
 
         center_x = new_x + self.pixel_size * 0.5
@@ -376,8 +445,8 @@ class TrackingEnv(gym.Env):
             return original_action, False
 
         base_angle, base_speed = physical_action
-        max_turn = (map_config.tracker_max_turn_deg if role == 'tracker' 
-                    else map_config.target_max_turn_deg)
+        max_turn = (float(getattr(map_config, 'tracker_max_angular_speed', 10.0)) if role == 'tracker' 
+                    else float(getattr(map_config, 'target_max_angular_speed', 12.0)))
 
         def make_candidate(angle_deg, speed_factor):
             clipped_angle = float(np.clip(angle_deg, -max_turn, max_turn))
@@ -416,8 +485,10 @@ class TrackingEnv(gym.Env):
             )
             tracker_phys = self._control_to_physical(tracker_action, 'tracker')
             if tracker_phys is not None:
-                self.tracker = env_lib.agent_move(
-                    self.tracker, tracker_phys, self.tracker_speed, role='tracker'
+                ang_acc, lin_acc = tracker_phys
+                max_ang_speed = float(getattr(map_config, 'tracker_max_angular_speed', 10.0))
+                self.tracker = env_lib.agent_move_accel(
+                    self.tracker, lin_acc, ang_acc, self.tracker_speed, max_ang_speed, role='tracker'
                 )
         if target_action is not None:
             target_action, target_corrected = self._find_valid_action(
@@ -425,8 +496,10 @@ class TrackingEnv(gym.Env):
             )
             target_phys = self._control_to_physical(target_action, 'target')
             if target_phys is not None:
-                self.target = env_lib.agent_move(
-                    self.target, target_phys, self.target_speed, role='target'
+                ang_acc, lin_acc = target_phys
+                max_ang_speed = float(getattr(map_config, 'target_max_angular_speed', 12.0))
+                self.target = env_lib.agent_move_accel(
+                    self.target, lin_acc, ang_acc, self.target_speed, max_ang_speed, role='target'
                 )
 
         self._fov_cache_valid = False

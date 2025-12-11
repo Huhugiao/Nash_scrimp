@@ -23,16 +23,19 @@ from mlp.model_mlp import Model
 from mlp.alg_parameters_mlp import *  # Use MLP-specific parameters
 from mlp.util_mlp import make_gif
 from mlp.policymanager_mlp import PolicyManager
-from rule_policies import CBFTracker, GreedyTarget, TRACKER_POLICY_REGISTRY, TARGET_POLICY_REGISTRY
+import rule_policies # Added to support rule_policies.SmartGreedyTarget etc.
+from rule_policies import CBFTracker, TRACKER_POLICY_REGISTRY, TARGET_POLICY_REGISTRY
+from targetmaker.target_wrapper import RLTargetPolicy
 
 # Simplified choices derived from registries
 TRACKER_POLICY_NAMES = tuple(TRACKER_POLICY_REGISTRY.keys())
 TARGET_POLICY_NAMES = tuple(TARGET_POLICY_REGISTRY.keys())
+RL_TARGET_NAMES = ("RL_Survival", "RL_Stealth", "RL_Taunt")
 TRACKER_TYPE_CHOICES = TRACKER_POLICY_NAMES + ("policy", "all")
-TARGET_TYPE_CHOICES = TARGET_POLICY_NAMES + ("policy", "all")
+TARGET_TYPE_CHOICES = {"Greedy", "all"} | set(RL_TARGET_NAMES)
 
-DEFAULT_TRACKER = "CBF"
-DEFAULT_TARGET = "Greedy"
+DEFAULT_TRACKER = "PurePursuit"
+DEFAULT_TARGET = "all"
 
 
 def get_available_policies(role: str):
@@ -58,9 +61,18 @@ class BattleConfig:
                  specific_target_strategy=None,
                  main_output_dir=None,
                  obstacle_density=None,
+                 tracker_name=None,
                  debug=False):
         self.tracker_type = tracker_type or DEFAULT_TRACKER
-        self.target_type = target_type or DEFAULT_TARGET
+        # Ensure target_type is a list for consistent processing
+        if isinstance(target_type, str):
+             self.target_type = [target_type]
+        elif isinstance(target_type, list):
+             self.target_type = target_type
+        elif target_type is None:
+             self.target_type = [DEFAULT_TARGET]
+        else:
+             self.target_type = target_type
         self.tracker_model_path = tracker_model_path
         self.target_model_path = target_model_path
         self.episodes = episodes
@@ -72,6 +84,7 @@ class BattleConfig:
         self.specific_target_strategy = specific_target_strategy
         self.main_output_dir = main_output_dir
         self.obstacle_density = obstacle_density or ObstacleDensity.MEDIUM
+        self.tracker_name = tracker_name
         self.debug = debug
 
         os.makedirs(output_dir, exist_ok=True)
@@ -110,13 +123,23 @@ def run_battle_batch(args):
             target_model.network.load_state_dict(model_dict)
         target_model.network.eval()
 
+
+    # Pre-load RL Target Policy if applicable
+    preloaded_target_policy = None
+    target_type_for_init = config.specific_target_strategy or (config.target_type if isinstance(config.target_type, str) else config.target_type[0])
+    
+    if target_type_for_init.startswith("RL_"):
+        # Load once per batch
+        _, policy_obj = _init_target_policy(config, preloaded_policy=None)
+        preloaded_target_policy = policy_obj
+
     policy_manager = PolicyManager()
 
     batch_results = []
 
     for episode_idx in episode_indices:
         try:
-            result = run_single_episode(config, episode_idx, tracker_model, target_model, device, policy_manager)
+            result = run_single_episode(config, episode_idx, tracker_model, target_model, device, policy_manager, preloaded_target_policy=preloaded_target_policy)
             batch_results.append(result)
         except Exception as e:
             print(f"Error in episode {episode_idx}: {e}")
@@ -136,7 +159,7 @@ def run_battle_batch(args):
     return batch_results
 
 
-def run_single_episode(config, episode_idx, tracker_model, target_model, device, policy_manager, force_save_gif=False):
+def run_single_episode(config, episode_idx, tracker_model, target_model, device, policy_manager, preloaded_target_policy=None, force_save_gif=False):
     map_config.set_obstacle_density(config.obstacle_density)
     env = TrackingEnv()
     try:
@@ -182,7 +205,7 @@ def run_single_episode(config, episode_idx, tracker_model, target_model, device,
         if hasattr(tracker_policy_fn, 'reset'):
             tracker_policy_fn.reset()
 
-        target_strategy, target_policy_obj = _init_target_policy(config)
+        target_strategy, target_policy_obj = _init_target_policy(config, preloaded_policy=preloaded_target_policy)
         if hasattr(target_policy_obj, 'reset'):
             target_policy_obj.reset()
 
@@ -401,7 +424,7 @@ def _init_tracker_policy(config):
     tracker_strategy = config.specific_tracker_strategy
 
     if config.tracker_type == "policy":
-        return tracker_strategy or "policy", None
+        return config.tracker_name or tracker_strategy or "policy", None
     elif config.tracker_type == "all":
         if tracker_strategy is None:
             raise ValueError("Tracker type is 'all' but no specific strategy provided")
@@ -415,22 +438,65 @@ def _init_tracker_policy(config):
         raise ValueError(f"Unsupported tracker type: {config.tracker_type}")
 
 
-def _init_target_policy(config):
-    target_strategy = config.specific_target_strategy
 
-    if config.target_type == "policy":
+def _init_target_policy(config, preloaded_policy=None):
+    target_strategy = config.specific_target_strategy
+    
+    # Map "RL_Survival" -> "RL_Survival" handled below, no specialized logic needed here other than
+    # creating the policy object. 
+    # If list is passed to config.target_type in BattleConfig, we handle specific strategy one by one.
+    
+    # Note: run_strategy_evaluation iterates and sets config.specific_target_strategy.
+    # Single battle sets it too.
+    
+    current_type = config.specific_target_strategy or (config.target_type if isinstance(config.target_type, str) else config.target_type[0])
+
+    if current_type == "policy":
         return target_strategy or "policy", None
-    elif config.target_type == "all":
+    elif current_type == "all":
         if target_strategy is None:
-            raise ValueError("Target type is 'all' but no specific strategy provided")
-        policy_cls = TARGET_POLICY_REGISTRY.get(target_strategy, GreedyTarget)
+             raise ValueError("Target type is 'all' but no specific strategy provided")
+        policy_cls = TARGET_POLICY_REGISTRY.get(target_strategy, rule_policies.GreedyTarget)
         return target_strategy, policy_cls()
-    elif config.target_type in TARGET_POLICY_REGISTRY:
-        target_strategy = target_strategy or config.target_type
-        policy_cls = TARGET_POLICY_REGISTRY[config.target_type]
+    elif current_type in TARGET_POLICY_REGISTRY:
+        target_strategy = target_strategy or current_type
+        policy_cls = TARGET_POLICY_REGISTRY[current_type]
         return target_strategy, policy_cls()
+    elif current_type.startswith("RL_"):
+        # Handle RL Targets
+        if preloaded_policy is not None:
+             return current_type, preloaded_policy
+
+        if not config.target_model_path:
+            raise ValueError("Must provide --target_model_path when using RL targets")
+        
+        style = current_type.split("_")[1].lower() 
+        if os.path.isdir(config.target_model_path):
+             # Try exact match first
+             candidate = os.path.join(config.target_model_path, f"{style}.pth")
+             if os.path.exists(candidate):
+                 model_file = candidate
+             else:
+                 # Try fuzzy match (e.g. survival_12345.pth)
+                 import glob
+                 candidates = glob.glob(os.path.join(config.target_model_path, f"{style}*.pth"))
+                 if candidates:
+                     # Sort by modification time or name length? 
+                     # Usually we want the one with highest number if it is step count.
+                     # But file system sort is usually fine if format is standard. 
+                     # Let's take the last one alphabetically which usually works for timestamp/step count if fixed width, 
+                     # or just latest modified.
+                     candidates.sort(key=os.path.getmtime)
+                     model_file = candidates[-1]
+                     print(f"Auto-selected latest model file for {style}: {os.path.basename(model_file)}")
+                 else:
+                      raise FileNotFoundError(f"No model file found for style '{style}' in {config.target_model_path}")
+        else:
+             model_file = config.target_model_path
+        
+        return current_type, RLTargetPolicy(model_file)
     else:
-        raise ValueError(f"Unsupported target type: {config.target_type}")
+        raise ValueError(f"Unsupported target type: {current_type}")
 
 
 def _get_tracker_action(config, model, policy_fn, strategy, actor_obs, critic_obs, hidden, privileged_state=None):
@@ -512,7 +578,6 @@ def analyze_strategy_performance(df):
             stats['avg_reward'] /= stats['episodes']
             stats['tracker_win_rate'] = stats['tracker_wins'] / stats['episodes']
             stats['target_win_rate'] = stats['target_wins'] / stats['episodes']
-            stats['draw_rate'] = stats['draws'] / stats['episodes']
 
     return dict(strategy_stats)
 
@@ -530,13 +595,15 @@ def run_strategy_evaluation(base_config):
 
     if base_config.tracker_type == "all":
         tracker_strategies = get_available_policies("tracker")
+    elif base_config.tracker_type == "policy" and base_config.tracker_name:
+        tracker_strategies = [base_config.tracker_name]
     else:
         tracker_strategies = [base_config.tracker_type]
 
-    if base_config.target_type == "all":
+    if "all" in base_config.target_type:
         target_strategies = get_available_policies("target")
     else:
-        target_strategies = [base_config.target_type]
+        target_strategies = base_config.target_type
 
     total_combinations = len(tracker_strategies) * len(target_strategies)
     print(f"将评估 {total_combinations} 种策略组合，每种组合 {base_config.episodes} 场对战")
@@ -559,12 +626,13 @@ def run_strategy_evaluation(base_config):
                 episodes=base_config.episodes,
                 save_gif_freq=base_config.save_gif_freq,
                 output_dir=strategy_output_dir,
-                seed=base_config.seed + combination_count,
+                seed=base_config.seed,
                 state_space=base_config.state_space,
-                specific_tracker_strategy=tracker_strategy if base_config.tracker_type == "all" else None,
-                specific_target_strategy=target_strategy if base_config.target_type == "all" else None,
+                specific_tracker_strategy=tracker_strategy,
+                specific_target_strategy=target_strategy,
                 main_output_dir=main_evaluation_dir,
                 obstacle_density=base_config.obstacle_density,
+                tracker_name=base_config.tracker_name,
                 debug=base_config.debug)
             results, run_dir = run_battle(config, strategy_name=f"{tracker_strategy}_vs_{target_strategy}")
 
@@ -577,7 +645,6 @@ def run_strategy_evaluation(base_config):
                     'episodes': len(results),
                     'tracker_win_rate': results['tracker_caught_target'].mean(),
                     'target_win_rate': results['target_reached_exit'].mean(),
-                    'draw_rate': 1.0 - results['tracker_caught_target'].mean() - results['target_reached_exit'].mean(),
                     'avg_steps': results['steps'].mean(),
                     'avg_reward': results['reward'].mean()
                 }
@@ -684,7 +751,6 @@ def run_battle(config, strategy_name=None):
 
     tracker_win_rate = float(df['tracker_caught_target'].mean()) if len(df) > 0 else 0.0
     target_win_rate = float(df['target_reached_exit'].mean()) if len(df) > 0 else 0.0
-    draw_rate = 1.0 - tracker_win_rate - target_win_rate
 
     try:
         results_path = os.path.join(config.run_dir, "results.csv")
@@ -696,7 +762,6 @@ def run_battle(config, strategy_name=None):
             "avg_reward": avg_reward,
             "tracker_win_rate": tracker_win_rate,
             "target_win_rate": target_win_rate,
-            "draw_rate": draw_rate,
             "tracker_strategy": config.specific_tracker_strategy or config.tracker_type,
             "target_strategy": config.specific_target_strategy or config.target_type
         }
@@ -711,7 +776,6 @@ def run_battle(config, strategy_name=None):
     print(f"结果: 场次={len(df)}, 平均步数={avg_steps:.1f}, "
           f"Tracker胜率={tracker_win_rate*100:.1f}%, "
           f"Target胜率={target_win_rate*100:.1f}%, "
-          f"平局率={draw_rate*100:.1f}%, "
           f"用时={total_time:.1f}s")
 
     return df, config.run_dir
@@ -736,24 +800,25 @@ Available Strategies:
 """
     )
 
-    parser.add_argument('--tracker', type=str, default="policy",
+    parser.add_argument('--tracker', type=str, default="PurePursuit",
                        choices=list(TRACKER_TYPE_CHOICES),
                        help=f'Tracker type: {", ".join(TRACKER_TYPE_CHOICES)}')
-    parser.add_argument('--target', type=str, default="all",
-                       choices=list(TARGET_TYPE_CHOICES),
-                       help=f'Target type: {", ".join(TARGET_TYPE_CHOICES)}')
+    parser.add_argument('--tracker_name', type=str, default="rl1208",
+                       help='Custom name for tracker when type is policy')
+    parser.add_argument('--target', type=str, nargs='+', default=["all"],
+                       help=f'Target type(s): {", ".join(TARGET_TYPE_CHOICES)}')
 
     parser.add_argument('--tracker_model', type=str,
-                       default='./models/mlp_ppo_oneop_rl_12-01-16-19/best_model/checkpoint.pth',
+                       default='./models/mlp_rl_fixop_12-08-21-19/latest_model/checkpoint.pth',
                        help='Path to tracker model (required when --tracker=policy)')
-    parser.add_argument('--target_model', type=str, default=None,
+    parser.add_argument('--target_model', type=str, default='./target_models/stealth_ppo_12-10-17-25/stealth_best.pth',
                        help='Path to target model (required when --target=policy)')
 
     parser.add_argument('--episodes', type=int, default=100,
                        help='Number of episodes to run')
-    parser.add_argument('--save_gif_freq', type=int, default=50,
+    parser.add_argument('--save_gif_freq', type=int, default=10,
                        help='Save GIF every N episodes (0 to disable)')
-    parser.add_argument('--output_dir', type=str, default='./scrimp_battle',
+    parser.add_argument('--output_dir', type=str, default='./battles',
                        help='Output directory for results')
     parser.add_argument('--seed', type=int, default=1234,
                        help='Random seed')
@@ -772,7 +837,7 @@ Available Strategies:
 
     if args.tracker == 'policy' and args.tracker_model is None:
         parser.error("--tracker_model is required when tracker is 'policy'")
-    if args.target == 'policy' and args.target_model is None:
+    if 'policy' in args.target and args.target_model is None:
         parser.error("--target_model is required when target is 'policy'")
 
     config = BattleConfig(
@@ -786,17 +851,43 @@ Available Strategies:
         seed=args.seed,
         state_space=args.state_space,
         obstacle_density=args.obstacles,
+        tracker_name=args.tracker_name,
         debug=args.debug
     )
 
-    if config.tracker_type == "all" or config.target_type == "all":
+    # Logic for choosing Single Battle vs Strategy Evaluation
+    # If we have multiple components (multiple targets, multiple trackers, or "all"), use evaluation mode
+    is_multi_eval = (
+        len(config.target_type) > 1 or 
+        "all" in config.target_type or 
+        config.tracker_type == "all"
+    )
+
+    if is_multi_eval:
         run_strategy_evaluation(config)
     else:
+        # Single Battle Mode
+        # Extract single target from list
+        single_target = config.target_type[0]
+        # Temporarily patch config.target_type to be string for single battle logic compatibility if needed, 
+        # but BattleConfig now stores list. run_battle expects config.target_type to be used as string in some places?
+        # Actually run_battle uses config.target_type for naming run_dir.
+        
+        # Let's adjust run_battle to handle list or just pass the single string
+        # But run_battle is called by run_strategy_evaluation too.
+        
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         main_dir = os.path.join(
             config.output_dir,
-            f"single_battle_{config.tracker_type}_vs_{config.target_type}_{config.obstacle_density}_{timestamp}"
+            f"single_battle_{config.tracker_type}_vs_{single_target}_{config.obstacle_density}_{timestamp}"
         )
         os.makedirs(main_dir, exist_ok=True)
         config.output_dir = main_dir
+        
+        # We need to pass the single strategy name to run_battle effectively
+        # Let's use config.specific_target_strategy logic
+        config.specific_target_strategy = single_target
+        # run_battle uses config.target_type for logging, string preferred
+        config.target_type = single_target 
+        
         run_battle(config)
