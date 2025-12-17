@@ -47,7 +47,7 @@ height = 640
 pixel_size = 4
 # target 略慢，tracker 稍快
 target_speed = 2.0
-tracker_speed = 2.5  # pixels/step
+tracker_speed = 2.6  # pixels/step
 
 # Acceleration limits (Removed - System is now Velocity-based)
 # tracker_max_acc, target_max_acc, etc. are deprecated.

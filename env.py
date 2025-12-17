@@ -378,10 +378,22 @@ class TrackingEnv(gym.Env):
 
     def _is_action_valid(self, agent, action, role):
         """简化的动作有效性检查"""
+        action_arr = np.asarray(action, dtype=np.float32).flatten()
+        if action_arr.size != 2:
+            return True
+            
+        angle_norm = float(action_arr[0])
+        speed_norm = float(action_arr[1])
+        
+        # Get max turn for this role
+        if role == 'tracker':
+            max_turn = float(getattr(map_config, 'tracker_max_angular_speed', 10.0))
+        else:
+            max_turn = float(getattr(map_config, 'target_max_angular_speed', 12.0))
+        
         # Simulate next position
-        max_turn = getattr(map_config, f'{role}_max_turn_deg', 45.0)
-        angle_delta = np.clip(action[0], -max_turn, max_turn)
-        speed = np.clip(action[1], 0.0, 1.0) * (
+        angle_delta = angle_norm * max_turn
+        speed = max(0.0, speed_norm) * (
             self.tracker_speed if role == 'tracker' else self.target_speed
         )
         
@@ -399,55 +411,81 @@ class TrackingEnv(gym.Env):
             cx, cy, padding=getattr(map_config, 'agent_radius', self.pixel_size * 0.5)
         )
 
+    def _find_valid_action(self, agent, original_action, role, max_attempts=8):
+        """
+        找到有效的替代动作（仅调整角度，不降低速度）
+        直接复刻用户的原始代码
+        """
+        action_arr = np.asarray(original_action, dtype=np.float32).flatten()
+        if action_arr.size != 2:
+            return original_action, False
+            
+        # 原动作有效则直接返回
+        if self._is_action_valid(agent, action_arr, role):
+            return action_arr, False
+        
+        base_angle = float(action_arr[0])
+        base_speed = float(action_arr[1])
+        
+        # 获取最大转向角
+        if role == 'tracker':
+            max_turn = float(getattr(map_config, 'tracker_max_angular_speed', 10.0))
+        else:
+            max_turn = float(getattr(map_config, 'target_max_angular_speed', 12.0))
+        
+        def make_candidate(angle_deg, speed_factor):
+            """将角度（度）转换为归一化动作"""
+            clipped_angle = float(np.clip(angle_deg / max_turn, -1.0, 1.0))
+            clipped_speed = float(np.clip(speed_factor, -1.0, 1.0))
+            return np.array([clipped_angle, clipped_speed], dtype=np.float32)
+        
+        attempts = 0
+        def try_candidate(angle_deg, speed_factor):
+            nonlocal attempts
+            if attempts >= max_attempts:
+                return None
+            attempts += 1
+            candidate = make_candidate(angle_deg, speed_factor)
+            return candidate if self._is_action_valid(agent, candidate, role) else None
+        
+        # 将当前归一化角度转换为物理角度
+        physical_base_angle = base_angle * max_turn
+        
+        # 仅通过角度偏移寻找可行解（速度保持不变）
+        for delta in (10, -10, 20, -20, 30, -30, 45, -45, 60, -60, 75, -75, 90, -90, 120, -120, 135, -135, 180, -180):
+            candidate = try_candidate(physical_base_angle + delta, base_speed)
+            if candidate is not None:
+                return candidate, True
+        
+        # 兜底：返回原始动作（未修正）
+        return action_arr, False
+
     def _apply_safety_layer(self, action, agent_state, role='tracker'):
         """
-        Safety Layer: 修正动作以避免碰撞
+        Safety Layer: 多层保护机制修正动作以避免碰撞
         
-        当 safety_layer_enabled=True 时，使用雷达感知和 hard_mask 
-        来修正可能导致碰撞的动作。这让 RL 可以专注于追踪目标，
-        而避障由环境自动处理。
-        
-        多层保护机制:
-        1. Hard Mask: 基于雷达检测修正转向角度
+        保护层级:
+        1. Hard Mask: 基于雷达检测快速修正转向角度
         2. 动作有效性检查: 模拟执行后验证是否碰撞
-        3. 速度调整: 如果仍有碰撞风险则降低速度
+        3. 系统性角度搜索: 尝试不同角度偏移找到有效动作
+        4. 速度调整: 只有在角度搜索失败后才降低速度
         
-        Args:
-            action: 原始动作 [angle_norm, speed_norm]
-            agent_state: 智能体状态字典
-            role: 'tracker' 或 'target'
-        
-        Returns:
-            修正后的安全动作
+        这让 RL 可以专注于追踪目标，避障由环境自动处理。
+        后续可用 Residual Learning 学习这个避障行为。
         """
         if not self.safety_layer_enabled:
             return action
         
         from rule_policies import apply_hard_mask
         
-        # 获取 360° 雷达读数
+        # 第1层: Hard Mask 基于雷达的快速修正
         radar = self._sense_agent_radar_optimized(agent_state)
         current_heading = agent_state.get('theta', 0.0)
-        
-        # 第1层: Hard Mask 基础修正
         safe_action = apply_hard_mask(action, radar, current_heading, role)
         
-        # 第2层: 动作有效性检查（模拟执行）
+        # 第2层: 动作有效性检查 + 系统性角度搜索
         if not self._is_action_valid(agent_state, safe_action, role):
-            # 尝试降低速度
-            for speed_factor in [0.5, 0.25, 0.0]:
-                reduced_action = np.array([safe_action[0], safe_action[1] * speed_factor], dtype=np.float32)
-                if self._is_action_valid(agent_state, reduced_action, role):
-                    safe_action = reduced_action
-                    break
-            else:
-                # 如果前进不行，尝试反方向
-                reverse_action = np.array([-safe_action[0], 0.0], dtype=np.float32)
-                if self._is_action_valid(agent_state, reverse_action, role):
-                    safe_action = reverse_action
-                else:
-                    # 完全停止
-                    safe_action = np.array([0.0, 0.0], dtype=np.float32)
+            safe_action, _ = self._find_valid_action(agent_state, safe_action, role)
         
         return safe_action
 
