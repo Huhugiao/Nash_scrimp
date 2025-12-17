@@ -3,10 +3,10 @@ import math
 import sys
 import os
 
-from env_lib import apply_hard_mask
+from rule_policies import apply_hard_mask
 from map_config import EnvParameters
 import map_config
-from lstm.model_lstm import Model
+from mlp.model_mlp import Model
 
 class PurePursuitTracker:
     """

@@ -5,7 +5,7 @@ from rule_policies import (
     TARGET_POLICY_REGISTRY
 )
 # 注意：这里使用通用的alg_parameters，因为PolicyManager可能被不同算法共享
-from lstm.alg_parameters import TrainingParameters
+from mlp.alg_parameters_mlp import TrainingParameters
 from map_config import EnvParameters
 
 class PolicyManager:

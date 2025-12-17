@@ -25,6 +25,7 @@ from mlp.util_mlp import make_gif
 from mlp.policymanager_mlp import PolicyManager
 import rule_policies # Added to support rule_policies.SmartGreedyTarget etc.
 from rule_policies import CBFTracker, TRACKER_POLICY_REGISTRY, TARGET_POLICY_REGISTRY
+from rule_policies import apply_hard_mask
 from targetmaker.target_wrapper import RLTargetPolicy
 
 # Simplified choices derived from registries
@@ -34,7 +35,7 @@ RL_TARGET_NAMES = ("RL_Survival", "RL_Stealth", "RL_Taunt")
 TRACKER_TYPE_CHOICES = TRACKER_POLICY_NAMES + ("policy", "all")
 TARGET_TYPE_CHOICES = {"Greedy", "all"} | set(RL_TARGET_NAMES)
 
-DEFAULT_TRACKER = "PurePursuit"
+DEFAULT_TRACKER = "CBF"
 DEFAULT_TARGET = "all"
 
 
@@ -62,7 +63,8 @@ class BattleConfig:
                  main_output_dir=None,
                  obstacle_density=None,
                  tracker_name=None,
-                 debug=False):
+                 debug=False,
+                 hard_mask=False):
         self.tracker_type = tracker_type or DEFAULT_TRACKER
         # Ensure target_type is a list for consistent processing
         if isinstance(target_type, str):
@@ -86,6 +88,7 @@ class BattleConfig:
         self.obstacle_density = obstacle_density or ObstacleDensity.MEDIUM
         self.tracker_name = tracker_name
         self.debug = debug
+        self.hard_mask = hard_mask
 
         os.makedirs(output_dir, exist_ok=True)
         self.run_dir = None
@@ -195,7 +198,8 @@ def run_single_episode(config, episode_idx, tracker_model, target_model, device,
             'lost_steps': 0,
             'min_obs_dist': 1.0,
             'collision': False,
-            'collision_type': None
+            'collision_type': None,
+            'collision_count': 0
         }
 
         tracker_hidden = None
@@ -255,12 +259,43 @@ def run_single_episode(config, episode_idx, tracker_model, target_model, device,
                 else:
                     target_action = g_action
 
-                tracker_action = np.asarray(tracker_action, dtype=np.float32).reshape(2)
-                target_action = np.asarray(target_action, dtype=np.float32).reshape(2)
+                # Ensure actions are 1D arrays with exactly 2 elements
+                tracker_action = np.asarray(tracker_action, dtype=np.float32).flatten()
+                target_action = np.asarray(target_action, dtype=np.float32).flatten()
+                
+                if tracker_action.size != 2:
+                    print(f"Warning: tracker_action has size {tracker_action.size}, expected 2. Using zeros.")
+                    tracker_action = np.zeros(2, dtype=np.float32)
+                    
+                if target_action.size != 2:
+                    print(f"Warning: target_action has size {target_action.size}, expected 2. Using zeros.")
+                    target_action = np.zeros(2, dtype=np.float32)
 
-                step_obs, reward, terminated, truncated, info = env.step(
-                    (tracker_action, target_action)
-                )
+                # 硬掩码：仅对 policy 类型的 tracker 应用（CBF已有自身安全约束）
+                if config.hard_mask and config.tracker_type == "policy":
+                    # 从 tracker_obs 提取雷达和航向
+                    radar = tracker_actor_obs[11:11+64]  # 雷达数据在索引 11-74
+                    heading_deg = (tracker_actor_obs[2] + 1.0) * 180.0  # 从归一化恢复
+                    masked_action = apply_hard_mask(tracker_action, radar, heading_deg, role='tracker')
+                    # Ensure the result is properly shaped
+                    masked_action = np.asarray(masked_action, dtype=np.float32).flatten()
+                    if masked_action.size == 2:
+                        tracker_action = masked_action
+                    else:
+                        print(f"Warning: apply_hard_mask returned size {masked_action.size}, keeping original action")
+
+                # Final safety check before env.step
+                try:
+                    step_obs, reward, terminated, truncated, info = env.step(
+                        action=tracker_action,
+                        target_action=target_action
+                    )
+                except Exception as step_error:
+                    print(f"Error in env.step: {step_error}")
+                    print(f"tracker_action shape: {tracker_action.shape}, values: {tracker_action}")
+                    print(f"target_action shape: {target_action.shape}, values: {target_action}")
+                    raise
+
                 done = terminated or truncated
                 episode_reward += float(reward)
                 episode_step += 1
@@ -300,6 +335,9 @@ def run_single_episode(config, episode_idx, tracker_model, target_model, device,
                 if info.get('tracker_collision'):
                     stats['collision'] = True
                     stats['collision_type'] = "tracker_collision"
+                
+                if 'tracker_collision_count' in info:
+                    stats['collision_count'] = info['tracker_collision_count']
 
                 if should_record:
                     try:
@@ -325,7 +363,7 @@ def run_single_episode(config, episode_idx, tracker_model, target_model, device,
                     gif_path = os.path.join(save_dir, f"debug_fail_episode_{episode_idx:03d}.gif")
                 else:
                     gif_path = os.path.join(save_dir, f"episode_{episode_idx:03d}.gif")
-                make_gif(episode_frames, gif_path, fps=EnvParameters.N_ACTIONS // 2)
+                make_gif(episode_frames, gif_path, fps=EnvParameters.RENDER_FPS)
             except Exception:
                 pass
 
@@ -413,6 +451,7 @@ def run_single_episode(config, episode_idx, tracker_model, target_model, device,
             "target_type": config.target_type,
             "tracker_strategy": tracker_strategy,
             "target_strategy": target_strategy,
+            "collision_count": stats.get('collision_count', 0),
             "debug_info": debug_info
         }
 
@@ -646,7 +685,8 @@ def run_strategy_evaluation(base_config):
                     'tracker_win_rate': results['tracker_caught_target'].mean(),
                     'target_win_rate': results['target_reached_exit'].mean(),
                     'avg_steps': results['steps'].mean(),
-                    'avg_reward': results['reward'].mean()
+                    'avg_reward': results['reward'].mean(),
+                    'avg_collisions': results['collision_count'].mean() if 'collision_count' in results else 0.0
                 }
                 all_summaries.append(summary)
 
@@ -677,13 +717,13 @@ def run_strategy_evaluation(base_config):
         print(f"总计 {len(all_results)} 场对战")
         print(f"结果保存在: {main_evaluation_dir}")
         print("\n策略组合表现排名 (按Tracker胜率排序):")
-        print(f"{'Tracker策略':<20} {'Target策略':<20} {'场次':<6} {'Tracker胜率':<12} {'Target胜率':<12} {'平均步数':<10}")
-        print("-" * 90)
+        print(f"{'Tracker策略':<20} {'Target策略':<20} {'场次':<6} {'Tracker胜率':<12} {'Target胜率':<12} {'平均步数':<10} {'平均碰撞':<10}")
+        print("-" * 105)
 
         summary_df_sorted = summary_df.sort_values('tracker_win_rate', ascending=False)
         for _, row in summary_df_sorted.iterrows():
             print(f"{row['tracker_strategy']:<20} {row['target_strategy']:<20} {row['episodes']:<6.0f} "
-                  f"{row['tracker_win_rate']*100:<11.1f}% {row['target_win_rate']*100:<11.1f}% {row['avg_steps']:<10.1f}")
+                  f"{row['tracker_win_rate']*100:<11.1f}% {row['target_win_rate']*100:<11.1f}% {row['avg_steps']:<10.1f} {row.get('avg_collisions', 0):<10.1f}")
 
         return all_results_df, main_evaluation_dir
 
@@ -707,7 +747,7 @@ def run_battle(config, strategy_name=None):
     from mlp.util_mlp import set_global_seeds
     set_global_seeds(config.seed)
 
-    num_processes = min(multiprocessing.cpu_count() // 2, 6)
+    num_processes = min(multiprocessing.cpu_count() // 2, 4)
     batch_size = max(10, config.episodes // max(num_processes, 1))
 
     start_time = time.time()
@@ -800,23 +840,23 @@ Available Strategies:
 """
     )
 
-    parser.add_argument('--tracker', type=str, default="PurePursuit",
+    parser.add_argument('--tracker', type=str, default="CBF",
                        choices=list(TRACKER_TYPE_CHOICES),
                        help=f'Tracker type: {", ".join(TRACKER_TYPE_CHOICES)}')
-    parser.add_argument('--tracker_name', type=str, default="rl1208",
+    parser.add_argument('--tracker_name', type=str, default="rl",
                        help='Custom name for tracker when type is policy')
     parser.add_argument('--target', type=str, nargs='+', default=["all"],
                        help=f'Target type(s): {", ".join(TARGET_TYPE_CHOICES)}')
 
     parser.add_argument('--tracker_model', type=str,
-                       default='./models/mlp_rl_fixop_12-08-21-19/latest_model/checkpoint.pth',
+                       default='./models/mlp_rl_coverseeker_12-15-11-08/best_model/checkpoint.pth',
                        help='Path to tracker model (required when --tracker=policy)')
     parser.add_argument('--target_model', type=str, default='./target_models/stealth_ppo_12-10-17-25/stealth_best.pth',
                        help='Path to target model (required when --target=policy)')
 
-    parser.add_argument('--episodes', type=int, default=100,
+    parser.add_argument('--episodes', type=int, default=50,
                        help='Number of episodes to run')
-    parser.add_argument('--save_gif_freq', type=int, default=10,
+    parser.add_argument('--save_gif_freq', type=int, default=50,
                        help='Save GIF every N episodes (0 to disable)')
     parser.add_argument('--output_dir', type=str, default='./battles',
                        help='Output directory for results')
@@ -830,8 +870,10 @@ Available Strategies:
                        choices=ObstacleDensity.ALL_LEVELS,
                        help='Obstacle density level (none/sparse/medium/dense)')
 
-    parser.add_argument('--debug', action='store_true', default=False,
+    parser.add_argument('--debug', action='store_true', default=True,
                        help='Enable debug mode: save GIFs and detailed data for failed tracker episodes')
+    parser.add_argument('--hard_mask', action='store_true', default=False,
+                       help='Apply hard mask to policy actions for collision avoidance')
 
     args = parser.parse_args()
 
@@ -852,7 +894,8 @@ Available Strategies:
         state_space=args.state_space,
         obstacle_density=args.obstacles,
         tracker_name=args.tracker_name,
-        debug=args.debug
+        debug=args.debug,
+        hard_mask=args.hard_mask
     )
 
     # Logic for choosing Single Battle vs Strategy Evaluation
@@ -866,15 +909,7 @@ Available Strategies:
     if is_multi_eval:
         run_strategy_evaluation(config)
     else:
-        # Single Battle Mode
-        # Extract single target from list
         single_target = config.target_type[0]
-        # Temporarily patch config.target_type to be string for single battle logic compatibility if needed, 
-        # but BattleConfig now stores list. run_battle expects config.target_type to be used as string in some places?
-        # Actually run_battle uses config.target_type for naming run_dir.
-        
-        # Let's adjust run_battle to handle list or just pass the single string
-        # But run_battle is called by run_strategy_evaluation too.
         
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         main_dir = os.path.join(
@@ -883,11 +918,7 @@ Available Strategies:
         )
         os.makedirs(main_dir, exist_ok=True)
         config.output_dir = main_dir
-        
-        # We need to pass the single strategy name to run_battle effectively
-        # Let's use config.specific_target_strategy logic
         config.specific_target_strategy = single_target
-        # run_battle uses config.target_type for logging, string preferred
         config.target_type = single_target 
         
         run_battle(config)

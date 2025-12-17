@@ -23,8 +23,9 @@ class ProtectingNetMLP(nn.Module):
         self.hidden_dim = NetParameters.HIDDEN_DIM
         self.num_layers = getattr(NetParameters, 'NUM_HIDDEN_LAYERS', 3)
         
-        # Radar Encoder
-        self.radar_encoder = RadarEncoder()
+        # Separate Radar Encoders for Actor and Critic
+        self.actor_radar_encoder = RadarEncoder()   # Actor 专用
+        self.critic_radar_encoder = RadarEncoder()  # Critic 专用
         
         # --- Actor Network ---
         # Input: Scalar (11) + Embedded Radar (8) = 19 (Encoded)
@@ -68,7 +69,7 @@ class ProtectingNetMLP(nn.Module):
         # 1. Process Actor Radar
         actor_scalar = actor_obs[:, :NetParameters.ACTOR_SCALAR_LEN]
         actor_radar = actor_obs[:, NetParameters.ACTOR_SCALAR_LEN:]
-        actor_radar_emb = self.radar_encoder(actor_radar)
+        actor_radar_emb = self.actor_radar_encoder(actor_radar)  # Actor 专用编码器
         actor_in = torch.cat([actor_scalar, actor_radar_emb], dim=-1) # [Batch, 19]
         
         # 2. Process Critic Radar
@@ -76,14 +77,14 @@ class ProtectingNetMLP(nn.Module):
         tracker_end = NetParameters.ACTOR_RAW_LEN
         tracker_scalar = critic_obs[:, :NetParameters.ACTOR_SCALAR_LEN]
         tracker_radar = critic_obs[:, NetParameters.ACTOR_SCALAR_LEN:tracker_end]
-        tracker_radar_emb = self.radar_encoder(tracker_radar) # Share encoder
+        tracker_radar_emb = self.critic_radar_encoder(tracker_radar)  # Critic 专用编码器
         tracker_part = torch.cat([tracker_scalar, tracker_radar_emb], dim=-1) # [Batch, 19]
         
         # Target Part (75 to 147)
         target_start = tracker_end
         target_scalar = critic_obs[:, target_start:target_start+NetParameters.PRIVILEGED_SCALAR_LEN]
         target_radar = critic_obs[:, target_start+NetParameters.PRIVILEGED_SCALAR_LEN:]
-        target_radar_emb = self.radar_encoder(target_radar) # Share encoder
+        target_radar_emb = self.critic_radar_encoder(target_radar)  # Critic 专用编码器
         target_part = torch.cat([target_scalar, target_radar_emb], dim=-1) # [Batch, 16]
         
         critic_in = torch.cat([tracker_part, target_part], dim=-1) # [Batch, 35]
@@ -105,14 +106,14 @@ class ProtectingNetMLP(nn.Module):
         tracker_end = NetParameters.ACTOR_RAW_LEN
         tracker_scalar = critic_obs[..., :NetParameters.ACTOR_SCALAR_LEN]
         tracker_radar = critic_obs[..., NetParameters.ACTOR_SCALAR_LEN:tracker_end]
-        tracker_radar_emb = self.radar_encoder(tracker_radar)
+        tracker_radar_emb = self.critic_radar_encoder(tracker_radar)
         tracker_part = torch.cat([tracker_scalar, tracker_radar_emb], dim=-1)
         
         # Target Part
         target_start = tracker_end
         target_scalar = critic_obs[..., target_start:target_start+NetParameters.PRIVILEGED_SCALAR_LEN]
         target_radar = critic_obs[..., target_start+NetParameters.PRIVILEGED_SCALAR_LEN:]
-        target_radar_emb = self.radar_encoder(target_radar)
+        target_radar_emb = self.critic_radar_encoder(target_radar)
         target_part = torch.cat([target_scalar, target_radar_emb], dim=-1)
         
         critic_in = torch.cat([tracker_part, target_part], dim=-1)

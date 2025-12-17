@@ -29,9 +29,9 @@ class TargetTrainingParameters:
     STYLE_MAP = {name: i for i, name in enumerate(STYLES)}
 
 class TargetNetParameters:
-    # Radar
+    # ====== 雷达编码配置（与 mlp/alg_parameters_mlp.py 保持一致）======
     RADAR_DIM = 64
-    RADAR_EMBED_DIM = 8
+    RADAR_EMBED_DIM = 8  # 雷达编码后维度（8/16/32）
     
     # Target Observation (Actor Input)
     TARGET_SCALAR_LEN = 8
@@ -47,9 +47,9 @@ class TargetNetParameters:
     ACTION_DIM = 2
     
     # Encoded Dimensions
-    TARGET_VECTOR_LEN = TARGET_SCALAR_LEN + RADAR_EMBED_DIM # 16
-    TRACKER_VECTOR_LEN = TRACKER_SCALAR_LEN + RADAR_EMBED_DIM # 19
-    STATE_VECTOR_LEN = TARGET_VECTOR_LEN + TRACKER_VECTOR_LEN # 35
+    TARGET_VECTOR_LEN = TARGET_SCALAR_LEN + RADAR_EMBED_DIM # 8 + 8 = 16
+    TRACKER_VECTOR_LEN = TRACKER_SCALAR_LEN + RADAR_EMBED_DIM # 11 + 8 = 19
+    STATE_VECTOR_LEN = TARGET_VECTOR_LEN + TRACKER_VECTOR_LEN # 16 + 19 = 35
     
     # MLP
     HIDDEN_DIM = 128

@@ -35,14 +35,10 @@ if not ray.is_initialized():
 	ray.init(num_gpus=SetupParameters.NUM_GPU)
 
 print("Welcome to TrackerMaker with MLP - Training Tracker!")
+print(f"Training Mode: {TrainingParameters.TRAINING_MODE} | Steps: {TrainingParameters.N_MAX_STEPS/1e6:.0f}M | Safety Layer: {TrainingParameters.SAFETY_LAYER_ENABLED}")
 if TrainingParameters.OPPONENT_TYPE in {"random", "random_nonexpert"}:
-	available = sorted(list(TARGET_POLICY_REGISTRY.keys()))
 	weights = TrainingParameters.RANDOM_OPPONENT_WEIGHTS.get("target", {})
-	print("Multi-Opponent Configuration:")
-	print(f"  Available target policies: {', '.join(available)}")
-	print(f"  Sampling weights: {weights}")
-	print(f"  Adaptive sampling: {'ENABLED' if TrainingParameters.ADAPTIVE_SAMPLING else 'DISABLED'}")
-print(f"IL probability is FIXED at {TrainingParameters.IL_INITIAL_PROB*100:.1f}% (relies on Q-filter)")
+	print(f"Opponent weights: {weights}")
 
 def_attr = lambda name, default: getattr(RecordingParameters, name, default)
 MODEL_PATH = def_attr('MODEL_PATH', './models/TrackingEnv/mlp')
@@ -55,17 +51,37 @@ BEST_INTERVAL = int(def_attr('BEST_INTERVAL', 0))
 GIF_INTERVAL = int(def_attr('GIF_INTERVAL', 200000))
 EVAL_EPISODES = int(def_attr('EVAL_EPISODES', 16))
 
-# def get_cosine_annealing_il_prob(current_step):
-# 	if current_step >= IL_DECAY_STEPS:
-# 		return IL_FINAL_PROB
-# 	cosine_decay = 0.5 * (1 + math.cos(math.pi * current_step / IL_DECAY_STEPS))
-# 	return IL_FINAL_PROB + (IL_INITIAL_PROB - IL_FINAL_PROB) * cosine_decay
+def get_scheduled_il_prob(current_step):
+	"""IL概率调度：如果启用衰减则 cosine annealing，否则返回固定值"""
+	# Check if decay is enabled
+	if not getattr(TrainingParameters, 'IL_PROB_DECAY_ENABLED', False):
+		return getattr(TrainingParameters, 'IL_INITIAL_PROB', 1.0)
+	
+	initial = getattr(TrainingParameters, 'IL_INITIAL_PROB', 1.0)
+	final = getattr(TrainingParameters, 'IL_FINAL_PROB', 0.0)
+	decay_steps = getattr(TrainingParameters, 'IL_DECAY_STEPS', 3e6)
+	
+	if current_step >= decay_steps:
+		return final
+	
+	progress = current_step / decay_steps
+	cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+	return final + (initial - final) * cosine_decay
 
 def get_scheduled_lr(current_step):
 	final_lr = getattr(TrainingParameters, 'LR_FINAL', TrainingParameters.lr)
 	progress = min(max(current_step / TrainingParameters.N_MAX_STEPS, 0.0), 1.0)
 	weight = 0.5 * (1.0 + math.cos(math.pi * progress))
 	return final_lr + (TrainingParameters.lr - final_lr) * weight
+
+def get_scheduled_n_epochs(current_step):
+	"""动态计算 N_EPOCHS，使用 cosine 衰减从 INITIAL 到 FINAL"""
+	initial = TrainingParameters.N_EPOCHS_INITIAL
+	final = TrainingParameters.N_EPOCHS_FINAL
+	progress = min(max(current_step / TrainingParameters.N_MAX_STEPS, 0.0), 1.0)
+	weight = 0.5 * (1.0 + math.cos(math.pi * progress))
+	n_epochs = final + (initial - final) * weight
+	return max(int(round(n_epochs)), 1)  # 确保至少为1
 
 def build_segments_from_rollout(rollout, window_size):
 	segments = []
@@ -328,7 +344,7 @@ def _record_eval_gif(eval_env, agent_model, opponent_model, device, gif_path):
 				break
 	if len(frames) > 1:
 		os.makedirs(os.path.dirname(gif_path), exist_ok=True)
-		make_gif(frames, gif_path, fps=EnvParameters.N_ACTIONS // 2)
+		make_gif(frames, gif_path, fps=EnvParameters.RENDER_FPS)
 
 def main():
 	model_dict = None
@@ -352,7 +368,7 @@ def main():
 			opp_dict = torch.load(SetupParameters.PRETRAINED_TARGET_PATH, map_location='cpu')
 			opponent_model.set_weights(opp_dict['model'])
 		opponent_weights = opponent_model.get_weights()
-	global_pm = PolicyManager() if TrainingParameters.OPPONENT_TYPE in {"random", "random_nonexpert"} and TrainingParameters.ADAPTIVE_SAMPLING else None
+	global_pm = None  # Adaptive sampling disabled
 	envs = [Runner.remote(i + 1) for i in range(TrainingParameters.N_ENVS)]
 	eval_env = TrackingEnv()
 	curr_steps = int(model_dict.get('step', 0)) if model_dict else 0
@@ -375,7 +391,8 @@ def main():
 	os.makedirs(GIFS_PATH, exist_ok=True)
 	try:
 		while curr_steps < TrainingParameters.N_MAX_STEPS:
-			il_prob = TrainingParameters.IL_INITIAL_PROB # Use configured probability
+			# IL probability with cosine annealing decay
+			il_prob = get_scheduled_il_prob(curr_steps)
 			new_lr = get_scheduled_lr(curr_steps)
 			training_model.update_learning_rate(new_lr)
 			model_weights = training_model.get_weights()
@@ -422,7 +439,9 @@ def main():
 			il_filter_ratios = []
 			if all_rl_segments:
 				random.shuffle(all_rl_segments)
-				for _ in range(TrainingParameters.N_EPOCHS):
+				# 动态计算当前 N_EPOCHS
+				current_n_epochs = get_scheduled_n_epochs(curr_steps)
+				for _ in range(current_n_epochs):
 					for mb_start in range(0, len(all_rl_segments), TrainingParameters.MINIBATCH_SIZE):
 						mb_end = min(mb_start + TrainingParameters.MINIBATCH_SIZE, len(all_rl_segments))
 						batch_segments = all_rl_segments[mb_start:mb_end]
@@ -472,70 +491,81 @@ def main():
 						}
 						
 						# call train
-						result = training_model.train(**train_args)
+					result = training_model.train(**train_args)
 
-						if isinstance(result, dict):
-							epoch_loss_buffer.append(result.get('losses', []))
-							if result.get('il_loss') is not None:
-								batch_il_losses.append(float(result['il_loss']))
-							if result.get('q_loss') is not None:
-								batch_q_losses.append(float(result['q_loss']))
-							if result.get('il_filter_ratio') is not None:
-								il_filter_ratios.append(float(result['il_filter_ratio']))
-						elif isinstance(result, (list, tuple)):
-							epoch_loss_buffer.append(result)
+					if isinstance(result, dict):
+						epoch_loss_buffer.append(result.get('losses', []))
+						if result.get('il_loss') is not None:
+							batch_il_losses.append(float(result['il_loss']))
+						if result.get('q_loss') is not None:
+							batch_q_losses.append(float(result['q_loss']))
+						if result.get('il_filter_ratio') is not None:
+							il_filter_ratios.append(float(result['il_filter_ratio']))
+						# Track gradient norms
+						if result.get('il_grad_norm') is not None:
+							if 'il_grad_norms' not in locals():
+								il_grad_norms = []
+							il_grad_norms.append(float(result['il_grad_norm']))
+						if result.get('rl_grad_norm') is not None:
+							if 'rl_grad_norms' not in locals():
+								rl_grad_norms = []
+							rl_grad_norms.append(float(result['rl_grad_norm']))
+						# Track current phase
+						if result.get('current_phase') is not None:
+							current_phase = result['current_phase']
+					elif isinstance(result, (list, tuple)):
+						epoch_loss_buffer.append(result)
 			
 			# No separate imitation_train call needed if we mix in every batch
 			
 			if curr_steps - last_train_log_t >= TrainingParameters.LOG_EPOCH_STEPS:
 				last_train_log_t = curr_steps
 				train_stats = compute_performance_stats(epoch_perf_buffer) if epoch_perf_buffer['per_r'] else {}
-				avg_il_loss = float(np.mean(batch_il_losses)) if batch_il_losses else 0.0
-				avg_q_loss = float(np.mean(batch_q_losses)) if batch_q_losses else 0.0
-				avg_il_error = float(np.mean(il_action_errors)) if il_action_errors else 0.0
-				avg_filter_ratio = float(np.mean(il_filter_ratios)) if il_filter_ratios else 0.0
 				
-				# Opponent Stats
-				opp_counts = {}
-				for opp in epoch_opponents:
-					opp_counts[opp] = opp_counts.get(opp, 0) + 1
-				total_opps = len(epoch_opponents)
-				sorted_opps = sorted(opp_counts.items(), key=lambda x: x[1], reverse=True)
-				
-				opp_str = ""
-				if sorted_opps:
-					top1 = sorted_opps[0]
-					opp_str = f" | Top1={top1[0]}({top1[1]/total_opps*100:.0f}%)"
-					if len(sorted_opps) > 1:
-						top2 = sorted_opps[1]
-						opp_str += f" Top2={top2[0]}({top2[1]/total_opps*100:.0f}%)"
-
+				# Log to terminal (simplified for RL mode)
+				is_pure_rl = TrainingParameters.TRAINING_MODE == "rl"
 				log_str = format_train_log(curr_steps, curr_episodes, il_prob, train_stats)
-				log_str += f" | IL_loss={avg_il_loss:.4f} | Filter={avg_filter_ratio:.2f}{opp_str}"
+				
+				if not is_pure_rl:
+					# IL/Mixed mode: show IL metrics
+					avg_il_loss = float(np.mean(batch_il_losses)) if batch_il_losses else 0.0
+					avg_filter_ratio = float(np.mean(il_filter_ratios)) if il_filter_ratios else 1.0
+					avg_il_grad = float(np.mean(il_grad_norms)) if 'il_grad_norms' in locals() and il_grad_norms else 0.0
+					avg_rl_grad = float(np.mean(rl_grad_norms)) if 'rl_grad_norms' in locals() and rl_grad_norms else 0.0
+					current_phase = locals().get('current_phase', 'phase1')
+					phase_str = "P1" if current_phase == "phase1" else "P2"
+					log_str += f" [{phase_str}] IL={avg_il_loss:.3f} Flt={avg_filter_ratio:.2f}"
+					log_str += f" gIL={avg_il_grad:.1f} gRL={avg_rl_grad:.1f}"
+				
 				print(log_str)
+				
 				if global_summary:
-					# Use the refactored write_to_tensorboard
 					from mlp.util_mlp import write_to_tensorboard
+					avg_il_loss = float(np.mean(batch_il_losses)) if batch_il_losses else 0.0
+					avg_q_loss = float(np.mean(batch_q_losses)) if batch_q_losses else 0.0
 					write_to_tensorboard(global_summary, curr_steps, performance_dict=epoch_perf_buffer, 
 										 mb_loss=epoch_loss_buffer, imitation_loss=[avg_il_loss, 0.0], q_loss=avg_q_loss, evaluate=False)
 					global_summary.add_scalar('Train/LR', new_lr, curr_steps)
+					global_summary.add_scalar('Train/N_Epochs', get_scheduled_n_epochs(curr_steps), curr_steps)
 					
-					# Log Filter Ratio
-					if il_filter_ratios:
-						avg_filter_ratio = float(np.mean(il_filter_ratios))
-						global_summary.add_scalar('Train/IL_Filter_Kept_Ratio', avg_filter_ratio, curr_steps)
-					
-					# Log Opponent Distribution
-					if total_opps > 0:
-						for opp, count in opp_counts.items():
-							global_summary.add_scalar(f'Train/Opponent_{opp}', count / total_opps, curr_steps)
-					else:
-						pass
+					if not is_pure_rl:
+						# IL metrics only for non-RL modes
+						global_summary.add_scalar('Train/IL_Prob', il_prob, curr_steps)
+						if il_filter_ratios:
+							avg_filter_ratio = float(np.mean(il_filter_ratios))
+							global_summary.add_scalar('Train/IL_Filter_Kept_Ratio', avg_filter_ratio, curr_steps)
+						if 'il_grad_norms' in locals() and il_grad_norms:
+							global_summary.add_scalar('Grad/IL_Grad_Norm', float(np.mean(il_grad_norms)), curr_steps)
+						if 'rl_grad_norms' in locals() and rl_grad_norms:
+							global_summary.add_scalar('Grad/RL_Grad_Norm', float(np.mean(rl_grad_norms)), curr_steps)
 
 				epoch_perf_buffer = {'per_r': [], 'per_episode_len': [], 'win': []}
 				epoch_loss_buffer = []
-				epoch_opponents = []  # Reset opponent buffer
+				batch_il_losses = []
+				batch_q_losses = []
 				il_filter_ratios = []
+				if 'il_grad_norms' in locals(): il_grad_norms = []
+				if 'rl_grad_norms' in locals(): rl_grad_norms = []
 			if curr_steps - last_test_t >= EVAL_INTERVAL:
 				last_test_t = curr_steps
 				eval_reward, eval_win_rate = evaluate_single_agent(eval_env, training_model, opponent_model, global_device)

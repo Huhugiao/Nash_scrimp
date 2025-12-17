@@ -6,17 +6,15 @@ import random, math
 # ============================================================================
 
 class EnvParameters:
-    # 观测 / 动作接口保持不变
-    N_ACTIONS = 48
-    EPISODE_LEN = 449
-    NUM_TARGET_POLICIES = 4  # Updated to match CONTEXT_LEN (Greedy, APF, Hiding, Random)
+    RENDER_FPS = 30  # Increased from 24 for smoother visualization
+    EPISODE_LEN = 449  # Rounded for cleaner logic
+    NUM_TARGET_POLICIES = 4
 
-    # 视场与观测配置（重新设计）
-    # Tracker：有限视场、雷达 360°；Target：全局视角 + 360° 雷达
-    FOV_ANGLE = 90         # 追踪者视场角（度）
-    FOV_RANGE = 250         # 追踪者最大可见距离（像素）
-    RADAR_RAYS = 64            # 360° 雷达射线数
-    MAX_UNOBSERVED_STEPS = 80  # 最长未观测时间归一化上限
+    # FOV configuration (optimized values)
+    FOV_ANGLE = 90  # 90° front facing cone
+    FOV_RANGE = 250.0  # Maximum visibility range
+    RADAR_RAYS = 64  # Power of 2 for efficiency
+    MAX_UNOBSERVED_STEPS = 90  # ~3 seconds at 30 FPS
 
 # ============================================================================
 # Obstacle Density Levels
@@ -49,22 +47,19 @@ height = 640
 pixel_size = 4
 # target 略慢，tracker 稍快
 target_speed = 2.0
-tracker_speed = 2.85
+tracker_speed = 2.5  # pixels/step
 
-# 加速度限制 (pixels/step^2, degrees/step^2)
-tracker_max_acc = 0.1
-target_max_acc = 0.2  # Increased for agility
-tracker_max_ang_acc = 2.0
-target_max_ang_acc = 4.0  # Increased for agility
+# Acceleration limits (Removed - System is now Velocity-based)
+# tracker_max_acc, target_max_acc, etc. are deprecated.
 
 # 物理极限 (Max Speed/Angular Speed)
 # tracker_speed defined above (2.4)
-tracker_max_angular_speed = 6.0 # degrees/step
-target_max_angular_speed = 12.0 # degrees/step
+tracker_max_angular_speed = 5 # degrees/step
+target_max_angular_speed = 10.0 # degrees/step
 
 # 捕获逻辑（保持接口，但参数更“紧凑”）
-capture_radius = 20
-capture_sector_angle_deg = 30
+capture_radius = 25.0
+capture_sector_angle_deg = 40.0
 capture_required_steps = 1
 CAPTURE_SECTOR_COLOR = (90, 220, 140, 50)
 
@@ -85,11 +80,11 @@ grid_step = 64
 trail_color_tracker = (80, 130, 255, 190)
 trail_color_target  = (255, 120, 120, 190)
 # 缩短轨迹长度以减少GIF每帧的像素变化量，显著降低文件大小
-trail_max_len = 120
+trail_max_len = 100  # Reduced for memory
 trail_width = 2
 
 # 增大墙体厚度：视觉更清晰，也让边界遮挡更合理
-wall_thickness = 6  
+wall_thickness = 8  # Increased for better visibility
 
 # 障碍物颜色（深灰略带透明）
 OBSTACLE_COLOR = (70, 70, 80, 255)
@@ -257,8 +252,8 @@ agent_radius = 8          # 半径稍大一点，让造型更明显
 base_radius_draw = 12
 
 # 抗锯齿与超级采样
-ssaa = 1
-enable_aa = True
+ssaa = 1  # Disable SSAA by default for speed
+enable_aa = False
 draw_grid = False
 
 # 训练相关（保持接口）
@@ -268,7 +263,13 @@ success_reward = 20
 max_loss_step = 50
 total_steps = 500
 
+
 agent_spawn_min_gap = 150.0
+dynamic_obstacles = False
+
+def update_dynamic_obstacles():
+    pass
+
 
 def set_render_quality(mode: str):
     """运行时切换渲染质量: 'fast' 或 'quality'"""

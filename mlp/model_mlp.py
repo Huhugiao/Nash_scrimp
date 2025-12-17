@@ -3,7 +3,7 @@ import numpy as np
 import torch
 from mlp.alg_parameters_mlp import NetParameters, TrainingParameters
 from mlp.nets_mlp import ProtectingNetMLP
-from util import write_to_tensorboard
+from mlp.util_mlp import write_to_tensorboard
 
 def get_grad_projection(g1, g2):
     gradient_dot = torch.dot(g1.view(-1), g2.view(-1))
@@ -116,6 +116,21 @@ class Model(object):
         return action[0].cpu().numpy(), pre_tanh[0].cpu().numpy(), \
                float(value.item()), float(log_prob.item())
 
+    @staticmethod
+    def get_current_phase(global_step):
+        """根据当前步数自动判断训练阶段"""
+        phase1_steps = getattr(TrainingParameters, 'PHASE1_STEPS', 8e6)
+        training_mode = getattr(TrainingParameters, 'TRAINING_MODE', 'mixed')
+        
+        # 如果明确设置了 phase1/phase2/mixed/rl/il，优先使用设置
+        if training_mode in ['rl', 'il', 'mixed']:
+            return training_mode
+        
+        # 自动阶段切换
+        if global_step is None:
+            return 'phase1'
+        return 'phase1' if global_step < phase1_steps else 'phase2'
+
     def train(self, actor_obs=None, critic_obs=None, returns=None, values=None, actions=None, old_log_probs=None, mask=None, il_batch=None,
               writer=None, global_step=None, perf_dict=None):
         """
@@ -125,8 +140,14 @@ class Model(object):
           returns, values, old_log_probs, mask: (N,) or None
           actions: (N, action_dim)  (pre-tanh) or None
         il_batch (optional) should be a dict with flattened arrays of same sample-first shapes.
+        
+        global_step is used for automatic phase switching.
         """
+        # Determine current training phase
+        current_phase = self.get_current_phase(global_step)
+        
         self.net_optimizer.zero_grad(set_to_none=True)
+
 
         # 1. Compute IL Gradients
         il_grads = None
@@ -148,7 +169,13 @@ class Model(object):
             else:
                 gating_mask = il_mask.reshape(-1)
 
-            if TrainingParameters.USE_Q_CRITIC:
+            # Q-Filter logic:
+            # - phase1: NO Q-filter (accept all IL samples to quickly learn from expert)
+            # - phase2: USE Q-filter (only learn from IL samples where expert is better)
+            # - mixed/il with USE_Q_CRITIC: use Q-filter
+            use_q_filter = TrainingParameters.USE_Q_CRITIC and current_phase != "phase1"
+            
+            if use_q_filter:
                 with torch.no_grad():
                     _, il_value_flat, _ = self.network(il_actor, il_critic)
                     q_expert_flat = self.network.forward_q(il_critic, il_actions).squeeze(-1)
@@ -236,9 +263,13 @@ class Model(object):
                                 1.0 + TrainingParameters.CLIP_RANGE) * advantages
             policy_loss_t = -torch.min(surr1, surr2).sum() / mask.sum().clamp_min(1.0)
             
-            # If Pure IL mode, we do NOT want PPO to update the policy.
-            # But we DO want Value/Q losses to update the critic/q-net.
-            if TrainingParameters.TRAINING_MODE == "il":
+            # Two-phase training logic:
+            # - phase1: Actor NOT updated by RL (only by IL)
+            # - phase2/mixed: Actor updated by both RL and IL
+            # - il: Actor only updated by IL (no RL policy loss)
+            # - rl: Actor only updated by RL (no IL)
+            if current_phase in ["il", "phase1"]:
+                # Disable RL policy loss for Actor
                 policy_loss = 0.0
                 policy_loss_t = policy_loss_t * 0.0
             else:
@@ -247,7 +278,7 @@ class Model(object):
             entropy = (0.5 * (1.0 + np.log(2 * np.pi)) + log_std_flat).sum(dim=-1)
             entropy_loss_t = -(entropy * mask).sum() / mask.sum().clamp_min(1.0)
             
-            if TrainingParameters.TRAINING_MODE == "il":
+            if current_phase in ["il", "phase1"]:
                 entropy_loss = 0.0
                 entropy_loss_t = entropy_loss_t * 0.0
             else:
@@ -287,10 +318,17 @@ class Model(object):
                 clipfrac = (torch.abs(ratio - 1.0) > TrainingParameters.CLIP_RANGE).float().mean().item()
 
         # 3. Gradient Projection and Update
+        il_grad_norm = 0.0
+        rl_grad_norm = 0.0
+        
         if il_grads is not None and rl_grads is not None:
             # Flatten gradients for projection
             g_il_flat = torch.cat([g.view(-1) for g in il_grads])
             g_rl_flat = torch.cat([g.view(-1) for g in rl_grads])
+            
+            # Record gradient norms BEFORE projection
+            il_grad_norm = float(torch.norm(g_il_flat).item())
+            rl_grad_norm = float(torch.norm(g_rl_flat).item())
             
             # Project RL gradient onto orthogonal complement of IL gradient
             dot_prod = torch.dot(g_rl_flat, g_il_flat)
@@ -310,11 +348,14 @@ class Model(object):
                 idx += numel
         elif il_grads is not None:
             # Only IL gradients
-             for i, param in enumerate(self.network.parameters()):
+            g_il_flat = torch.cat([g.view(-1) for g in il_grads])
+            il_grad_norm = float(torch.norm(g_il_flat).item())
+            for i, param in enumerate(self.network.parameters()):
                 param.grad = il_grads[i]
         elif rl_grads is not None:
-            # Only RL gradients (already in param.grad, do nothing)
-            pass
+            # Only RL gradients (already in param.grad)
+            g_rl_flat = torch.cat([g.view(-1) for g in rl_grads])
+            rl_grad_norm = float(torch.norm(g_rl_flat).item())
         else:
             # No gradients (should not happen if at least one batch is provided)
             pass
@@ -330,7 +371,16 @@ class Model(object):
 
         losses = [total_loss, policy_loss, entropy_loss, value_loss,
                   adv_std, approx_kl, 0.0, clipfrac, grad_norm, adv_mean]
-        return {'losses': losses, 'il_loss': il_loss_value, 'q_loss': q_loss_value, 'il_filter_ratio': il_filter_ratio}
+        return {
+            'losses': losses, 
+            'il_loss': il_loss_value, 
+            'q_loss': q_loss_value, 
+            'il_filter_ratio': il_filter_ratio,
+            'il_grad_norm': il_grad_norm,
+            'rl_grad_norm': rl_grad_norm,
+            'final_grad_norm': grad_norm,
+            'current_phase': current_phase
+        }
 
     def imitation_train(self, actor_obs, critic_obs, optimal_actions, writer=None, global_step=None):
         # Expect flattened per-sample inputs: actor_obs (N, actor_dim), critic_obs (N, critic_dim), optimal_actions (N, action_dim)

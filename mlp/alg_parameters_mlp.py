@@ -24,70 +24,67 @@ class TrainingParameters:
     # --- 训练流程设置 ---
     N_ENVS = 4               # 并行环境数量
     N_STEPS = 2048           # 每个环境采样的步数 (PPO Rollout Length)
-    N_MAX_STEPS = 4e7        # 最大训练总步数
+    
+    # 纯 RL 训练步数
+    N_MAX_STEPS = int(8e6)   # 800万步
+    
     LOG_EPOCH_STEPS = int(1e4) # 每隔多少步记录一次日志
     
     MINIBATCH_SIZE = 64      # PPO更新的Mini-batch大小
-    N_EPOCHS = 10            # PPO更新的Epoch数
+    N_EPOCHS_INITIAL = 12    # 初始Epoch数 (会衰减)
+    N_EPOCHS_FINAL = 4       # 最终Epoch数
 
     # --- 序列长度设置 (MLP也使用TBPTT进行数据切分) ---
     TBPTT_STEPS = 32         # 截断反向传播的时间步长 (也是Context Window大小)
     
     # --- PPO 核心参数 ---
     VALUE_CLIP_RANGE = 0.2   # Value Loss的Clip范围
-    CLIP_RANGE = 0.2         # Policy Loss的Clip范围 (PPO Clip)
+    CLIP_RANGE = 0.1         # Policy Loss的Clip范围 (PPO Clip)
     RATIO_CLAMP_MAX = 4.0    # Importance Sampling Ratio的最大值
-    EX_VALUE_COEF = 0.5      # Value Loss的系数
-    ENTROPY_COEF = 0.02      # Entropy Bonus的系数
+    EX_VALUE_COEF = 0.6      # Value Loss的系数
+    ENTROPY_COEF = 0.01      # Entropy Bonus的系数
     MAX_GRAD_NORM = 0.5      # 梯度裁剪阈值
     GAMMA = 0.99             # 折扣因子
     LAM = 0.95               # GAE参数 lambda
     
-    # --- 模仿学习 (IL) 设置 ---
-    IL_TYPE = "expert"       # 模仿类型 (目前仅支持 'expert')
+    # --- 观测噪声 (Domain Randomization) ---
+    OBS_NOISE_STD = 0.01     # 观测噪声标准差 (0=无噪声, 建议0.01~0.05)
     
-    # 训练模式: 'mixed' (IL+RL), 'rl' (Pure RL), 'il' (Pure IL)
+    # ====== 训练模式 ======
+    # 'rl'     - 纯 RL 训练 (推荐配合 SAFETY_LAYER_ENABLED)
+    # 'phase1' - IL-only Actor + RL Critic/Q
+    # 'phase2' - Q-filtered IL + RL
+    # 'mixed'  - 传统混合训练
+    # 'il'     - 纯 IL 训练
     TRAINING_MODE = "rl"
     
-    # IL 概率调度
-    IL_INITIAL_PROB = 1.0    # 初始模仿概率
-    IL_FINAL_PROB = 0.05     # 最终模仿概率
-    IL_DECAY_STEPS = 3e6     # 衰减步数
-
-    if TRAINING_MODE == "rl":
-        IL_INITIAL_PROB = 0.0
-        IL_FINAL_PROB = 0.0
-        IL_DECAY_STEPS = 1.0
-    elif TRAINING_MODE == "il":
-        IL_INITIAL_PROB = 1.0
-        IL_FINAL_PROB = 1.0
-        IL_DECAY_STEPS = 1.0
+    # ====== Safety Layer (环境辅助避障) ======
+    # 开启后，环境会在执行动作前修正动作以避免碰撞
+    # 让 RL 专注于追踪目标，避障由环境处理
+    # 后续可用 Residual Learning 学习这个避障行为
+    SAFETY_LAYER_ENABLED = True
     
-    # IL 数据混合比例
-    # 既然只用新数据，这里不再需要比例设置，或者可以理解为 1.0
+    # IL 概率 (RL 模式下自动设为 0)
+    IL_INITIAL_PROB = 0.0
+    IL_FINAL_PROB = 0.0
+    IL_PROB_DECAY_ENABLED = False
+    IL_DECAY_STEPS = 1.0
     
-    # Q-Filter 设置
-    USE_Q_CRITIC = False      # 是否使用Q-Critic进行专家数据筛选
-    Q_LOSS_COEF = 0.5        # Q Loss的系数
-    IL_FILTER_THRESHOLD = -0 # Q-Filter 阈值 (Q_expert - V > threshold)
+    # Q-Critic 设置 (RL 模式不需要)
+    USE_Q_CRITIC = False
+    Q_LOSS_COEF = 0.5
+    IL_FILTER_THRESHOLD = 0.0
     
     # --- 对手策略设置 ---
-    # 纯 RL 训练，随机抽样四个规则 target
-    OPPONENT_TYPE = "random" # 对手类型 ('random', 'policy', 'random_nonexpert')
+    OPPONENT_TYPE = "random"
     
-    # 自适应采样 (Adaptive Sampling)
-    ADAPTIVE_SAMPLING = False           # 是否开启自适应采样
-    ADAPTIVE_SAMPLING_WINDOW = 200      # 统计胜率的窗口大小
-    ADAPTIVE_SAMPLING_MIN_GAMES = 10   # 最小对局数
-    ADAPTIVE_SAMPLING_STRENGTH = 1.0   # 采样强度 (越大越倾向于选择弱势对手)
-    
-    # 随机对手权重 (初始权重)
+    # 随机对手权重
     RANDOM_OPPONENT_WEIGHTS = {
         "target": {
-            "Greedy": 1.0,
             "CoverSeeker": 1.0,
-            "ZigZag": 1.0,
-            "Orbiter": 1.0,
+            # "Greedy": 1.0,
+            # "ZigZag": 1.0,
+            # "Orbiter": 1.0,
         }
     }
 
@@ -95,9 +92,9 @@ class NetParameters:
     """
     网络结构参数
     """
-    # Radar Encoding
-    RADAR_DIM = 64           # 原始雷达维度
-    RADAR_EMBED_DIM = 8      # 雷达编码后维度
+    # ====== 雷达编码配置（统一开关）======
+    RADAR_DIM = 64           # 原始雷达维度（射线数量）
+    RADAR_EMBED_DIM = 8      # 雷达编码后维度（可调整：8/16/32）
     
     # Inputs
     ACTOR_SCALAR_LEN = 11    # Actor 标量部分
@@ -126,13 +123,13 @@ class RecordingParameters:
     日志与记录参数
     """
     EXPERIMENT_PROJECT = "AvoidMaker_MLP"
-    EXPERIMENT_NAME = "mlp_rl_fixop"
+    EXPERIMENT_NAME = "mlp_rl_coverseeker"
     ENTITY = "user"
-    EXPERIMENT_NOTE = "MLP PPO training with separate radar encoding"
+    EXPERIMENT_NOTE = "MLP PPO training"
     TIME = datetime.datetime.now().strftime("_%m-%d-%H-%M")
     
     RETRAIN = False          # 是否继续训练
-    RESTORE_DIR = "./models/mlp_ppo_oneop_rl_12-02-11-12/final_model/checkpoint.pth"       # 恢复模型的目录
+    RESTORE_DIR = "./models/mlp_rl_greedy_12-12-14-27/best_model/checkpoint.pth"       # 恢复模型的目录
     
     WANDB = False            # 是否使用WandB
     TENSORBOARD = True       # 是否使用TensorBoard

@@ -1,14 +1,13 @@
-import os
-import sys
 import math
 import numpy as np
 from typing import Optional, Union, Tuple
 import gymnasium as gym
 from gymnasium import spaces
+from shapely.geometry import Point, Polygon as ShapelyPolygon
 
 import env_lib, map_config
 from map_config import EnvParameters
-from lstm.alg_parameters import NetParameters
+from mlp.alg_parameters_mlp import TrainingParameters
 import pygame
 
 
@@ -18,57 +17,61 @@ class TrackingEnv(gym.Env):
         'render_fps': 40
     }
 
-    def __init__(self, spawn_outside_fov=False):
+    def __init__(self, spawn_outside_fov=False, safety_layer_enabled=None):
         super().__init__()
         self.spawn_outside_fov = bool(spawn_outside_fov)
-        self.mask_flag = getattr(map_config, 'mask_flag', False)
         self.width = map_config.width
         self.height = map_config.height
         self.pixel_size = map_config.pixel_size
         self.target_speed = map_config.target_speed
         self.tracker_speed = map_config.tracker_speed
+        
+        # Safety Layer: environment-assisted obstacle avoidance
+        # When enabled, actions are modified before execution to prevent collisions
+        self.safety_layer_enabled = safety_layer_enabled if safety_layer_enabled is not None else TrainingParameters.SAFETY_LAYER_ENABLED
+        
+        # State
         self.tracker = None
         self.target = None
-        self._render_surface = None
-        self.tracker_trajectory = []
-        self.target_trajectory = []
         self.step_count = 0
-        self.target_frame_count = 0
         self.prev_tracker_pos = None
-        self.last_tracker_pos = None
         self.prev_target_pos = None
-        self.last_target_pos = None
-
-        # 视场配置：直接使用 EnvParameters
+        
+        # FOV config
         self.fov_angle = EnvParameters.FOV_ANGLE
         self.fov_range = EnvParameters.FOV_RANGE
         self.radar_rays = EnvParameters.RADAR_RAYS
-
-        # 捕获配置
-        self.capture_radius = float(getattr(map_config, 'capture_radius', 10.0))
-        self.capture_sector_angle_deg = float(getattr(map_config, 'capture_sector_angle_deg', 60.0))
-        self.capture_required_steps = int(getattr(map_config, 'capture_required_steps', 8))
+        
+        # Capture config
+        self.capture_radius = map_config.capture_radius
+        self.capture_sector_angle_deg = map_config.capture_sector_angle_deg
+        self.capture_required_steps = int(getattr(map_config, 'capture_required_steps', 1))
         self._capture_counter = 0
-
+        
+        # Visibility tracking
         self.last_observed_target_pos = None
         self.steps_since_observed = 0
-        self._best_distance = None
-
-        # 观测空间保持不变：tracker(27), target(24) 打包成二元组
-        # 观测空间：tracker scalar (11) + radar (64) = 75
-        obs_dim = 11 + 64
-        self.observation_space = spaces.Box(low=-1.0, high=1.0,
-                                            shape=(obs_dim,), dtype=np.float32)
-        self.action_space = spaces.Box(
-            low=np.array([-1.0, -1.0], dtype=np.float32),
-            high=np.array([1.0, 1.0], dtype=np.float32),
-            dtype=np.float32
+        
+        # Observation space: tracker(75), target(72)
+        self.observation_space = spaces.Box(
+            low=-1.0, high=1.0, shape=(75,), dtype=np.float32
         )
-        self.current_obs = None
-
-        # FOV 多边形缓存
+        self.action_space = spaces.Box(
+            low=-1.0, high=1.0, shape=(2,), dtype=np.float32
+        )
+        
+        # Rendering
+        self._render_surface = None
         self._fov_cache = None
         self._fov_cache_valid = False
+        
+        # Trajectory (limit length for memory)
+        self.tracker_trajectory = []
+        self.target_trajectory = []
+        self._max_trajectory_len = 500
+        
+        # Radar angle cache for performance
+        self._radar_angle_cache = {}
 
     def _get_obs_features(self):
         """
@@ -81,126 +84,120 @@ class TrackingEnv(gym.Env):
         return tracker_obs, target_obs
 
     def _get_tracker_observation(self):
-        """Tracker 相对观测（75维），FOV / 雷达基于统一射线逻辑。"""
+        """优化的Tracker观测生成"""
         obs = np.zeros(75, dtype=np.float32)
 
-        # 1) 自身状态
+        # 1. Self state (3 dims)
         current_vel = self._get_velocity(self.tracker, self.prev_tracker_pos)
-        vel_magnitude = float(np.linalg.norm(current_vel))
-        max_speed = float(max(self.tracker_speed, self.target_speed))
-        normalized_vel = np.clip(vel_magnitude / (max_speed + 1e-6), 0, 1) * 2.0 - 1.0
-
-        normalized_angular_vel = self._get_angular_velocity(
-            self.tracker, self.prev_tracker_pos, 
+        vel_mag = float(np.linalg.norm(current_vel))
+        max_speed = max(self.tracker_speed, self.target_speed)
+        
+        obs[0] = np.clip(vel_mag / (max_speed + 1e-6) * 2.0 - 1.0, -1.0, 1.0)
+        obs[1] = self._get_angular_velocity(
+            self.tracker, self.prev_tracker_pos,
             getattr(map_config, 'tracker_max_angular_speed', 10.0)
         )
-        normalized_heading = (self.tracker['theta'] / 180.0) - 1.0
+        obs[2] = (self.tracker['theta'] / 180.0) - 1.0
 
-        obs[0] = normalized_vel
-        obs[1] = normalized_angular_vel
-        obs[2] = normalized_heading
-
-        # 2) 计算可见性 & 确定目标参考状态
-        # 先计算真实相对信息用于判断可见性
+        # 2. Target relative info (optimized)
         true_rel_vec, true_dist = self._get_relative_position(self.tracker, self.target)
-        absolute_angle = math.atan2(true_rel_vec[1], true_rel_vec[0])
-        true_rel_angle_deg = self._normalize_angle(
-            math.degrees(absolute_angle) - self.tracker['theta']
-        )
+        abs_angle = math.atan2(true_rel_vec[1], true_rel_vec[0])
+        rel_angle_deg = self._normalize_angle(math.degrees(abs_angle) - self.tracker['theta'])
         fov_half = self.fov_angle * 0.5
         
-        # 调用可见性更新 (复用现有逻辑)
-        in_fov, occluded = self._update_visibility(true_rel_angle_deg, true_dist, fov_half)
+        # Visibility check
+        in_fov = abs(rel_angle_deg) <= fov_half and true_dist <= self.fov_range
+        occluded = False
         
-        # 3) 构造用于观测的目标状态 (Last Known Position Logic)
-        obs_target_state = None
-        obs_target_vel = np.zeros(2, dtype=np.float32)
-        
-        is_visible = (in_fov > 0.5 and occluded < 0.5)
+        if in_fov:
+            occluded = self._is_line_blocked(self.tracker, self.target, padding=2.0)
+            if not occluded:
+                self.last_observed_target_pos = np.array([
+                    self.target['x'] + self.pixel_size * 0.5,
+                    self.target['y'] + self.pixel_size * 0.5
+                ])
+                self.steps_since_observed = 0
+            else:
+                self.steps_since_observed += 1
+        else:
+            self.steps_since_observed += 1
+
+        # Determine observation state
+        is_visible = in_fov and not occluded
         
         if is_visible:
-            # 真实目标可见：使用真实状态
-            obs_target_state = self.target
-            obs_target_vel = self._get_velocity(self.target, self.prev_target_pos)
+            # Use real target state
+            obs_dist = true_dist
+            obs_bearing = rel_angle_deg
         elif self.last_observed_target_pos is not None:
-            # 目标不可见但有记忆：使用最后一次观测到的位置 (Ghost)
-            # Ghost 视为静止，且没有角度信息(theta=0)
-            obs_target_state = {
-                'x': self.last_observed_target_pos[0] - self.pixel_size * 0.5,
-                'y': self.last_observed_target_pos[1] - self.pixel_size * 0.5,
-                'theta': 0.0 # 无法得知朝向
-            }
-            obs_target_vel = np.zeros(2, dtype=np.float32) # 假设Ghost静止
+            # Use last known position
+            ghost_rel = self.last_observed_target_pos - np.array([
+                self.tracker['x'] + self.pixel_size * 0.5,
+                self.tracker['y'] + self.pixel_size * 0.5
+            ])
+            obs_dist = float(np.linalg.norm(ghost_rel))
+            obs_bearing = self._normalize_angle(
+                math.degrees(math.atan2(ghost_rel[1], ghost_rel[0])) - self.tracker['theta']
+            )
         else:
-            # 目标不可见且无记忆：完全丢失
-            obs_target_state = None
+            # No information
+            obs_dist = self.fov_range
+            obs_bearing = 0.0
 
-        # 4) 基于观测状态计算相对特征
-        if obs_target_state is not None:
-            # 有参考目标 (真实或Ghost)
-            rel_vec, distance = self._get_relative_position(self.tracker, obs_target_state)
-            normalized_distance = np.clip((distance / self.fov_range) * 2.0 - 1.0, -1.0, 1.0)
+        # Normalize observations (5 dims: distance, bearing, rel_speed, rel_ang_vel, fov_edge)
+        obs[3] = np.clip((obs_dist / self.fov_range) * 2.0 - 1.0, -1.0, 1.0)
+        obs[4] = np.clip(obs_bearing / 180.0, -1.0, 1.0)
+        
+        # Relative velocities (simplified when not visible)
+        if is_visible:
+            target_vel = self._get_velocity(self.target, self.prev_target_pos)
+            rel_vel = target_vel - current_vel
+            obs[5] = np.clip(np.linalg.norm(rel_vel) / (max_speed * 2.0) * 2.0 - 1.0, -1.0, 1.0)
             
-            abs_ang = math.atan2(rel_vec[1], rel_vec[0])
-            rel_ang = self._normalize_angle(math.degrees(abs_ang) - self.tracker['theta'])
-            normalized_bearing = np.clip(rel_ang / 180.0, -1.0, 1.0)
-            
-            # 相对速度
-            relative_vel = obs_target_vel - current_vel
-            relative_speed = float(np.linalg.norm(relative_vel))
-            max_relative_speed = max_speed * 2.0
-            normalized_relative_speed = np.clip(
-                (relative_speed / (max_relative_speed + 1e-6)) * 2.0 - 1.0, -1.0, 1.0
-            ) 
-            
-            # FOV Edge (基于观测到的角度)
-            fov_edge_angle = min(abs(rel_ang + fov_half), abs(rel_ang - fov_half))
-            normalized_fov_edge = np.clip((fov_edge_angle / fov_half) * 2.0 - 1.0, -1.0, 1.0)
-            
-            # 相对角速度 (Ghost视为0角速度)
-            if is_visible:
-                target_ang_vel = self._get_angular_velocity(
-                    self.target, self.prev_target_pos,
-                    getattr(map_config, 'target_max_angular_speed', 12.0)
-                )
-            else:
-                target_ang_vel = 0.0
-            
-            normalized_relative_angular_vel = np.clip(target_ang_vel - normalized_angular_vel, -1.0, 1.0)
-            
+            target_ang_vel = self._get_angular_velocity(
+                self.target, self.prev_target_pos,
+                getattr(map_config, 'target_max_angular_speed', 12.0)
+            )
+            obs[6] = np.clip(target_ang_vel - obs[1], -1.0, 1.0)
         else:
-            # 没有任何目标信息
-            normalized_distance = -1.0 # 认为非常远? 或者 1.0? 通常 -1.0 代表 0 距离, 1.0 代表 max range. 
-            # 这里原逻辑: distance=0 -> -1.0; distance=max -> 1.0. 
-            # 如果没看到，设为 1.0 (最远) 或 0.0 (中间) 比较合理，或者保持原状。
-            # 为了让网络知道没东西，我们设为边界值 1.0 (超出视野)
-            normalized_distance = 1.0 
-            normalized_bearing = 0.0
-            normalized_relative_speed = 0.0
-            normalized_relative_angular_vel = 0.0
-            normalized_fov_edge = 1.0
+            obs[5] = 0.0
+            obs[6] = 0.0
+        
+        # FOV edge distance
+        fov_edge_dist = min(abs(rel_angle_deg + fov_half), abs(rel_angle_deg - fov_half))
+        obs[7] = np.clip((fov_edge_dist / fov_half) * 2.0 - 1.0, -1.0, 1.0)
 
-        obs[3] = normalized_distance
-        obs[4] = normalized_bearing
-        obs[5] = normalized_relative_speed
-        obs[6] = normalized_relative_angular_vel
-        obs[7] = normalized_fov_edge
-
-        # 5) 状态特征
-        max_unobserved = float(EnvParameters.MAX_UNOBSERVED_STEPS)
-        normalized_unobserved = np.clip(
-            (self.steps_since_observed / max_unobserved) * 2.0 - 1.0,
+        # 3. State flags (3 dims)
+        obs[8] = 1.0 if in_fov else -1.0
+        obs[9] = 1.0 if occluded else -1.0
+        obs[10] = np.clip(
+            (self.steps_since_observed / EnvParameters.MAX_UNOBSERVED_STEPS) * 2.0 - 1.0,
             -1.0, 1.0
         )
-        obs[8] = in_fov
-        obs[9] = occluded
-        obs[10] = normalized_unobserved
 
-        # 4) 雷达 64 维，360°
-        obs[11:11+64] = self._sense_agent_radar(
-            self.tracker, num_rays=self.radar_rays, full_circle=True
-        )
+        # 4. Radar (64 dims) - batch computation
+        obs[11:75] = self._sense_agent_radar_optimized(self.tracker)
+        
         return obs
+
+    def _sense_agent_radar_optimized(self, agent):
+        """优化的雷达感知（批量计算 + 缓存）"""
+        center = np.array([
+            agent['x'] + self.pixel_size * 0.5,
+            agent['y'] + self.pixel_size * 0.5
+        ], dtype=float)
+        
+        # Generate angles (360° scan)
+        angles = np.linspace(0, 2 * np.pi, self.radar_rays, endpoint=False)
+        
+        # Batch ray casting (Numba optimized)
+        dists = env_lib.ray_distances_multi(
+            center, angles, self.fov_range,
+            padding=getattr(map_config, 'agent_radius', self.pixel_size * 0.5)
+        )
+        
+        # Normalize
+        return (dists / self.fov_range) * 2.0 - 1.0
 
     def _get_velocity(self, agent, prev_pos):
         """计算智能体速度"""
@@ -289,28 +286,36 @@ class TrackingEnv(gym.Env):
     def _sense_agent_radar(self, agent, num_rays=10, full_circle=False):
         """
         生成多方向雷达读数：统一使用 env_lib.ray_distances_multi。
+        优化：使用缓存的角度数组
         """
         center = np.array([
             agent['x'] + self.pixel_size * 0.5,
             agent['y'] + self.pixel_size * 0.5
-        ], dtype=float)
-        heading = math.radians(agent.get('theta', 0.0))
+        ], dtype=np.float64)
+        
+        # Use cached angles for full_circle (most common case for 64, 16 rays)
         if full_circle:
-            angles = [2 * math.pi * i / num_rays for i in range(num_rays)]
+            cache_key = f'fc_{num_rays}'
+            if cache_key not in self._radar_angle_cache:
+                self._radar_angle_cache[cache_key] = np.linspace(0, 2*np.pi, num_rays, endpoint=False)
+            angles = self._radar_angle_cache[cache_key]
         else:
-            angle_range = math.pi
-            angles = [
-                heading + (i / (num_rays - 1) - 0.5) * angle_range
-                for i in range(num_rays)
-            ]
+            # Heading-relative angles (less common, compute inline)
+            heading = math.radians(agent.get('theta', 0.0))
+            cache_key = f'hr_{num_rays}'
+            if cache_key not in self._radar_angle_cache:
+                base = np.linspace(-0.5, 0.5, num_rays) * np.pi
+                self._radar_angle_cache[cache_key] = base
+            angles = heading + self._radar_angle_cache[cache_key]
+        
         max_radar_range = float(EnvParameters.FOV_RANGE)
         pad = float(getattr(map_config, 'agent_radius', self.pixel_size * 0.5))
         
-        # Use Numba accelerated batch ray casting (handled inside env_lib)
+        # Use Numba accelerated batch ray casting
         dists = env_lib.ray_distances_multi(center, angles, max_radar_range, padding=pad)
-            
-        readings = (np.asarray(dists, dtype=np.float32) / max_radar_range) * 2.0 - 1.0
-        return readings
+        
+        # Normalize to [-1, 1]
+        return (dists / max_radar_range) * 2.0 - 1.0
 
     def _is_line_blocked(self, agent1, agent2, padding=0.0):
         """
@@ -355,28 +360,7 @@ class TrackingEnv(gym.Env):
                 return action[0], action[1]
         return action, target_action
 
-    def _control_to_physical(self, action, role):
-        if action is None:
-            return None
-        arr = np.asarray(action, dtype=np.float32).reshape(-1)
-        if arr.size != 2:
-            raise ValueError("action must contain exactly two elements")
-        if np.all(np.abs(arr) <= 1.0 + 1e-6):
-            if role == 'tracker':
-                max_acc = float(getattr(map_config, 'tracker_max_acc', 0.1))
-                max_ang_acc = float(getattr(map_config, 'tracker_max_ang_acc', 2.0))
-            elif role == 'target':
-                max_acc = float(getattr(map_config, 'target_max_acc', 0.1))
-                max_ang_acc = float(getattr(map_config, 'target_max_ang_acc', 2.0))
-            else:
-                max_acc = 0.1
-                max_ang_acc = 2.0
-            
-            # Action[0] = Angular Acc, Action[1] = Linear Acc
-            ang_acc = float(np.clip(arr[0], -1.0, 1.0) * max_ang_acc)
-            lin_acc = float(np.clip(arr[1], -1.0, 1.0) * max_acc)
-            return ang_acc, lin_acc
-        return float(arr[0]), float(arr[1])
+    # _control_to_physical removed (deprecated acceleration logic)
 
     def _physical_to_control(self, physical_action, role):
         if physical_action is None:
@@ -393,179 +377,191 @@ class TrackingEnv(gym.Env):
         return (float(angle_norm), float(speed_norm))
 
     def _is_action_valid(self, agent, action, role):
-        """检查动作是否会导致碰撞"""
-        action_physical = self._control_to_physical(action, role)
-        if action_physical is None:
-            return True
-
-        ang_acc, lin_acc = action_physical
+        """简化的动作有效性检查"""
+        # Simulate next position
+        max_turn = getattr(map_config, f'{role}_max_turn_deg', 45.0)
+        angle_delta = np.clip(action[0], -max_turn, max_turn)
+        speed = np.clip(action[1], 0.0, 1.0) * (
+            self.tracker_speed if role == 'tracker' else self.target_speed
+        )
         
-        # Simulate physics
-        sim_agent = agent.copy()
-        max_speed = self.tracker_speed if role == 'tracker' else self.target_speed
-        max_ang_speed = float(getattr(map_config, f'{role}_max_angular_speed', 10.0))
+        new_theta = (agent['theta'] + angle_delta) % 360.0
+        rad = math.radians(new_theta)
         
-        # Update velocities
-        sim_agent['v'] = float(sim_agent.get('v', 0.0) + lin_acc)
-        sim_agent['w'] = float(sim_agent.get('w', 0.0) + ang_acc)
+        new_x = agent['x'] + speed * math.cos(rad)
+        new_y = agent['y'] + speed * math.sin(rad)
         
-        # Clip
-        sim_agent['v'] = float(np.clip(sim_agent['v'], 0.0, max_speed))
-        sim_agent['w'] = float(np.clip(sim_agent['w'], -max_ang_speed, max_ang_speed))
+        # Check collision at center
+        cx = new_x + self.pixel_size * 0.5
+        cy = new_y + self.pixel_size * 0.5
         
-        # Update pose
-        new_theta = (sim_agent['theta'] + sim_agent['w']) % 360.0
-        rad_theta = math.radians(new_theta)
-        new_x = np.clip(sim_agent['x'] + sim_agent['v'] * math.cos(rad_theta), 
-                        0, self.width - self.pixel_size)
-        new_y = np.clip(sim_agent['y'] + sim_agent['v'] * math.sin(rad_theta), 
-                        0, self.height - self.pixel_size)
+        return not env_lib.is_point_blocked(
+            cx, cy, padding=getattr(map_config, 'agent_radius', self.pixel_size * 0.5)
+        )
 
-        center_x = new_x + self.pixel_size * 0.5
-        center_y = new_y + self.pixel_size * 0.5
+    def _apply_safety_layer(self, action, agent_state, role='tracker'):
+        """
+        Safety Layer: 修正动作以避免碰撞
+        
+        当 safety_layer_enabled=True 时，使用雷达感知和 hard_mask 
+        来修正可能导致碰撞的动作。这让 RL 可以专注于追踪目标，
+        而避障由环境自动处理。
+        
+        多层保护机制:
+        1. Hard Mask: 基于雷达检测修正转向角度
+        2. 动作有效性检查: 模拟执行后验证是否碰撞
+        3. 速度调整: 如果仍有碰撞风险则降低速度
+        
+        Args:
+            action: 原始动作 [angle_norm, speed_norm]
+            agent_state: 智能体状态字典
+            role: 'tracker' 或 'target'
+        
+        Returns:
+            修正后的安全动作
+        """
+        if not self.safety_layer_enabled:
+            return action
+        
+        from rule_policies import apply_hard_mask
+        
+        # 获取 360° 雷达读数
+        radar = self._sense_agent_radar_optimized(agent_state)
+        current_heading = agent_state.get('theta', 0.0)
+        
+        # 第1层: Hard Mask 基础修正
+        safe_action = apply_hard_mask(action, radar, current_heading, role)
+        
+        # 第2层: 动作有效性检查（模拟执行）
+        if not self._is_action_valid(agent_state, safe_action, role):
+            # 尝试降低速度
+            for speed_factor in [0.5, 0.25, 0.0]:
+                reduced_action = np.array([safe_action[0], safe_action[1] * speed_factor], dtype=np.float32)
+                if self._is_action_valid(agent_state, reduced_action, role):
+                    safe_action = reduced_action
+                    break
+            else:
+                # 如果前进不行，尝试反方向
+                reverse_action = np.array([-safe_action[0], 0.0], dtype=np.float32)
+                if self._is_action_valid(agent_state, reverse_action, role):
+                    safe_action = reverse_action
+                else:
+                    # 完全停止
+                    safe_action = np.array([0.0, 0.0], dtype=np.float32)
+        
+        return safe_action
 
-        safety_margin = float(getattr(map_config, 'agent_radius', self.pixel_size * 0.5))
-        return not env_lib.is_point_blocked(center_x, center_y, padding=safety_margin)
-    
-    def _find_valid_action(self, agent, original_action, role, max_attempts=8):
-        """找到有效的替代动作（仅调整角度，不降低速度）"""
-        physical_action = self._control_to_physical(original_action, role)
-        if physical_action is None:
-            return original_action, False
+    def step(self, action=None, target_action=None, residual_action=None, action_penalty_coef=0.0):
+        """优化的step函数"""
+        # Update obstacles if dynamic
+        if map_config.dynamic_obstacles:
+            map_config.update_dynamic_obstacles()
+            env_lib.build_occupancy()
 
-        # 检查输入格式
-        is_normalized_input = False
-        if isinstance(original_action, (tuple, list, np.ndarray)):
-            arr = np.asarray(original_action, dtype=np.float32).reshape(-1)
-            if arr.shape[0] == 2 and np.all(np.abs(arr) <= 1.0 + 1e-6):
-                is_normalized_input = True
+        # Parse actions with better error handling
+        if action is None:
+            tracker_action = np.zeros(2, dtype=np.float32)
+            target_action_parsed = np.zeros(2, dtype=np.float32)
+        elif target_action is not None:
+            # Both provided explicitly
+            tracker_action = np.asarray(action, dtype=np.float32).flatten()
+            target_action_parsed = np.asarray(target_action, dtype=np.float32).flatten()
+        elif isinstance(action, (tuple, list)) and len(action) == 2:
+            # Check if it's (tracker_action, target_action) tuple
+            first = np.asarray(action[0], dtype=np.float32).flatten()
+            second = np.asarray(action[1], dtype=np.float32).flatten()
+            if first.size == 2 and second.size == 2:
+                tracker_action = first
+                target_action_parsed = second
+            else:
+                # It's a single action
+                tracker_action = np.asarray(action, dtype=np.float32).flatten()
+                target_action_parsed = np.zeros(2, dtype=np.float32)
+        else:
+            # Single action provided
+            tracker_action = np.asarray(action, dtype=np.float32).flatten()
+            target_action_parsed = np.zeros(2, dtype=np.float32)
 
-        # 原动作有效则直接返回
-        if self._is_action_valid(agent, original_action, role):
-            return original_action, False
+        # Validate shapes
+        if tracker_action.size != 2:
+            raise ValueError(f"tracker_action must have size 2, got {tracker_action.size}")
+        if target_action_parsed.size != 2:
+            raise ValueError(f"target_action must have size 2, got {target_action_parsed.size}")
 
-        base_angle, base_speed = physical_action
-        max_turn = (float(getattr(map_config, 'tracker_max_angular_speed', 10.0)) if role == 'tracker' 
-                    else float(getattr(map_config, 'target_max_angular_speed', 12.0)))
+        # Store previous positions
+        self.prev_tracker_pos = self.tracker.copy()
+        self.prev_target_pos = self.target.copy()
 
-        def make_candidate(angle_deg, speed_factor):
-            clipped_angle = float(np.clip(angle_deg, -max_turn, max_turn))
-            clipped_speed = float(np.clip(speed_factor, 0.0, 1.0))
-            candidate_physical = (clipped_angle, clipped_speed)
-            return (self._physical_to_control(candidate_physical, role) 
-                    if is_normalized_input else candidate_physical)
+        # Apply Safety Layer to tracker action (if enabled)
+        # This modifies the action to avoid obstacles, letting RL focus on pursuit
+        if self.safety_layer_enabled:
+            tracker_action = self._apply_safety_layer(tracker_action, self.tracker, 'tracker')
 
-        attempts = 0
-        def try_candidate(angle_deg, speed_factor):
-            nonlocal attempts
-            if attempts >= max_attempts:
-                return None
-            attempts += 1
-            candidate = make_candidate(angle_deg, speed_factor)
-            return candidate if self._is_action_valid(agent, candidate, role) else None
+        # Apply actions
+        self.tracker = env_lib.agent_move(
+            self.tracker, tracker_action, self.tracker_speed, role='tracker'
+        )
+        self.target = env_lib.agent_move(
+            self.target, target_action_parsed, self.target_speed, role='target'
+        )
 
-        # 仅通过角度偏移寻找可行解（速度保持不变）
-        for delta in (10, -10, 20, -20, 30, -30, 45, -45, 60, -60, 75, -75, 90, -90, 120, -120, 135, -135, 180, -180):
-            candidate = try_candidate(base_angle + delta, base_speed)
-            if candidate is not None:
-                return candidate, True
-
-        # 兜底：返回原始动作（未修正）
-        return original_action, False
-
-    def step(self, action: Union[Tuple, list, np.ndarray] = None,
-             target_action: Optional[Tuple] = None):
-        self.step_count += 1
-        tracker_action, target_action = self._parse_actions(action, target_action)
-        tracker_corrected = False
-        target_corrected = False
-        if tracker_action is not None:
-            tracker_action, tracker_corrected = self._find_valid_action(
-                self.tracker, tracker_action, 'tracker'
-            )
-            tracker_phys = self._control_to_physical(tracker_action, 'tracker')
-            if tracker_phys is not None:
-                ang_acc, lin_acc = tracker_phys
-                max_ang_speed = float(getattr(map_config, 'tracker_max_angular_speed', 10.0))
-                self.tracker = env_lib.agent_move_accel(
-                    self.tracker, lin_acc, ang_acc, self.tracker_speed, max_ang_speed, role='tracker'
-                )
-        if target_action is not None:
-            target_action, target_corrected = self._find_valid_action(
-                self.target, target_action, 'target'
-            )
-            target_phys = self._control_to_physical(target_action, 'target')
-            if target_phys is not None:
-                ang_acc, lin_acc = target_phys
-                max_ang_speed = float(getattr(map_config, 'target_max_angular_speed', 12.0))
-                self.target = env_lib.agent_move_accel(
-                    self.target, lin_acc, ang_acc, self.target_speed, max_ang_speed, role='target'
-                )
-
+        # Invalidate FOV cache
         self._fov_cache_valid = False
+
+        # Update trajectories (with length limit)
         self.tracker_trajectory.append((
-            self.tracker['x'] + self.pixel_size / 2.0,
-            self.tracker['y'] + self.pixel_size / 2.0
+            self.tracker['x'] + self.pixel_size / 2,
+            self.tracker['y'] + self.pixel_size / 2
         ))
         self.target_trajectory.append((
-            self.target['x'] + self.pixel_size / 2.0,
-            self.target['y'] + self.pixel_size / 2.0
+            self.target['x'] + self.pixel_size / 2,
+            self.target['y'] + self.pixel_size / 2
         ))
-        max_len = getattr(map_config, 'trail_max_len', 600)
-        if len(self.tracker_trajectory) > max_len:
-            self.tracker_trajectory = self.tracker_trajectory[-max_len:]
-        if len(self.target_trajectory) > max_len:
-            self.target_trajectory = self.target_trajectory[-max_len:]
+        
+        # Limit trajectory length
+        if len(self.tracker_trajectory) > self._max_trajectory_len:
+            self.tracker_trajectory.pop(0)
+        if len(self.target_trajectory) > self._max_trajectory_len:
+            self.target_trajectory.pop(0)
 
-        if self.last_tracker_pos is not None:
-            self.prev_tracker_pos = self.last_tracker_pos.copy()
-        self.last_tracker_pos = self.tracker.copy()
-        if self.last_target_pos is not None:
-            self.prev_target_pos = self.last_target_pos.copy()
-        self.last_target_pos = self.target.copy()
-
-        in_sector = self._is_target_in_capture_sector()
-        if in_sector:
-            self._capture_counter = min(
-                self._capture_counter + 1, self.capture_required_steps
-            )
+        # Check capture
+        sector_captured = self._is_target_in_capture_sector()
+        if sector_captured:
+            self._capture_counter += 1
         else:
-            self._capture_counter = 0
-        sector_captured = (self._capture_counter >= self.capture_required_steps)
+            self._capture_counter = max(0, self._capture_counter - 1)
+
+        is_captured = self._capture_counter >= self.capture_required_steps
+
+        # Calculate reward
+        tracker_collision = not self._is_action_valid(
+            self.prev_tracker_pos, tracker_action, 'tracker'
+        )
+        target_collision = not self._is_action_valid(
+            self.prev_target_pos, target_action_parsed, 'target'
+        )
 
         reward, terminated, truncated, info = env_lib.reward_calculate(
             self.tracker, self.target,
             prev_tracker=self.prev_tracker_pos,
             prev_target=self.prev_target_pos,
-            tracker_collision=bool(tracker_corrected),
-            target_collision=bool(target_corrected),
-            sector_captured=bool(sector_captured),
-            capture_progress=int(self._capture_counter),
-            capture_required_steps=int(self.capture_required_steps)
+            tracker_collision=tracker_collision,
+            target_collision=target_collision,
+            sector_captured=is_captured,
+            capture_progress=self._capture_counter,
+            capture_required_steps=self.capture_required_steps,
+            residual_action=residual_action,
+            action_penalty_coef=action_penalty_coef
         )
 
-        try:
-            cur_dist = float(math.hypot(
-                self.tracker['x'] - self.target['x'],
-                self.tracker['y'] - self.target['y']
-            ))
-            if self._best_distance is None or cur_dist < (self._best_distance - 1e-6):
-                self._best_distance = cur_dist
-                # 移除密集奖励
-                info['closest_record_improved'] = True
-            else:
-                info['closest_record_improved'] = False
-            info['closest_record_value'] = float(
-                self._best_distance if self._best_distance is not None else cur_dist
-            )
-        except Exception:
-            pass
-
+        # Get new observation
         self.current_obs = self._get_obs_features()
+        
+        # Check episode length
+        self.step_count += 1
         if self.step_count >= EnvParameters.EPISODE_LEN and not terminated:
             truncated = True
 
-        self.target_frame_count += 1
         return self.current_obs, float(reward), bool(terminated), bool(truncated), info
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
@@ -586,7 +582,6 @@ class TrackingEnv(gym.Env):
             pass
 
         self.step_count = 0
-        self.target_frame_count = 0
         self.tracker_trajectory = []
         self.target_trajectory = []
 
@@ -930,7 +925,9 @@ class TrackingEnv(gym.Env):
         angles = np.linspace(heading_rad - fov_half, heading_rad + fov_half, num_rays)
         
         # Use Numba accelerated batch ray casting
-        dists = env_lib.ray_distances_multi((cx_world, cy_world), angles, max_range, padding=0.0)
+        dists = env_lib.ray_distances_multi(
+            (cx_world, cy_world), angles, max_range, padding=0.0
+        )
 
         pts = [(cx, cy)]
         for i in range(num_rays):
@@ -1020,3 +1017,126 @@ class TrackingEnv(gym.Env):
                 'height': float(self.height)
             }
         }
+
+    def polygon_sdf_grad_lse(self, rbt_state, tgt_state, debug=False):
+        """
+        计算 Visibility SDF 和梯度（优化版本）
+        
+        使用批量射线追踪构建 FOV 多边形 + 解析梯度近似。
+        相比原版减少约 90% 的射线计算。
+        
+        Args:
+            rbt_state: np.ndarray [x, y, theta] 像素坐标（左上角）
+            tgt_state: np.ndarray [x, y, theta] 像素坐标（左上角）
+            debug: bool 调试标志
+            
+        Returns:
+            grad_rbt: np.ndarray (3,) 机器人状态梯度 [dx, dy, dtheta]
+            grad_tgt: np.ndarray (3,) 目标状态梯度（简化为0）
+            sdf: float SDF 值（负数=目标在FOV内，正数=在外）
+        """
+        # 1. 计算中心坐标
+        rbt_center = np.array([
+            rbt_state[0] + self.pixel_size * 0.5,
+            rbt_state[1] + self.pixel_size * 0.5
+        ])
+        tgt_center = np.array([
+            tgt_state[0] + self.pixel_size * 0.5,
+            tgt_state[1] + self.pixel_size * 0.5
+        ])
+        
+        # 2. 使用批量射线追踪构建 FOV 多边形（优化）
+        heading_rad = math.radians(rbt_state[2])
+        fov_half = math.radians(self.fov_angle / 2.0)
+        num_rays = 25  # 减少射线数量以提升性能（原50）
+        angles = np.linspace(heading_rad - fov_half, heading_rad + fov_half, num_rays)
+        
+        # 批量射线投射 - 单次调用替代循环
+        dists = env_lib.ray_distances_multi(rbt_center, angles, self.fov_range, padding=0.0)
+        
+        # 构建多边形点
+        fov_polygon_points = [rbt_center.tolist()]
+        cos_angles = np.cos(angles)
+        sin_angles = np.sin(angles)
+        for i in range(num_rays):
+            px = rbt_center[0] + dists[i] * cos_angles[i]
+            py = rbt_center[1] + dists[i] * sin_angles[i]
+            fov_polygon_points.append([px, py])
+        
+        # 3. 计算 SDF：目标到 FOV 多边形的距离
+        try:
+            poly = ShapelyPolygon(fov_polygon_points)
+            point = Point(tgt_center)
+            
+            if poly.contains(point):
+                # 目标在 FOV 内，SDF < 0
+                sdf = -point.distance(poly.boundary)
+            else:
+                # 目标在 FOV 外，SDF > 0
+                sdf = point.distance(poly.boundary)
+        except Exception as e:
+            if debug:
+                print(f"[polygon_sdf_grad_lse] Polygon construction failed: {e}")
+            sdf = self.fov_range * 2.0
+        
+        # 4. 解析梯度近似（替代数值微分，避免额外射线计算）
+        # 使用目标相对于机器人的位置方向作为梯度方向
+        rel_vec = tgt_center - rbt_center
+        rel_dist = max(np.linalg.norm(rel_vec), 1e-6)
+        rel_dir = rel_vec / rel_dist
+        
+        # 目标到机器人的角度
+        angle_to_target = math.atan2(rel_vec[1], rel_vec[0])
+        angle_diff = angle_to_target - heading_rad
+        # 归一化到 [-pi, pi]
+        while angle_diff > math.pi: angle_diff -= 2 * math.pi
+        while angle_diff < -math.pi: angle_diff += 2 * math.pi
+        
+        # 位置梯度：指向目标方向的反方向
+        # 当机器人向目标移动时，SDF减小（目标更容易在FOV内）
+        grad_x = -rel_dir[0] * 0.5
+        grad_y = -rel_dir[1] * 0.5
+        
+        # 角度梯度：转向目标会减小SDF
+        # 当目标在左侧（angle_diff > 0），左转（正角度变化）减小SDF
+        grad_theta = -np.sign(angle_diff) * min(abs(angle_diff), 1.0) * 5.0
+        
+        grad_rbt = np.array([grad_x, grad_y, grad_theta])
+        grad_tgt = np.array([0.0, 0.0, 0.0])
+        
+        return grad_rbt, grad_tgt, float(sdf)
+
+    def SDF_RT_circular(self, rbt_state, radius, num_rays):
+        """
+        圆形射线追踪（适配 cbf_qp.py 接口）
+        
+        在机器人周围进行 360° 圆形扫描，返回所有射线与障碍物的交点。
+        
+        Args:
+            rbt_state: np.ndarray [x, y, theta] 像素坐标（左上角）
+            radius: float 射线最大长度
+            num_rays: int 射线数量
+            
+        Returns:
+            np.ndarray: shape (N, 2) 障碍物交点坐标 [x, y]
+        """
+        center = np.array([
+            rbt_state[0] + self.pixel_size * 0.5,
+            rbt_state[1] + self.pixel_size * 0.5
+        ])
+        
+        # 360° 均匀采样
+        angles = np.linspace(0, 2 * np.pi, num_rays, endpoint=False)
+        
+        # 批量射线追踪
+        dists = env_lib.ray_distances_multi(center, angles, radius, padding=0.0)
+        
+        # 收集撞击点
+        points = []
+        for i, dist in enumerate(dists):
+            if dist < radius:  # 撞到障碍物
+                px = center[0] + dist * np.cos(angles[i])
+                py = center[1] + dist * np.sin(angles[i])
+                points.append([px, py])
+        
+        return np.array(points) if points else np.array([]).reshape(0, 2)

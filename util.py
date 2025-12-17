@@ -17,7 +17,7 @@ try:
 except Exception:
     wandb = None
 
-from lstm.alg_parameters import *  # 使用通用参数
+from mlp.alg_parameters_mlp import *  # 使用通用参数
 from map_config import EnvParameters
 
 
@@ -174,18 +174,9 @@ def update_perf(one_ep, perf):
 
 
 def build_critic_observation(actor_obs, opponent_strategy=None, policy_manager=None):
-    """构建critic观测：actor_obs + opponent_id context"""
-    from lstm.alg_parameters import NetParameters  # 确保导入
-    
-    actor_vec = np.asarray(actor_obs, dtype=np.float32).reshape(-1)
-    
-    # 不再强制填充，使用实际观测长度
-    # Tracker: 27维, Target: 24维
-    
-    context = np.zeros(NetParameters.CONTEXT_LEN, dtype=np.float32)
-    if opponent_strategy is not None and policy_manager is not None:
-        policy_id = policy_manager.get_policy_id(opponent_strategy)
-        if policy_id is not None and policy_id >= 0:
-            context = get_opponent_id_one_hot(policy_id)
-
-    return np.concatenate([actor_vec, context], axis=0)
+    """Legacy function. Use mlp.evaluate_mlp.build_critic_observation instead."""
+    from mlp.alg_parameters_mlp import NetParameters
+    # Just return actor_obs or similar dummy if really needed, but raising explicit error is safer to find usage.
+    # But since I want to avoid breaking if it IS called but result ignored...
+    # Let's just return actor_obs as flattened
+    return np.asarray(actor_obs, dtype=np.float32).reshape(-1)

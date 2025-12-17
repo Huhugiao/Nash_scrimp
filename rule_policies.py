@@ -5,21 +5,16 @@ This module provides baseline policies that can be used for evaluation and testi
 import math
 import numpy as np
 import map_config
-from env_lib import apply_hard_mask
+import env_lib
 from map_config import EnvParameters
 
-# Optional CBFTracker (requires cvxpy)
-try:
-    from cbf_controller import CBFTracker
-    CBF_AVAILABLE = True
-except ImportError:
-    CBFTracker = None
-    CBF_AVAILABLE = False
-    print("Warning: CBFTracker not available (cvxpy missing?)")
+# ============================================================================
+# Local Helper Functions (Policy Control Logic)
+# ============================================================================
 
-# ============================================================================
-# Utility Functions
-# ============================================================================
+HARD_MASK_SAFETY_MULTIPLIER = 3.5
+HARD_MASK_CHECK_WINDOW = 2
+HARD_MASK_EMERGENCY_BRAKE = True
 
 def _normalize_angle(angle_deg: float):
     """Normalize angle to [-180, 180] range."""
@@ -28,78 +23,268 @@ def _normalize_angle(angle_deg: float):
         angle_deg -= 360.0
     return float(angle_deg)
 
+def apply_hard_mask(action, radar, current_heading_deg, role='tracker', safety_dist=None):
+    """
+    Hard Mask Function: Force collision avoidance based on radar.
+    Moved from env_lib.py to rule_policies.py as it is control logic.
+    """
+    if safety_dist is None:
+        safety_dist = float(getattr(map_config, 'agent_radius', 8.0)) * HARD_MASK_SAFETY_MULTIPLIER
+
+    # Ensure action is array-like and extract angle_norm and speed_norm
+    action_arr = np.asarray(action, dtype=np.float32).flatten()
+    if action_arr.size != 2:
+        # If action is wrong shape, return as-is (defensive)
+        return action
+    
+    angle_norm = float(action_arr[0])
+    speed_norm = float(action_arr[1])
+
+    # Max turn capabilities
+    if role == 'tracker':
+        max_turn = float(getattr(map_config, 'tracker_max_angular_speed', 10.0))
+    else:
+        max_turn = float(getattr(map_config, 'target_max_angular_speed', 12.0))
+        
+    angle_delta = angle_norm * max_turn
+    target_heading = _normalize_angle(current_heading_deg + angle_delta)
+    
+    # Convert radar to numpy array
+    radar_arr = np.asarray(radar, dtype=np.float32).flatten()
+    if len(radar_arr) == 0:
+        return np.array([angle_norm, speed_norm], dtype=np.float32)
+
+    num_rays = len(radar_arr)
+    angle_step = 360.0 / num_rays
+    
+    # Calculate target heading index
+    th_360 = target_heading % 360.0
+    center_idx = int(round(th_360 / angle_step)) % num_rays
+    
+    max_range = float(getattr(map_config, 'FOV_RANGE', 250.0))
+    dists = (radar_arr + 1.0) * 0.5 * max_range
+    
+    # Check safety
+    is_safe = True
+    for i in range(-HARD_MASK_CHECK_WINDOW, HARD_MASK_CHECK_WINDOW + 1):
+        idx = (center_idx + i) % num_rays
+        if dists[idx] <= safety_dist:
+            is_safe = False
+            break
+            
+    if is_safe:
+        return np.array([angle_norm, speed_norm], dtype=np.float32)
+        
+    # Search for safe direction
+    safe_indices = []
+    for i in range(num_rays):
+        window_safe = True
+        for w in range(-HARD_MASK_CHECK_WINDOW, HARD_MASK_CHECK_WINDOW + 1):
+            if dists[(i + w) % num_rays] <= safety_dist:
+                window_safe = False
+                break
+        if window_safe:
+            safe_indices.append(i)
+    
+    if not safe_indices:
+        if HARD_MASK_EMERGENCY_BRAKE:
+            # Find furthest direction (emergency escape)
+            best_idx = -1
+            max_avg_dist = -1.0
+            for i in range(num_rays):
+                avg_dist = 0
+                for w in range(-HARD_MASK_CHECK_WINDOW, HARD_MASK_CHECK_WINDOW + 1):
+                    avg_dist += dists[(i + w) % num_rays]
+                if avg_dist > max_avg_dist:
+                    max_avg_dist = avg_dist
+                    best_idx = i
+            
+            if best_idx != -1:
+                best_ray_angle = best_idx * angle_step
+                needed_turn = _normalize_angle(best_ray_angle - current_heading_deg)
+                clamped_turn = np.clip(needed_turn, -max_turn, max_turn)
+                new_angle_norm = clamped_turn / (max_turn + 1e-6)
+                return np.array([new_angle_norm, -1.0], dtype=np.float32)
+        return np.array([angle_norm, -1.0], dtype=np.float32)
+
+    # Find closest safe angle to desired
+    best_idx = -1
+    min_diff = 1000.0
+    
+    for idx in safe_indices:
+        ray_angle = idx * angle_step
+        diff = abs(_normalize_angle(ray_angle - target_heading))
+        if diff < min_diff:
+            min_diff = diff
+            best_idx = idx
+            
+    best_ray_angle = best_idx * angle_step
+    needed_turn = _normalize_angle(best_ray_angle - current_heading_deg)
+    clamped_turn = np.clip(needed_turn, -max_turn, max_turn)
+    new_angle_norm = clamped_turn / (max_turn + 1e-6)
+    
+    new_speed_norm = speed_norm
+    return np.array([new_angle_norm, new_speed_norm], dtype=np.float32)
+
+
+# ============================================================================
+# Tracker Policies
+# ============================================================================
+
+from cbf_controller import CBFTracker
+
+TRACKER_POLICY_REGISTRY = {
+    "CBF": CBFTracker,
+}
+
+
+# --- A* Pathfinding (Optimized) ---
+# Cache for path results (cleared on map change)
+_PATH_CACHE = {}
+_PATH_CACHE_MAX_SIZE = 100
+
+def _get_path_cache_key(start_pos, goal_pos, padding):
+    """Generate cache key for paths (quantized to grid cells)"""
+    if not env_lib._occ_available():
+        return None
+    cell = env_lib._OCC_CELL
+    return (
+        int(start_pos[0] / cell), int(start_pos[1] / cell),
+        int(goal_pos[0] / cell), int(goal_pos[1] / cell),
+        int(padding / cell)
+    )
+
+def clear_path_cache():
+    """Clear path cache (call when obstacles change)"""
+    global _PATH_CACHE
+    _PATH_CACHE.clear()
+
+def heuristic(a, b):
+    # Use Chebyshev distance for 8-direction movement
+    dx = abs(b[0] - a[0])
+    dy = abs(b[1] - a[1])
+    return max(dx, dy) + 0.414 * min(dx, dy)  # Octile distance
+
+def find_path(start_pos, goal_pos, padding=0.0):
+    """
+    Optimized A* Pathfinding with caching, 8-direction movement, and early termination.
+    """
+    if not env_lib._occ_available():
+        return [goal_pos]
+    
+    # Check cache
+    cache_key = _get_path_cache_key(start_pos, goal_pos, padding)
+    if cache_key and cache_key in _PATH_CACHE:
+        return _PATH_CACHE[cache_key]
+
+    # Use env_lib utilities
+    sx, sy, _, _ = env_lib._world_to_cell(start_pos[0], start_pos[1], env_lib._OCC_CELL)
+    gx, gy, _, _ = env_lib._world_to_cell(goal_pos[0], goal_pos[1], env_lib._OCC_CELL)
+    
+    start_node = (sx, sy)
+    goal_node = (gx, gy)
+    
+    grid_nx, grid_ny = env_lib._OCC_GRID.shape[1], env_lib._OCC_GRID.shape[0]
+    
+    if not env_lib._clip_idx(sx, sy, grid_nx, grid_ny):
+        return [goal_pos]
+
+    import heapq
+    
+    frontier = []
+    heapq.heappush(frontier, (0, start_node))
+    came_from = {start_node: None}
+    cost_so_far = {start_node: 0}
+    
+    pad_cells = int(math.ceil(float(padding) / float(env_lib._OCC_CELL)))
+    
+    found = False
+    current = start_node
+    
+    # Balanced max nodes (was 5000, now 1000)
+    MAX_NODES = 1000
+    
+    # 8-direction movements with proper costs
+    DIRECTIONS = [
+        (-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),  # Cardinal
+        (-1, -1, 1.414), (-1, 1, 1.414), (1, -1, 1.414), (1, 1, 1.414)  # Diagonal
+    ]
+    
+    while frontier and len(cost_so_far) < MAX_NODES:
+        _, current = heapq.heappop(frontier)
+        
+        if current == goal_node:
+            found = True
+            break
+        
+        x, y = current
+        for dx, dy, move_cost in DIRECTIONS:
+            nx_ = x + dx
+            ny_ = y + dy
+            next_node = (nx_, ny_)
+            
+            if not (0 <= nx_ < grid_nx and 0 <= ny_ < grid_ny):
+                continue
+            
+            if env_lib._occ_any_with_pad(nx_, ny_, pad_cells):
+                continue
+            
+            new_cost = cost_so_far[current] + move_cost
+            if next_node not in cost_so_far or new_cost < cost_so_far[next_node]:
+                cost_so_far[next_node] = new_cost
+                priority = new_cost + heuristic(next_node, goal_node)
+                heapq.heappush(frontier, (priority, next_node))
+                came_from[next_node] = current
+    
+    # Reconstruct path
+    if not found and current == start_node:
+        result = [goal_pos]
+    else:
+        path = []
+        curr = goal_node if found else current
+        while curr is not None and curr != start_node:
+            cx = (curr[0] + 0.5) * env_lib._OCC_CELL
+            cy = (curr[1] + 0.5) * env_lib._OCC_CELL
+            path.append((cx, cy))
+            curr = came_from.get(curr)
+        
+        path.reverse()
+        
+        # Simplify path (skip every 3rd point)
+        if len(path) > 3:
+            result = path[::3]
+            if result[-1] != path[-1]:
+                result.append(path[-1])
+        else:
+            result = path if path else [goal_pos]
+    
+    # Cache result
+    if cache_key and len(_PATH_CACHE) < _PATH_CACHE_MAX_SIZE:
+        _PATH_CACHE[cache_key] = result
+    
+    return result
+
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+# _normalize_angle is already defined at top of file (line 19)
+
 def apply_hard_mask_adapter(action, obs_dict, role='tracker', safety_dist=None):
     """
-    Adapter for apply_hard_mask to work with obs_dict.
+    Adapter for apply_hard_mask to work with obs_dict. Adds speed-based inflation to keep clearance.
     """
     radar = obs_dict.get('radar', [])
     heading = obs_dict.get('self_heading_deg', 0.0)
-    heading = obs_dict.get('self_heading_deg', 0.0)
+    if safety_dist is None:
+        base = float(getattr(map_config, 'agent_radius', 8.0)) * HARD_MASK_SAFETY_MULTIPLIER
+        speed_norm = float(obs_dict.get('self_vel', 0.0))
+        speed_frac = (speed_norm + 1.0) * 0.5
+        safety_dist = base * (1.0 + 0.5 * speed_frac)
     return apply_hard_mask(action, radar, heading, role, safety_dist)
 
-def velocity_to_acceleration(desired_angle_deg, desired_speed_factor, obs_dict, role='target'):
-    """
-    Convert desired velocity (angle, speed_factor) to acceleration command.
-    """
-    # Get limits
-    if role == 'tracker':
-        max_acc = float(getattr(map_config, 'tracker_max_acc', 0.1))
-        max_ang_acc = float(getattr(map_config, 'tracker_max_ang_acc', 2.0))
-        max_speed = float(getattr(map_config, 'tracker_speed', 2.4))
-        max_ang_speed = float(getattr(map_config, 'tracker_max_angular_speed', 10.0))
-    else:
-        max_acc = float(getattr(map_config, 'target_max_acc', 0.1))
-        max_ang_acc = float(getattr(map_config, 'target_max_ang_acc', 2.0))
-        max_speed = float(getattr(map_config, 'target_speed', 2.0))
-        max_ang_speed = float(getattr(map_config, 'target_max_angular_speed', 12.0))
-    
-    current_vel_norm = obs_dict.get('self_vel', 0.0)
-    current_vel = (current_vel_norm + 1.0) / 2.0 * max_speed
-    
-    # For angular velocity, if missing, assume 0.
-    # Tracker has it.
-    current_ang_vel_norm = obs_dict.get('self_angular_vel', 0.0)
-    current_w = current_ang_vel_norm * max_ang_speed
-    
-    # Desired velocity
-    desired_v = desired_speed_factor * max_speed
-    
-    # Desired angular velocity (PD controller)
-    current_heading = obs_dict.get('self_heading_deg', 0.0)
-    angle_diff = _normalize_angle(desired_angle_deg - current_heading)
-    
-    # Tuned Gains
-    Kp_heading = 4.0  # Increased from 0.5 to 4.0 for faster turning
-    Kd_heading = 0.5  # Damping to prevent oscillation
-    
-    # Feedforward term (if we knew target angular velocity, but we don't here)
-    desired_w = Kp_heading * angle_diff
-    
-    # Damping
-    if current_w != 0.0:
-        desired_w -= Kd_heading * current_w
-        
-    desired_w = np.clip(desired_w, -max_ang_speed, max_ang_speed)
-    
-    # Calculate acceleration
-    # Linear P-controller
-    Kp_v = 2.0
-    lin_acc = Kp_v * (desired_v - current_vel)
-    
-    # Angular P-controller (since we output angular acceleration)
-    # ang_acc = Kp_w * (desired_w - current_w)
-    Kp_w = 2.0
-    ang_acc = Kp_w * (desired_w - current_w)
-    
-    # Clamp
-    lin_acc = np.clip(lin_acc, -max_acc, max_acc)
-    ang_acc = np.clip(ang_acc, -max_ang_acc, max_ang_acc)
-    
-    # Normalize
-    lin_acc_norm = lin_acc / max_acc
-    ang_acc_norm = ang_acc / max_ang_acc
-    
-    return np.array([ang_acc_norm, lin_acc_norm], dtype=np.float32)
+# velocity_to_acceleration removed (switched to velocity control)
 
 
 # ============================================================================
@@ -228,8 +413,7 @@ class CoverSeekerTarget:
                     continue
                     
                 # Check collision (stricter check for cover point utility)
-                # We use a slightly larger padding to ensure we can actually stand there
-                import env_lib # Import env_lib here to avoid circular dependency if it imports policies
+                # env_lib is imported at top of file
                 if env_lib.is_point_blocked(point[0], point[1], padding=self.agent_radius):
                     continue
                     
@@ -244,8 +428,7 @@ class CoverSeekerTarget:
         if dist < 1e-3: return True
         
         angle = math.atan2(rel[1], rel[0])
-        # Check ray from tracker
-        import env_lib # Import env_lib here to avoid circular dependency if it imports policies
+        # Check ray from tracker (env_lib is imported at top of file)
         ray_dist = env_lib.ray_distance_grid(
             (tracker_pos[0], tracker_pos[1]), 
             angle, 
@@ -255,61 +438,65 @@ class CoverSeekerTarget:
         return ray_dist >= (dist - 5.0) # Tolerance
 
     def _select_best_cover(self, self_pos, tracker_pos, self_vel):
-        """Select cover point that places obstacle between self and tracker"""
-        best_score = -float('inf')
-        best_cover = None
-        best_obs_center = None
-        best_obs_radius = 0.0
+        """Select cover point that places obstacle between self and tracker (vectorized)"""
+        if not self.cover_points:
+            return None, None, 0.0
         
-        # Current heading vector logic could be added, using velocity for now
-        if np.linalg.norm(self_vel) > 0.1:
-            heading_vec = self_vel / np.linalg.norm(self_vel)
+        n = len(self.cover_points)
+        
+        # Pre-allocate arrays
+        cover_pts = np.array([cp[0] for cp in self.cover_points])  # (n, 2)
+        obs_centers = np.array([cp[1] for cp in self.cover_points])  # (n, 2)
+        obs_radii = np.array([cp[2] for cp in self.cover_points])  # (n,)
+        
+        # Vectorized distance calculations
+        vec_to_tracker = tracker_pos - cover_pts  # (n, 2)
+        vec_to_obs = obs_centers - cover_pts  # (n, 2)
+        vec_to_cover = cover_pts - self_pos  # (n, 2)
+        vec_from_tracker = cover_pts - tracker_pos  # (n, 2)
+        
+        # Use np.einsum for fast norm-squared computation (avoid sqrt when possible)
+        dist_tracker_sq = np.einsum('ij,ij->i', vec_to_tracker, vec_to_tracker)  # (n,)
+        dist_tracker = np.sqrt(dist_tracker_sq + 1e-6)
+        
+        dist_obs = np.sqrt(np.einsum('ij,ij->i', vec_to_obs, vec_to_obs) + 1e-6)
+        dist_to_cover = np.sqrt(np.einsum('ij,ij->i', vec_to_cover, vec_to_cover) + 1e-6)
+        dist_from_tracker = np.sqrt(np.einsum('ij,ij->i', vec_from_tracker, vec_from_tracker) + 1e-6)
+        
+        # Normalized vectors
+        vec_to_tracker_norm = vec_to_tracker / dist_tracker[:, np.newaxis]
+        vec_to_obs_norm = vec_to_obs / dist_obs[:, np.newaxis]
+        
+        # Occlusion score (dot product)
+        occlusion = np.einsum('ij,ij->i', vec_to_tracker_norm, vec_to_obs_norm)
+        
+        # Alignment score
+        vel_norm = np.linalg.norm(self_vel)
+        if vel_norm > 0.1:
+            heading_vec = self_vel / vel_norm
+            vec_to_cover_norm = vec_to_cover / dist_to_cover[:, np.newaxis]
+            alignment = np.dot(vec_to_cover_norm, heading_vec)
         else:
-            heading_vec = np.array([0., 0.])
-
-        for cover_pt, obs_center, obs_radius in self.cover_points:
-            # Vectors
-            vec_to_tracker = tracker_pos - cover_pt
-            vec_to_obs = obs_center - cover_pt
-            
-            dist_tracker = np.linalg.norm(vec_to_tracker)
-            if dist_tracker < 1e-3: continue
-            
-            dist_obs = np.linalg.norm(vec_to_obs)
-            
-            # Occlusion Score (Dot Product)
-            # 1.0 = Obstacle directly between Cover and Tracker
-            # -1.0 = Tracker between Cover and Obstacle
-            occlusion = np.dot(vec_to_tracker / dist_tracker, vec_to_obs / (dist_obs + 1e-6))
-            
-            dist_from_tracker = np.linalg.norm(cover_pt - tracker_pos)
-            dist_to_cover = np.linalg.norm(cover_pt - self_pos)
-            
-            # Alignment Score: Do we need to turn much?
-            vec_to_cover = cover_pt - self_pos
-            dist_cover_move = np.linalg.norm(vec_to_cover)
-            alignment = 0.0
-            if dist_cover_move > 1.0 and np.linalg.norm(heading_vec) > 0.1:
-                alignment = np.dot(heading_vec, vec_to_cover / dist_cover_move)
-
-            # Heuristic Scoring
-            # Prioritize: High occlusion, Far from tracker (safe), Close to self (reachable)
-            score = (occlusion * 3.0) + \
-                    (dist_from_tracker * 0.01) - \
-                    (dist_to_cover * 0.02) + \
-                    (alignment * 0.5)
-            
-            # Penalty if cover point is too close to tracker (unsafe)
-            if dist_from_tracker < 100.0:
-                score -= 10.0
-
-            if score > best_score:
-                best_score = score
-                best_cover = cover_pt
-                best_obs_center = obs_center
-                best_obs_radius = obs_radius
-
-        return best_cover, best_obs_center, best_obs_radius
+            alignment = np.zeros(n)
+        
+        # Heuristic scoring (vectorized)
+        scores = (occlusion * 3.0) + \
+                 (dist_from_tracker * 0.01) - \
+                 (dist_to_cover * 0.02) + \
+                 (alignment * 0.5)
+        
+        # Penalty for too-close points
+        scores = np.where(dist_from_tracker < 100.0, scores - 10.0, scores)
+        
+        # Filter invalid (too close to tracker)
+        valid_mask = dist_tracker_sq > 1e-6
+        scores = np.where(valid_mask, scores, -np.inf)
+        
+        best_idx = np.argmax(scores)
+        if scores[best_idx] == -np.inf:
+            return None, None, 0.0
+        
+        return cover_pts[best_idx], obs_centers[best_idx], obs_radii[best_idx]
 
     def _get_orbit_point(self, self_pos, tracker_pos, obs_center, obs_radius):
         """Calculate a point tangent to the obstacle to maintain cover."""
@@ -439,8 +626,15 @@ class CoverSeekerTarget:
                     is_blocked = True
             
             if is_blocked:
-                # Tangent navigation
-                target_pos = self._get_tangent_navigation_point(self_pos, target_pos, best_obs_center, best_obs_radius)
+                # A* Pathfinding Navigation
+                # Tangent navigation was too simple. Use A* to find path around obstacle.
+                path = find_path(self_pos, target_pos, padding=self.agent_radius * 1.5)
+                if len(path) > 1:
+                    # Target the next waypoint in the path
+                    target_pos = np.array(path[1]) 
+                else:
+                    # If path failed or reached, just go to target
+                    target_pos = np.array(path[0])
 
             dist_to_target = np.linalg.norm(target_pos - self_pos)
             
@@ -482,9 +676,9 @@ class CoverSeekerTarget:
         safe_action = apply_hard_mask_adapter(raw_action, parsed, role="target")
         
         safe_angle_deg = safe_action[0] * max_turn
-        final_heading = heading_deg + safe_angle_deg
         
-        return velocity_to_acceleration(final_heading, safe_action[1], parsed, role="target")
+        # Output direct velocity command: [delta_deg, speed_fraction]
+        return np.array([safe_angle_deg, safe_action[1]], dtype=np.float32)
 
 class ZigZagTarget:
     """
@@ -599,8 +793,9 @@ class ZigZagTarget:
         safe_action = apply_hard_mask_adapter(action, parsed, role='target')
         
         safe_angle_deg = safe_action[0] * target_max_turn
-        final_heading = cur_heading + safe_angle_deg
-        return velocity_to_acceleration(final_heading, safe_action[1], parsed, role='target')
+
+        # Output direct velocity command: [delta_deg, speed_fraction]
+        return np.array([safe_angle_deg, safe_action[1]], dtype=np.float32)
 
 class OrbiterTarget:
     """
@@ -696,6 +891,7 @@ class OrbiterTarget:
         angle_norm = np.clip(angle_diff / max_turn, -1.0, 1.0)
 
         action = np.array([angle_norm, speed_norm], dtype=np.float32)
+        action = np.array([angle_norm, speed_norm], dtype=np.float32)
         safe_action = apply_hard_mask_adapter(action, parsed, role='target')
 
         blocked = abs(safe_action[0] - angle_norm) > 0.55
@@ -709,8 +905,9 @@ class OrbiterTarget:
             self.direction_cooldown = self.min_dir_hold
 
         safe_angle_deg = safe_action[0] * max_turn
-        final_heading = cur_heading + safe_angle_deg
-        return velocity_to_acceleration(final_heading, safe_action[1], parsed, role='target')
+        
+        # Output direct velocity command: [delta_deg, speed_fraction]
+        return np.array([safe_angle_deg, safe_action[1]], dtype=np.float32)
 
 class GreedyTarget:
     """
@@ -755,138 +952,18 @@ class GreedyTarget:
         action = np.array([angle_norm, speed_norm], dtype=np.float32)
         
         # 3. Apply Hard Mask
-        # We need to adapt the action using the same helper we assumed earlier or use cbf_controller directly if imported.
-        # apply_hard_mask_adapter is defined above.
-        
-        # Note: apply_hard_mask expects 'role' argument to check specific radii/speeds if needed in cbf_controller.
         safe_action = apply_hard_mask_adapter(action, parsed, role='target')
         
         # 4. Convert control to acceleration (Environment expects acceleration often? Or control?)
-        # Tracker policies return control (angle, speed).
-        # But `velocity_to_acceleration` was used by previous policies.
-        # Let's check `target_runner.py` or default env usage.
-        # Usually rule policies return 'action' which matches env action space.
-        # Env action space is acceleration if configured? Or velocity?
-        # `env.py` has `_control_to_physical` which handles acceleration conversion if needed.
-        # BUT `velocity_to_acceleration` helper suggests we want to output ACCELERATION commands.
-        # If the environment expects acceleration (which it does via _control_to_physical -> agent_move_accel),
-        # then we must convert our desired velocity (heading/speed) to acceleration.
         
         # Recover safe desired attributes from safe_action
         safe_angle_norm = safe_action[0]
         safe_speed_norm = safe_action[1]
         
         safe_angle_deg = safe_angle_norm * max_turn
-        safe_desired_heading = cur_heading + safe_angle_deg
         
-        return velocity_to_acceleration(safe_desired_heading, safe_speed_norm, parsed, role='target')
-
-class PurePursuitTracker:
-    """
-    Pure Pursuit Tracker Policy with Hard Mask.
-    - Pursues the target by turning towards it.
-    - Uses hard mask (ray-casting check) to avoid immediate collisions.
-    """
-    def __init__(self):
-        self.kp_heading = 4.0
-        self.max_speed = float(getattr(map_config, 'tracker_speed', 2.4))
-        self.max_turn_deg = float(getattr(map_config, "tracker_max_angular_speed", 10.0))
-        
-        # Acceleration limits
-        self.max_acc = float(getattr(map_config, 'tracker_max_acc', 0.1))
-        self.max_ang_acc = float(getattr(map_config, 'tracker_max_ang_acc', 2.0))
-
-    def reset(self):
-        pass
-
-    def get_action(self, observation, privileged_state=None):
-        """
-        Get action for tracker.
-        obs is assumed to be the tracker observation vector.
-        """
-        obs = np.asarray(observation, dtype=np.float32)
-        
-        # --- 1. Parse Observation ---
-        expected_dim = 11 + EnvParameters.RADAR_RAYS
-        if obs.shape[0] != expected_dim and obs.shape[0] != 75:
-            pass
-
-        # Self State
-        current_vel_norm = float(obs[0]) # [-1, 1]
-        current_heading_norm = float(obs[2])
-        current_heading_deg = (current_heading_norm + 1.0) * 180.0
-        
-        # Target State
-        target_bearing_norm = float(obs[4]) # [-1, 1] => [-180, 180]
-        # target_bearing_deg is relative to self heading
-        target_bearing_deg = target_bearing_norm * 180.0
-        
-        # Radar
-        radar_start = 11
-        radar = obs[radar_start:]
-        
-        # --- 2. Pure Pursuit Logic ---
-        # We want to turn towards the target (bearing 0)
-        # Desired angular velocity is proportional to bearing error
-        
-        # Desired Turn
-        # Target bearing is already the error (angle to target)
-        desired_turn_deg = np.clip(target_bearing_deg, -self.max_turn_deg, self.max_turn_deg)
-        angle_norm = desired_turn_deg / (self.max_turn_deg + 1e-6)
-        
-        # Desired Speed
-        # Full speed ahead
-        speed_norm = 1.0
-        
-        # Raw Action (before mask)
-        raw_action = (angle_norm, speed_norm)
-        
-        # --- 3. Apply Hard Mask ---
-        # Checks radar and modifies action if blocked
-        safe_action = apply_hard_mask(raw_action, radar, current_heading_deg, role='tracker')
-        
-        safe_angle_norm, safe_speed_norm = safe_action
-        
-        # --- 4. Convert to Acceleration (Env expects acceleration control) ---
-        # We need to compute angular acc and linear acc to achieve the desired velocity
-        
-        # Desired Velocity
-        desired_speed_val = (safe_speed_norm + 1.0) / 2.0 * self.max_speed
-        
-        desired_heading_delta = safe_angle_norm * self.max_turn_deg
-        desired_heading_deg = current_heading_deg + desired_heading_delta
-        
-        # Current Velocity (Approx)
-        current_vel_val = (current_vel_norm + 1.0) / 2.0 * self.max_speed
-        current_w_norm = float(obs[1]) # angular vel norm
-        current_w = current_w_norm * self.max_turn_deg
-        
-        # Linear Control (P)
-        lin_err = desired_speed_val - current_vel_val
-        lin_acc = np.clip(2.0 * lin_err, -self.max_acc, self.max_acc)
-        lin_acc_norm = lin_acc / self.max_acc
-        
-        # Angular Control (PD)
-        Kp_heading = 4.0
-        Kd_heading = 0.5
-        
-        desired_w = Kp_heading * desired_heading_delta
-        desired_w -= Kd_heading * current_w
-        desired_w = np.clip(desired_w, -self.max_turn_deg, self.max_turn_deg)
-        
-        Kp_w = 2.0
-        ang_acc = Kp_w * (desired_w - current_w)
-        ang_acc = np.clip(ang_acc, -self.max_ang_acc, self.max_ang_acc)
-        ang_acc_norm = ang_acc / self.max_ang_acc
-        
-        return np.array([ang_acc_norm, lin_acc_norm], dtype=np.float32)
-
-TRACKER_POLICY_REGISTRY = {
-    "CBF": CBFTracker,
-    "PurePursuit": PurePursuitTracker
-}
-if not CBF_AVAILABLE:
-    del TRACKER_POLICY_REGISTRY["CBF"]
+        # Output direct velocity command: [delta_deg, speed_fraction]
+        return np.array([safe_angle_deg, safe_speed_norm], dtype=np.float32)
 
 
 TARGET_POLICY_REGISTRY = {

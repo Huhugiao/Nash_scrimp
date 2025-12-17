@@ -6,16 +6,7 @@ import torch
 from typing import Dict, List, Optional
 import map_config
 
-# 仅使用 PIL，移除 imageio
-try:
-    from PIL import Image as PILImage
-except ImportError:
-    PILImage = None
-
-try:
-    import wandb
-except Exception:
-    wandb = None
+from PIL import Image as PILImage
 
 from mlp.alg_parameters_mlp import *  # 使用 MLP 通用参数
 from map_config import EnvParameters
@@ -179,15 +170,4 @@ def build_critic_observation(actor_obs, opponent_strategy=None, policy_manager=N
     
     actor_vec = np.asarray(actor_obs, dtype=np.float32).reshape(-1)
     
-    # 不再强制填充，使用实际观测长度
-    # Tracker: 27维, Target: 24维
-    
-    # 注意：这里已经去掉了 CONTEXT_LEN 的依赖，因为 MLP 版本用 CTDE
-    # 如果还需要 context，必须确保 NetParameters 里有定义
-    # 但根据之前的修改，MLP 应该不再使用这个函数或者这个函数应该被重写
-    # 这里保留原逻辑但指向正确的参数文件
-    
-    # 实际上 MLP 的 build_critic_observation 已经在 evaluate_mlp.py 中重写了
-    # 这个 util 函数可能是给旧代码用的，但为了安全，我们指向 mlp 参数
-    
-    return actor_vec # 暂时直接返回，因为 MLP 不用这个
+    return actor_vec 
