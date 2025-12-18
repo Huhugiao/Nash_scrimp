@@ -17,7 +17,7 @@ try:
 except Exception:
     wandb = None
 
-from lstm.alg_parameters import *  # 使用通用参数
+from mlp.alg_parameters_mlp import *  # 使用通用参数
 from map_config import EnvParameters
 
 
@@ -175,7 +175,7 @@ def update_perf(one_ep, perf):
 
 def build_critic_observation(actor_obs, opponent_strategy=None, policy_manager=None):
     """构建critic观测：actor_obs + opponent_id context"""
-    from lstm.alg_parameters import NetParameters  # 确保导入
+    from mlp.alg_parameters_mlp import NetParameters  # 确保导入
     
     actor_vec = np.asarray(actor_obs, dtype=np.float32).reshape(-1)
     

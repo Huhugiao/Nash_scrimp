@@ -24,11 +24,12 @@ class TrainingParameters:
     # --- 训练流程设置 ---
     N_ENVS = 4               # 并行环境数量
     N_STEPS = 2048           # 每个环境采样的步数 (PPO Rollout Length)
-    N_MAX_STEPS = 4e7        # 最大训练总步数
+    N_MAX_STEPS = 10e7        # 最大训练总步数
     LOG_EPOCH_STEPS = int(1e4) # 每隔多少步记录一次日志
     
     MINIBATCH_SIZE = 64      # PPO更新的Mini-batch大小
-    N_EPOCHS = 10            # PPO更新的Epoch数
+    N_EPOCHS_INITIAL = 10    # N_EPOCHS 初始值
+    N_EPOCHS_FINAL = 10       # N_EPOCHS 最终值 (线性衰减)
 
     # --- 序列长度设置 (MLP也使用TBPTT进行数据切分) ---
     TBPTT_STEPS = 32         # 截断反向传播的时间步长 (也是Context Window大小)
@@ -38,7 +39,7 @@ class TrainingParameters:
     CLIP_RANGE = 0.2         # Policy Loss的Clip范围 (PPO Clip)
     RATIO_CLAMP_MAX = 4.0    # Importance Sampling Ratio的最大值
     EX_VALUE_COEF = 0.5      # Value Loss的系数
-    ENTROPY_COEF = 0.02      # Entropy Bonus的系数
+    ENTROPY_COEF = 0.01      # Entropy Bonus的系数
     MAX_GRAD_NORM = 0.5      # 梯度裁剪阈值
     GAMMA = 0.99             # 折扣因子
     LAM = 0.95               # GAE参数 lambda
@@ -84,10 +85,10 @@ class TrainingParameters:
     # 随机对手权重 (初始权重)
     RANDOM_OPPONENT_WEIGHTS = {
         "target": {
-            "Greedy": 1.0,
+            # "Greedy": 1.0,
             "CoverSeeker": 1.0,
-            "ZigZag": 1.0,
-            "Orbiter": 1.0,
+            # "ZigZag": 1.0,
+            # "Orbiter": 1.0,
         }
     }
 
@@ -126,13 +127,23 @@ class RecordingParameters:
     日志与记录参数
     """
     EXPERIMENT_PROJECT = "AvoidMaker_MLP"
-    EXPERIMENT_NAME = "mlp_rl_fixop"
+    
+    # 环境安全层开关 (训练时) - 需要在 EXPERIMENT_NAME 之前定义
+    ENABLE_SAFETY_LAYER = False   # True: 环境辅助避障, False: 纯 RL 自主学习避障
+    
+    # 根据激活的 targets 自动命名
+    _targets = list(TrainingParameters.RANDOM_OPPONENT_WEIGHTS.get("target", {}).keys())
+    EXPERIMENT_NAME = f"rl_{_targets[0] if len(_targets) == 1 else 'all'}"
+    if not ENABLE_SAFETY_LAYER:
+        EXPERIMENT_NAME += "_collision"
+    
     ENTITY = "user"
     EXPERIMENT_NOTE = "MLP PPO training with separate radar encoding"
     TIME = datetime.datetime.now().strftime("_%m-%d-%H-%M")
     
-    RETRAIN = False          # 是否继续训练
-    RESTORE_DIR = "./models/mlp_ppo_oneop_rl_12-02-11-12/final_model/checkpoint.pth"       # 恢复模型的目录
+    RETRAIN = True          # 是否继续训练 (加载权重和进度)
+    FRESH_RETRAIN = False     # 仅加载模型权重，重置训练进度和学习率调度
+    RESTORE_DIR = "./models/rl_CoverSeeker_collision_12-17-22-44/best_model/checkpoint.pth"       # 恢复模型的目录
     
     WANDB = False            # 是否使用WandB
     TENSORBOARD = True       # 是否使用TensorBoard

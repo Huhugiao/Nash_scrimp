@@ -20,19 +20,19 @@ from collections import defaultdict
 
 from env import TrackingEnv
 from mlp.model_mlp import Model
-from mlp.alg_parameters_mlp import *  # Use MLP-specific parameters
+from mlp.alg_parameters_mlp import *
 from mlp.util_mlp import make_gif
 from mlp.policymanager_mlp import PolicyManager
-import rule_policies # Added to support rule_policies.SmartGreedyTarget etc.
+import rule_policies 
 from rule_policies import CBFTracker, TRACKER_POLICY_REGISTRY, TARGET_POLICY_REGISTRY
-from targetmaker.target_wrapper import RLTargetPolicy
+
 
 # Simplified choices derived from registries
 TRACKER_POLICY_NAMES = tuple(TRACKER_POLICY_REGISTRY.keys())
 TARGET_POLICY_NAMES = tuple(TARGET_POLICY_REGISTRY.keys())
-RL_TARGET_NAMES = ("RL_Survival", "RL_Stealth", "RL_Taunt")
+RL_TARGET_NAMES = ()  # RL Targets disabled (targetmaker removed)
 TRACKER_TYPE_CHOICES = TRACKER_POLICY_NAMES + ("policy", "all")
-TARGET_TYPE_CHOICES = {"Greedy", "all"} | set(RL_TARGET_NAMES)
+TARGET_TYPE_CHOICES = {"all"} | set(TARGET_POLICY_NAMES)
 
 DEFAULT_TRACKER = "PurePursuit"
 DEFAULT_TARGET = "all"
@@ -62,7 +62,8 @@ class BattleConfig:
                  main_output_dir=None,
                  obstacle_density=None,
                  tracker_name=None,
-                 debug=False):
+                 debug=False,
+                 enable_safety_layer=True):
         self.tracker_type = tracker_type or DEFAULT_TRACKER
         # Ensure target_type is a list for consistent processing
         if isinstance(target_type, str):
@@ -86,6 +87,7 @@ class BattleConfig:
         self.obstacle_density = obstacle_density or ObstacleDensity.MEDIUM
         self.tracker_name = tracker_name
         self.debug = debug
+        self.enable_safety_layer = bool(enable_safety_layer)
 
         os.makedirs(output_dir, exist_ok=True)
         self.run_dir = None
@@ -114,24 +116,11 @@ def run_battle_batch(args):
             tracker_model.network.load_state_dict(model_dict)
         tracker_model.network.eval()
 
-    if config.target_type == "policy":
-        target_model = Model(device, global_model=False)
-        model_dict = torch.load(config.target_model_path, map_location=device)
-        if isinstance(model_dict, dict) and 'model' in model_dict:
-            target_model.network.load_state_dict(model_dict['model'])
-        else:
-            target_model.network.load_state_dict(model_dict)
-        target_model.network.eval()
 
 
-    # Pre-load RL Target Policy if applicable
+
+    # Pre-load target policy
     preloaded_target_policy = None
-    target_type_for_init = config.specific_target_strategy or (config.target_type if isinstance(config.target_type, str) else config.target_type[0])
-    
-    if target_type_for_init.startswith("RL_"):
-        # Load once per batch
-        _, policy_obj = _init_target_policy(config, preloaded_policy=None)
-        preloaded_target_policy = policy_obj
 
     policy_manager = PolicyManager()
 
@@ -161,7 +150,7 @@ def run_battle_batch(args):
 
 def run_single_episode(config, episode_idx, tracker_model, target_model, device, policy_manager, preloaded_target_policy=None, force_save_gif=False):
     map_config.set_obstacle_density(config.obstacle_density)
-    env = TrackingEnv()
+    env = TrackingEnv(enable_safety_layer=config.enable_safety_layer)
     try:
         obs_result = env.reset()
         # unpack observation
@@ -451,9 +440,7 @@ def _init_target_policy(config, preloaded_policy=None):
     
     current_type = config.specific_target_strategy or (config.target_type if isinstance(config.target_type, str) else config.target_type[0])
 
-    if current_type == "policy":
-        return target_strategy or "policy", None
-    elif current_type == "all":
+    if current_type == "all":
         if target_strategy is None:
              raise ValueError("Target type is 'all' but no specific strategy provided")
         policy_cls = TARGET_POLICY_REGISTRY.get(target_strategy, rule_policies.GreedyTarget)
@@ -462,39 +449,6 @@ def _init_target_policy(config, preloaded_policy=None):
         target_strategy = target_strategy or current_type
         policy_cls = TARGET_POLICY_REGISTRY[current_type]
         return target_strategy, policy_cls()
-    elif current_type.startswith("RL_"):
-        # Handle RL Targets
-        if preloaded_policy is not None:
-             return current_type, preloaded_policy
-
-        if not config.target_model_path:
-            raise ValueError("Must provide --target_model_path when using RL targets")
-        
-        style = current_type.split("_")[1].lower() 
-        if os.path.isdir(config.target_model_path):
-             # Try exact match first
-             candidate = os.path.join(config.target_model_path, f"{style}.pth")
-             if os.path.exists(candidate):
-                 model_file = candidate
-             else:
-                 # Try fuzzy match (e.g. survival_12345.pth)
-                 import glob
-                 candidates = glob.glob(os.path.join(config.target_model_path, f"{style}*.pth"))
-                 if candidates:
-                     # Sort by modification time or name length? 
-                     # Usually we want the one with highest number if it is step count.
-                     # But file system sort is usually fine if format is standard. 
-                     # Let's take the last one alphabetically which usually works for timestamp/step count if fixed width, 
-                     # or just latest modified.
-                     candidates.sort(key=os.path.getmtime)
-                     model_file = candidates[-1]
-                     print(f"Auto-selected latest model file for {style}: {os.path.basename(model_file)}")
-                 else:
-                      raise FileNotFoundError(f"No model file found for style '{style}' in {config.target_model_path}")
-        else:
-             model_file = config.target_model_path
-        
-        return current_type, RLTargetPolicy(model_file)
     else:
         raise ValueError(f"Unsupported target type: {current_type}")
 
@@ -521,18 +475,11 @@ def _get_tracker_action(config, model, policy_fn, strategy, actor_obs, critic_ob
 
 
 def _get_target_action(config, model, policy_obj, strategy, actor_obs, critic_obs, hidden, privileged_state=None):
-    if config.target_type == "policy":
-        eval_result = model.evaluate(actor_obs, critic_obs, greedy=True)
-        raw_action = eval_result[0]
-        pre_tanh = eval_result[1]
-        raw_action = np.asarray(raw_action, dtype=np.float32).reshape(2)
-        return raw_action, pre_tanh, None
-    else:
-        if policy_obj is None:
-            raise ValueError(f"No target policy object for strategy {strategy}")
-        action = policy_obj.get_action(actor_obs)
-        action = np.asarray(action, dtype=np.float32).reshape(2)
-        return action, None, None
+    if policy_obj is None:
+        raise ValueError(f"No target policy object for strategy {strategy}")
+    action = policy_obj.get_action(actor_obs)
+    action = np.asarray(action, dtype=np.float32).reshape(2)
+    return action, None, None
 
 
 def build_critic_observation(actor_obs, other_obs):
@@ -633,7 +580,8 @@ def run_strategy_evaluation(base_config):
                 main_output_dir=main_evaluation_dir,
                 obstacle_density=base_config.obstacle_density,
                 tracker_name=base_config.tracker_name,
-                debug=base_config.debug)
+                debug=base_config.debug,
+                enable_safety_layer=base_config.enable_safety_layer)
             results, run_dir = run_battle(config, strategy_name=f"{tracker_strategy}_vs_{target_strategy}")
 
             if results is not None:
@@ -800,16 +748,16 @@ Available Strategies:
 """
     )
 
-    parser.add_argument('--tracker', type=str, default="PurePursuit",
+    parser.add_argument('--tracker', type=str, default="policy",
                        choices=list(TRACKER_TYPE_CHOICES),
                        help=f'Tracker type: {", ".join(TRACKER_TYPE_CHOICES)}')
-    parser.add_argument('--tracker_name', type=str, default="rl1208",
+    parser.add_argument('--tracker_name', type=str, default="rl1217",
                        help='Custom name for tracker when type is policy')
     parser.add_argument('--target', type=str, nargs='+', default=["all"],
                        help=f'Target type(s): {", ".join(TARGET_TYPE_CHOICES)}')
 
     parser.add_argument('--tracker_model', type=str,
-                       default='./models/mlp_rl_fixop_12-08-21-19/latest_model/checkpoint.pth',
+                       default='./models/rl_CoverSeeker_12-17-17-59/best_model/checkpoint.pth',
                        help='Path to tracker model (required when --tracker=policy)')
     parser.add_argument('--target_model', type=str, default='./target_models/stealth_ppo_12-10-17-25/stealth_best.pth',
                        help='Path to target model (required when --target=policy)')
@@ -833,12 +781,14 @@ Available Strategies:
     parser.add_argument('--debug', action='store_true', default=False,
                        help='Enable debug mode: save GIFs and detailed data for failed tracker episodes')
 
+    parser.add_argument('--no-safety-layer', action='store_true', default=True,
+                       help='Disable environment safety layer (action validation and correction)')
+
     args = parser.parse_args()
 
     if args.tracker == 'policy' and args.tracker_model is None:
         parser.error("--tracker_model is required when tracker is 'policy'")
-    if 'policy' in args.target and args.target_model is None:
-        parser.error("--target_model is required when target is 'policy'")
+
 
     config = BattleConfig(
         tracker_type=args.tracker,
@@ -852,7 +802,8 @@ Available Strategies:
         state_space=args.state_space,
         obstacle_density=args.obstacles,
         tracker_name=args.tracker_name,
-        debug=args.debug
+        debug=args.debug,
+        enable_safety_layer=not args.no_safety_layer
     )
 
     # Logic for choosing Single Battle vs Strategy Evaluation

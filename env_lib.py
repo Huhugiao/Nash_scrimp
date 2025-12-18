@@ -743,10 +743,13 @@ def agent_move(agent, action, moving_size, role=None):
 
     return _resolve_obstacle_collision(old_state, agent)
 
-def agent_move_accel(agent, lin_acc, ang_acc, max_speed, max_ang_speed, role=None):
+def agent_move_accel(agent, lin_acc, ang_acc, max_speed, max_ang_speed, role=None, enable_safety_layer=True):
     """
     Acceleration-based movement update.
     Updates agent state (x, y, theta, v, w) in place.
+    
+    Args:
+        enable_safety_layer: If False, disables collision rollback protection.
     """
     old_state = dict(agent)
     
@@ -769,8 +772,12 @@ def agent_move_accel(agent, lin_acc, ang_acc, max_speed, max_ang_speed, role=Non
                                0, map_config.width - map_config.pixel_size))
     agent['y'] = float(np.clip(agent['y'] + agent['v'] * math.sin(rad_theta),
                                0, map_config.height - map_config.pixel_size))
-                               
-    return _resolve_obstacle_collision(old_state, agent)
+    
+    # Only apply collision rollback if safety layer is enabled
+    if enable_safety_layer:
+        return _resolve_obstacle_collision(old_state, agent)
+    else:
+        return agent
 # ============================================================================
 # Hard Mask Safety Parameters (Moved from cbf_controller.py)
 # ============================================================================

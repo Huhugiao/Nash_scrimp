@@ -67,6 +67,17 @@ def get_scheduled_lr(current_step):
 	weight = 0.5 * (1.0 + math.cos(math.pi * progress))
 	return final_lr + (TrainingParameters.lr - final_lr) * weight
 
+def get_scheduled_n_epochs(current_step):
+	"""
+	线性衰减 N_EPOCHS: 从 N_EPOCHS_INITIAL 线性衰减到 N_EPOCHS_FINAL
+	"""
+	initial = getattr(TrainingParameters, 'N_EPOCHS_INITIAL', 10)
+	final = getattr(TrainingParameters, 'N_EPOCHS_FINAL', initial)
+	progress = min(max(current_step / TrainingParameters.N_MAX_STEPS, 0.0), 1.0)
+	# 线性插值
+	n_epochs = initial + (final - initial) * progress
+	return max(1, int(round(n_epochs)))
+
 def build_segments_from_rollout(rollout, window_size):
 	segments = []
 	total_steps = rollout['actor_obs'].shape[0]
@@ -228,8 +239,10 @@ def format_train_log(curr_steps, curr_episodes, il_prob, train_stats):
 	parts = [
 		f"[TRAIN] step={curr_steps:,}",
 		f"ep={curr_episodes:,}",
-		f"ILp={il_prob*100:5.1f}%"
 	]
+	# Only include ILp when IL is active
+	if TrainingParameters.TRAINING_MODE != "rl":
+		parts.append(f"ILp={il_prob*100:5.1f}%")
 	if train_stats:
 		parts.append(f"Rew={train_stats.get('per_r_mean', 0):.2f}±{train_stats.get('per_r_std', 0):.2f}")
 		parts.append(f"Win={train_stats.get('win_mean', 0)*100:.1f}%")
@@ -332,11 +345,15 @@ def _record_eval_gif(eval_env, agent_model, opponent_model, device, gif_path):
 
 def main():
 	model_dict = None
-	if def_attr('RETRAIN', False):
+	fresh_retrain = def_attr('FRESH_RETRAIN', False)
+	if def_attr('RETRAIN', False) or fresh_retrain:
 		checkpoint_path = RecordingParameters.RESTORE_DIR
 		if checkpoint_path and os.path.exists(checkpoint_path):
 			model_dict = torch.load(checkpoint_path, map_location='cpu')
-			print(f"Loaded checkpoint from {checkpoint_path}")
+			if fresh_retrain:
+				print(f"[FRESH_RETRAIN] Loaded model weights from {checkpoint_path}, resetting training progress")
+			else:
+				print(f"Loaded checkpoint from {checkpoint_path}")
 	global_summary = SummaryWriter(log_dir=SUMMARY_PATH) if def_attr('TENSORBOARD', True) else None
 	if setproctitle:
 		setproctitle.setproctitle("AvoidMaker_MLP")
@@ -354,10 +371,20 @@ def main():
 		opponent_weights = opponent_model.get_weights()
 	global_pm = PolicyManager() if TrainingParameters.OPPONENT_TYPE in {"random", "random_nonexpert"} and TrainingParameters.ADAPTIVE_SAMPLING else None
 	envs = [Runner.remote(i + 1) for i in range(TrainingParameters.N_ENVS)]
-	eval_env = TrackingEnv()
-	curr_steps = int(model_dict.get('step', 0)) if model_dict else 0
-	curr_episodes = int(model_dict.get('episode', 0)) if model_dict else 0
-	best_perf = float(model_dict.get('reward', -1e9)) if model_dict else -1e9
+	
+	# Use ENABLE_SAFETY_LAYER for eval_env as well
+	enable_safety = getattr(RecordingParameters, 'ENABLE_SAFETY_LAYER', True)
+	eval_env = TrackingEnv(enable_safety_layer=enable_safety)
+	
+	# FRESH_RETRAIN: load weights but reset training progress (steps, episodes, best_perf)
+	if model_dict and not fresh_retrain:
+		curr_steps = int(model_dict.get('step', 0))
+		curr_episodes = int(model_dict.get('episode', 0))
+		best_perf = float(model_dict.get('reward', -1e9))
+	else:
+		curr_steps = 0
+		curr_episodes = 0
+		best_perf = -1e9
 	# il_buffer removed
 	epoch_perf_buffer = {'per_r': [], 'per_episode_len': [], 'win': []}
 	epoch_loss_buffer = []
@@ -422,7 +449,8 @@ def main():
 			il_filter_ratios = []
 			if all_rl_segments:
 				random.shuffle(all_rl_segments)
-				for _ in range(TrainingParameters.N_EPOCHS):
+				current_n_epochs = get_scheduled_n_epochs(curr_steps)
+				for _ in range(current_n_epochs):
 					for mb_start in range(0, len(all_rl_segments), TrainingParameters.MINIBATCH_SIZE):
 						mb_end = min(mb_start + TrainingParameters.MINIBATCH_SIZE, len(all_rl_segments))
 						batch_segments = all_rl_segments[mb_start:mb_end]
@@ -511,17 +539,29 @@ def main():
 						opp_str += f" Top2={top2[0]}({top2[1]/total_opps*100:.0f}%)"
 
 				log_str = format_train_log(curr_steps, curr_episodes, il_prob, train_stats)
-				log_str += f" | IL_loss={avg_il_loss:.4f} | Filter={avg_filter_ratio:.2f}{opp_str}"
+				# Conditionally add IL and Q-filter info
+				extra_parts = []
+				if TrainingParameters.TRAINING_MODE != "rl":
+					extra_parts.append(f"IL_loss={avg_il_loss:.4f}")
+				if TrainingParameters.USE_Q_CRITIC:
+					extra_parts.append(f"Filter={avg_filter_ratio:.2f}")
+				extra_parts.append(f"Epochs={get_scheduled_n_epochs(curr_steps)}")
+				log_str += " | " + " | ".join(extra_parts) + opp_str
 				print(log_str)
 				if global_summary:
 					# Use the refactored write_to_tensorboard
 					from mlp.util_mlp import write_to_tensorboard
+					global_summary.add_scalar('Train/N_EPOCHS', get_scheduled_n_epochs(curr_steps), curr_steps)
+					
+					# Only pass IL/Q-filter data when enabled
+					il_loss_data = [avg_il_loss, 0.0] if TrainingParameters.TRAINING_MODE != "rl" else None
+					q_loss_data = avg_q_loss if TrainingParameters.USE_Q_CRITIC else None
 					write_to_tensorboard(global_summary, curr_steps, performance_dict=epoch_perf_buffer, 
-										 mb_loss=epoch_loss_buffer, imitation_loss=[avg_il_loss, 0.0], q_loss=avg_q_loss, evaluate=False)
+										 mb_loss=epoch_loss_buffer, imitation_loss=il_loss_data, q_loss=q_loss_data, evaluate=False)
 					global_summary.add_scalar('Train/LR', new_lr, curr_steps)
 					
-					# Log Filter Ratio
-					if il_filter_ratios:
+					# Log Filter Ratio only when Q-filter is enabled
+					if TrainingParameters.USE_Q_CRITIC and il_filter_ratios:
 						avg_filter_ratio = float(np.mean(il_filter_ratios))
 						global_summary.add_scalar('Train/IL_Filter_Kept_Ratio', avg_filter_ratio, curr_steps)
 					

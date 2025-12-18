@@ -8,7 +8,6 @@ from gymnasium import spaces
 
 import env_lib, map_config
 from map_config import EnvParameters
-from lstm.alg_parameters import NetParameters
 import pygame
 
 
@@ -18,9 +17,10 @@ class TrackingEnv(gym.Env):
         'render_fps': 40
     }
 
-    def __init__(self, spawn_outside_fov=False):
+    def __init__(self, spawn_outside_fov=False, enable_safety_layer=True):
         super().__init__()
         self.spawn_outside_fov = bool(spawn_outside_fov)
+        self.enable_safety_layer = bool(enable_safety_layer)
         self.mask_flag = getattr(map_config, 'mask_flag', False)
         self.width = map_config.width
         self.height = map_config.height
@@ -480,26 +480,32 @@ class TrackingEnv(gym.Env):
         tracker_corrected = False
         target_corrected = False
         if tracker_action is not None:
-            tracker_action, tracker_corrected = self._find_valid_action(
-                self.tracker, tracker_action, 'tracker'
-            )
+            # Apply safety layer only if enabled
+            if self.enable_safety_layer:
+                tracker_action, tracker_corrected = self._find_valid_action(
+                    self.tracker, tracker_action, 'tracker'
+                )
             tracker_phys = self._control_to_physical(tracker_action, 'tracker')
             if tracker_phys is not None:
                 ang_acc, lin_acc = tracker_phys
                 max_ang_speed = float(getattr(map_config, 'tracker_max_angular_speed', 10.0))
                 self.tracker = env_lib.agent_move_accel(
-                    self.tracker, lin_acc, ang_acc, self.tracker_speed, max_ang_speed, role='tracker'
+                    self.tracker, lin_acc, ang_acc, self.tracker_speed, max_ang_speed, 
+                    role='tracker', enable_safety_layer=self.enable_safety_layer
                 )
         if target_action is not None:
-            target_action, target_corrected = self._find_valid_action(
-                self.target, target_action, 'target'
-            )
+            # Apply safety layer only if enabled
+            if self.enable_safety_layer:
+                target_action, target_corrected = self._find_valid_action(
+                    self.target, target_action, 'target'
+                )
             target_phys = self._control_to_physical(target_action, 'target')
             if target_phys is not None:
                 ang_acc, lin_acc = target_phys
                 max_ang_speed = float(getattr(map_config, 'target_max_angular_speed', 12.0))
                 self.target = env_lib.agent_move_accel(
-                    self.target, lin_acc, ang_acc, self.target_speed, max_ang_speed, role='target'
+                    self.target, lin_acc, ang_acc, self.target_speed, max_ang_speed, 
+                    role='target', enable_safety_layer=self.enable_safety_layer
                 )
 
         self._fov_cache_valid = False
@@ -523,6 +529,20 @@ class TrackingEnv(gym.Env):
         if self.last_target_pos is not None:
             self.prev_target_pos = self.last_target_pos.copy()
         self.last_target_pos = self.target.copy()
+
+        # When safety layer is disabled, check for actual collisions with obstacles
+        if not self.enable_safety_layer:
+            agent_radius = float(getattr(map_config, 'agent_radius', self.pixel_size * 0.5))
+            # Check tracker collision
+            tracker_center_x = self.tracker['x'] + self.pixel_size * 0.5
+            tracker_center_y = self.tracker['y'] + self.pixel_size * 0.5
+            if env_lib.is_point_blocked(tracker_center_x, tracker_center_y, padding=agent_radius):
+                tracker_corrected = True  # Use same flag to trigger collision penalty/termination
+            # Check target collision
+            target_center_x = self.target['x'] + self.pixel_size * 0.5
+            target_center_y = self.target['y'] + self.pixel_size * 0.5
+            if env_lib.is_point_blocked(target_center_x, target_center_y, padding=agent_radius):
+                target_corrected = True
 
         in_sector = self._is_target_in_capture_sector()
         if in_sector:

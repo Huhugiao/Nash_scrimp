@@ -6,7 +6,6 @@ import numpy as np
 import cvxpy as cp
 import math
 import map_config
-from lstm.model_lstm import Model
 from map_config import EnvParameters
 
 
@@ -458,8 +457,11 @@ class CBFTracker:
         speed_factor = min(v_cmd / max_speed, 1.0) if max_speed > 0 else 0.0
         
         # 8. 应用硬掩码（安全层）
-        # raw_vel_action: (angle_norm, speed_norm)
-        raw_vel_action = Model.to_normalized_action((angle_out, speed_factor))
+        # 转换为归一化动作: angle_norm = angle_deg / max_turn_deg, speed_norm = speed_factor * 2 - 1
+        max_turn_deg = float(getattr(map_config, 'tracker_max_angular_speed', 10.0))
+        angle_norm = float(np.clip(angle_out / max_turn_deg, -1.0, 1.0))
+        speed_norm = float(speed_factor * 2.0 - 1.0)  # [0,1] -> [-1,1]
+        raw_vel_action = (angle_norm, speed_norm)
         safe_vel_action = apply_hard_mask(raw_vel_action, radar_norm, heading_deg, role='tracker')
         
         # 9. Convert to Acceleration
