@@ -8,7 +8,7 @@ class SetupParameters:
     SEED = 1234              # 随机种子
     NUM_GPU = 1              # 使用的GPU数量
     USE_GPU_LOCAL = False    # 是否在本地（Runner）使用GPU
-    USE_GPU_GLOBAL = True    # 是否在全局（Driver/Learner）使用GPU
+    USE_GPU_GLOBAL = False    # 是否在全局（Driver/Learner）使用GPU
     PRETRAINED_TARGET_PATH = None  # 预训练Target模型路径
     PRETRAINED_TRACKER_PATH = None # 预训练Tracker模型路径
 
@@ -24,7 +24,7 @@ class TrainingParameters:
     # --- 训练流程设置 ---
     N_ENVS = 4               # 并行环境数量
     N_STEPS = 2048           # 每个环境采样的步数 (PPO Rollout Length)
-    N_MAX_STEPS = 10e7        # 最大训练总步数
+    N_MAX_STEPS = 15e7        # 最大训练总步数
     LOG_EPOCH_STEPS = int(1e4) # 每隔多少步记录一次日志
     
     MINIBATCH_SIZE = 64      # PPO更新的Mini-batch大小
@@ -143,7 +143,7 @@ class RecordingParameters:
     
     RETRAIN = True          # 是否继续训练 (加载权重和进度)
     FRESH_RETRAIN = False     # 仅加载模型权重，重置训练进度和学习率调度
-    RESTORE_DIR = "./models/rl_CoverSeeker_collision_12-17-22-44/best_model/checkpoint.pth"       # 恢复模型的目录
+    RESTORE_DIR = "./models/rl_CoverSeeker_collision_12-18-20-12/latest_model/checkpoint.pth"       # 恢复模型的目录
     
     WANDB = False            # 是否使用WandB
     TENSORBOARD = True       # 是否使用TensorBoard

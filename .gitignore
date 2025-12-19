@@ -1,5 +1,5 @@
 __pycache__/
 battles/
 *.gif
-mlp_eval/
+*.log
 models/
