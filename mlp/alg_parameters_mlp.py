@@ -128,14 +128,15 @@ class RecordingParameters:
     """
     EXPERIMENT_PROJECT = "AvoidMaker_MLP"
     
-    # 环境安全层开关 (训练时) - 需要在 EXPERIMENT_NAME 之前定义
+    # 环境安全层开关 (训练时)
     ENABLE_SAFETY_LAYER = False   # True: 环境辅助避障, False: 纯 RL 自主学习避障
+    BOUNCE_ON_COLLISION = True    # True: 碰撞后弹回25像素+惩罚-3, False: 碰撞后终止+惩罚-20
     
     # 根据激活的 targets 自动命名
     _targets = list(TrainingParameters.RANDOM_OPPONENT_WEIGHTS.get("target", {}).keys())
     EXPERIMENT_NAME = f"rl_{_targets[0] if len(_targets) == 1 else 'all'}"
-    if not ENABLE_SAFETY_LAYER:
-        EXPERIMENT_NAME += "_collision"
+    EXPERIMENT_NAME += "_collision" if not ENABLE_SAFETY_LAYER else ""
+    EXPERIMENT_NAME += "_bounce" if BOUNCE_ON_COLLISION else ""
     
     ENTITY = "user"
     EXPERIMENT_NOTE = "MLP PPO training with separate radar encoding"
@@ -143,7 +144,7 @@ class RecordingParameters:
     
     RETRAIN = True          # 是否继续训练 (加载权重和进度)
     FRESH_RETRAIN = False     # 仅加载模型权重，重置训练进度和学习率调度
-    RESTORE_DIR = "./models/rl_CoverSeeker_collision_12-18-20-12/latest_model/checkpoint.pth"       # 恢复模型的目录
+    RESTORE_DIR = "./models/rl_CoverSeeker_collision_12-19-12-30/latest_model/checkpoint.pth"       # 恢复模型的目录
     
     WANDB = False            # 是否使用WandB
     TENSORBOARD = True       # 是否使用TensorBoard
@@ -158,8 +159,8 @@ class RecordingParameters:
     EVAL_INTERVAL = 100000   # 评估间隔 (步数)
     SAVE_INTERVAL = 300000   # 保存模型间隔 (步数)
     BEST_INTERVAL = 0        # (未使用)
-    GIF_INTERVAL = 300000    # 保存GIF间隔 (步数)
-    EVAL_EPISODES = 50       # 评估时的对局数
+    GIF_INTERVAL = 500000    # 保存GIF间隔 (步数)
+    EVAL_EPISODES = 32       # 评估时的对局数
     
     # Loss 名称列表 (用于日志记录)
     LOSS_NAME = [

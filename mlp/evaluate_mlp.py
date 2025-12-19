@@ -751,18 +751,18 @@ Available Strategies:
     parser.add_argument('--tracker', type=str, default="policy",
                        choices=list(TRACKER_TYPE_CHOICES),
                        help=f'Tracker type: {", ".join(TRACKER_TYPE_CHOICES)}')
-    parser.add_argument('--tracker_name', type=str, default="rl1217",
+    parser.add_argument('--tracker_name', type=str, default="rl1219",
                        help='Custom name for tracker when type is policy')
     parser.add_argument('--target', type=str, nargs='+', default=["all"],
                        help=f'Target type(s): {", ".join(TARGET_TYPE_CHOICES)}')
 
     parser.add_argument('--tracker_model', type=str,
-                       default='./models/rl_CoverSeeker_12-17-17-59/best_model/checkpoint.pth',
+                       default='./models/rl_CoverSeeker_collision_12-19-12-30/best_model/checkpoint.pth',
                        help='Path to tracker model (required when --tracker=policy)')
     parser.add_argument('--target_model', type=str, default='./target_models/stealth_ppo_12-10-17-25/stealth_best.pth',
                        help='Path to target model (required when --target=policy)')
 
-    parser.add_argument('--episodes', type=int, default=100,
+    parser.add_argument('--episodes', type=int, default=10,
                        help='Number of episodes to run')
     parser.add_argument('--save_gif_freq', type=int, default=10,
                        help='Save GIF every N episodes (0 to disable)')

@@ -329,22 +329,9 @@ def ray_distances_multi(origin, angles_rad, max_range, padding=0.0):
 
 def reward_calculate(tracker, target, prev_tracker=None, prev_target=None,
                      tracker_collision=False, target_collision=False,
-                     sector_captured=False, capture_progress=0, capture_required_steps=0):
-    """
-    计算奖励函数：
-    1. 差分奖励 (Potential-based Reward Shaping):
-       R_approach = alpha * (dist_{t-1} - dist_{t})
-       - 鼓励智能体每一步都向目标靠近。
-       - 相比绝对距离奖励，差分奖励能防止智能体在特定距离“刷分”，
-         因为只有距离缩小时才有正奖励，原地不动或震荡的累积奖励为0。
-    
-    2. 时间惩罚 (Time Penalty):
-       - 每步固定扣分，迫使智能体以最短路径完成任务。
-    
-    3. 终局奖励 (Terminal Reward):
-       - 捕获成功给予大额正奖励。
-       - 发生碰撞给予大额负奖励。
-    """
+                     sector_captured=False, capture_progress=0, capture_required_steps=0,
+                     bounce_on_collision=False):
+    """计算奖励函数"""
     info = {
         'capture_progress': int(capture_progress),
         'capture_required_steps': int(capture_required_steps),
@@ -352,33 +339,23 @@ def reward_calculate(tracker, target, prev_tracker=None, prev_target=None,
         'target_collision': bool(target_collision)
     }
 
-    # --- Dense shaping 部分（每步）---
     reward = 0.0
     terminated = False
 
-    # 1) 差分奖励：R = alpha * (prev_dist - curr_dist)
-    # 计算当前距离
     dx = (tracker['x'] + map_config.pixel_size * 0.5) - (target['x'] + map_config.pixel_size * 0.5)
     dy = (tracker['y'] + map_config.pixel_size * 0.5) - (target['y'] + map_config.pixel_size * 0.5)
     curr_dist = math.hypot(dx, dy)
 
-    # 计算上一时刻距离
     if prev_tracker is not None and prev_target is not None:
         p_dx = (prev_tracker['x'] + map_config.pixel_size * 0.5) - (prev_target['x'] + map_config.pixel_size * 0.5)
         p_dy = (prev_tracker['y'] + map_config.pixel_size * 0.5) - (prev_target['y'] + map_config.pixel_size * 0.5)
         prev_dist = math.hypot(p_dx, p_dy)
     else:
-        # 第一帧没有上一时刻，假设距离不变
         prev_dist = curr_dist
 
-    # alpha 系数：决定引导力度
     alpha = 0.05
-    reward_approach = alpha * (prev_dist - curr_dist)
-    reward += reward_approach
-
-    # 2) 时间惩罚：鼓励更快结束
-    time_penalty = 0.01
-    reward -= time_penalty
+    reward += alpha * (prev_dist - curr_dist)
+    reward -= 0.01  # time penalty
 
     success_reward = float(getattr(map_config, 'success_reward', 20.0))
 
@@ -387,8 +364,13 @@ def reward_calculate(tracker, target, prev_tracker=None, prev_target=None,
         info['reason'] = 'tracker_caught_target'
         reward += success_reward
     elif tracker_collision:
-        terminated = True
-        reward -= success_reward
+        if bounce_on_collision:
+            reward -= 3.0
+            info['reason'] = 'tracker_collision_bounce'
+        else:
+            terminated = True
+            reward -= success_reward
+            info['reason'] = 'tracker_collision'
 
     return float(reward), bool(terminated), False, info
 
@@ -407,109 +389,47 @@ def _draw_grid(surface):
     for y in range(0, h, step):
         pygame.draw.line(surface, map_config.grid_color, (0, y), (w, y), 1)
 
-def _draw_agent(surface, agent, color):
+def _draw_agent(surface, agent, color, role=None):
     """
-    绘制美化后的智能体：
-    - 科技感机甲风格
-    - 核心发光
-    - 尾部推进器
-    - 动态光环
+    绘制智能体：
+    - 外圈：圆环表示碰撞体积 (agent_radius)
+    - 内部：箭头表示朝向
     """
     if pygame is None:
         return
-    
-    # 获取参数
-    ss = getattr(map_config, 'ssaa', 1)
-    x_world = agent['x'] + map_config.pixel_size * 0.5
-    y_world = agent['y'] + map_config.pixel_size * 0.5
-    cx, cy = int(x_world * ss), int(y_world * ss)
-    
-    # 基础半径
-    r = map_config.agent_radius * ss
-    heading = math.radians(agent.get('theta', 0.0))
-    cos_h, sin_h = math.cos(heading), math.sin(heading)
-    
-    # 颜色解包
-    base_rgb = color[:3]
-    r_val, g_val, b_val = base_rgb
-    
-    # --- 1. 能量护盾 (Collision Radius) ---
-    # 使用多层透明圆模拟光晕
-    shield_r = int(r * 1.4)
-    # 外层淡光
-    try:
-        pygame.gfxdraw.filled_circle(surface, cx, cy, shield_r, (*base_rgb, 20))
-        pygame.gfxdraw.aacircle(surface, cx, cy, shield_r, (*base_rgb, 40))
-    except AttributeError:
-        pass
-    
-    # --- 2. 机体 (Body) ---
-    # 设计一个类似 "星际战机" 的形状
-    # 顶点定义 (相对坐标, 假设朝右)
-    scale = 1.1
-    # 形状：[鼻锥, 右翼前, 右翼后, 尾部凹陷, 左翼后, 左翼前]
-    pts_rel = [
-        (r * 1.3, 0),           # Nose
-        (r * 0.2, r * 0.7),     # Right Wing Front
-        (-r * 0.6, r * 0.9),    # Right Wing Back
-        (-r * 0.3, 0),          # Rear Center (Engine)
-        (-r * 0.6, -r * 0.9),   # Left Wing Back
-        (r * 0.2, -r * 0.7)     # Left Wing Front
-    ]
-    
-    # 旋转并转换坐标
-    poly_pts = []
-    for dx, dy in pts_rel:
-        dx *= scale
-        dy *= scale
-        px = cx + dx * cos_h - dy * sin_h
-        py = cy + dx * sin_h + dy * cos_h
-        poly_pts.append((px, py))
-        
-    # 填充机体 (深色底 + 亮色边)
-    darker_rgb = (max(0, r_val-40), max(0, g_val-40), max(0, b_val-40))
-    try:
-        pygame.gfxdraw.filled_polygon(surface, poly_pts, (*darker_rgb, 230))
-        pygame.gfxdraw.aapolygon(surface, poly_pts, (*base_rgb, 255))
-    except AttributeError:
-        pygame.draw.polygon(surface, darker_rgb, poly_pts)
-        pygame.draw.polygon(surface, base_rgb, poly_pts, 1)
-    
-    # --- 3. 核心反应堆 (Core) ---
-    core_offset = 0
-    core_x = cx + core_offset * cos_h
-    core_y = cy + core_offset * sin_h
-    core_radius = int(r * 0.3)
-    
-    # 核心发光 (白色)
-    try:
-        pygame.gfxdraw.filled_circle(surface, int(core_x), int(core_y), core_radius, (255, 255, 255, 255))
-        # 核心光晕
-        pygame.gfxdraw.filled_circle(surface, int(core_x), int(core_y), int(core_radius*1.8), (*base_rgb, 100))
-    except AttributeError:
-        pygame.draw.circle(surface, (255, 255, 255), (int(core_x), int(core_y)), core_radius)
 
-    # --- 4. 尾焰 (Thrusters) ---
-    # 在两个翼尖后方画小的粒子流
-    thruster_offset = -r * 0.6 * scale
-    wing_spread = r * 0.6 * scale
+    ss = float(getattr(map_config, 'ssaa', 1))
+    x_world = float(agent['x']) + float(map_config.pixel_size) * 0.5
+    y_world = float(agent['y']) + float(map_config.pixel_size) * 0.5
+    cx, cy = int(x_world * ss), int(y_world * ss)
+
+    if role == 'target':
+        r_world = getattr(map_config, 'target_radius', getattr(map_config, 'agent_radius', 8.0))
+    elif role == 'tracker':
+        r_world = getattr(map_config, 'tracker_radius', getattr(map_config, 'agent_radius', 8.0))
+    else:
+        r_world = getattr(map_config, 'agent_radius', 8.0)
+        
+    r_i = max(3, int(r_world * ss))
     
-    # 计算两个引擎位置
-    eng1_x = cx + thruster_offset * cos_h - wing_spread * sin_h
-    eng1_y = cy + thruster_offset * sin_h + wing_spread * cos_h
+    thickness = max(1, int(1.5 * ss))
+    pygame.draw.circle(surface, color[:3], (cx, cy), r_i, thickness)
     
-    eng2_x = cx + thruster_offset * cos_h - (-wing_spread) * sin_h
-    eng2_y = cy + thruster_offset * sin_h + (-wing_spread) * cos_h
+    theta_deg = agent.get('theta', 0.0)
+    theta_rad = math.radians(theta_deg)
+    cos_t = math.cos(theta_rad)
+    sin_t = math.sin(theta_rad)
     
-    # 尾焰颜色 (偏黄/白)
-    flame_color = (255, 230, 150, 180)
-    flame_r = int(r * 0.25)
+    tip_len = r_i * 0.8
+    base_len = r_i * 0.4
+    wing_len = r_i * 0.5
     
-    try:
-        pygame.gfxdraw.filled_circle(surface, int(eng1_x), int(eng1_y), flame_r, flame_color)
-        pygame.gfxdraw.filled_circle(surface, int(eng2_x), int(eng2_y), flame_r, flame_color)
-    except AttributeError:
-        pass
+    p1 = (cx + tip_len * cos_t, cy + tip_len * sin_t)
+    p2 = (cx - base_len * cos_t - wing_len * sin_t, cy - base_len * sin_t + wing_len * cos_t)
+    p_indent = (cx - (base_len * 0.5) * cos_t, cy - (base_len * 0.5) * sin_t)
+    p3 = (cx - base_len * cos_t + wing_len * sin_t, cy - base_len * sin_t - wing_len * cos_t)
+    
+    pygame.draw.polygon(surface, color[:3], [p1, p2, p_indent, p3])
 
 def _draw_trail(surface, traj, rgba, width_px):
     if pygame is None or len(traj) < 2:
@@ -712,8 +632,8 @@ def get_canvas(target, tracker, tracker_traj, target_traj, surface=None, fov_poi
     _draw_capture_sector(surface, tracker)
     _draw_trail(surface, tracker_traj, map_config.trail_color_tracker, map_config.trail_width)
     _draw_trail(surface, target_traj, map_config.trail_color_target, map_config.trail_width)
-    _draw_agent(surface, tracker, map_config.tracker_color)
-    _draw_agent(surface, target, map_config.target_color)
+    _draw_agent(surface, tracker, map_config.tracker_color, role='tracker')
+    _draw_agent(surface, target, map_config.target_color, role='target')
 
     canvas = pygame.transform.smoothscale(surface, (w, h)) if ss > 1 else surface
     return pygame.surfarray.array3d(canvas).swapaxes(0, 1)

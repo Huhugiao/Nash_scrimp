@@ -17,10 +17,11 @@ class TrackingEnv(gym.Env):
         'render_fps': 40
     }
 
-    def __init__(self, spawn_outside_fov=False, enable_safety_layer=True):
+    def __init__(self, spawn_outside_fov=False, enable_safety_layer=True, bounce_on_collision=False):
         super().__init__()
         self.spawn_outside_fov = bool(spawn_outside_fov)
         self.enable_safety_layer = bool(enable_safety_layer)
+        self.bounce_on_collision = bool(bounce_on_collision)
         self.mask_flag = getattr(map_config, 'mask_flag', False)
         self.width = map_config.width
         self.height = map_config.height
@@ -494,18 +495,17 @@ class TrackingEnv(gym.Env):
                     role='tracker', enable_safety_layer=self.enable_safety_layer
                 )
         if target_action is not None:
-            # Apply safety layer only if enabled
-            if self.enable_safety_layer:
-                target_action, target_corrected = self._find_valid_action(
-                    self.target, target_action, 'target'
-                )
+            # Target ALWAYS uses safety layer (to prevent getting stuck)
+            target_action, target_corrected = self._find_valid_action(
+                self.target, target_action, 'target'
+            )
             target_phys = self._control_to_physical(target_action, 'target')
             if target_phys is not None:
                 ang_acc, lin_acc = target_phys
                 max_ang_speed = float(getattr(map_config, 'target_max_angular_speed', 12.0))
                 self.target = env_lib.agent_move_accel(
                     self.target, lin_acc, ang_acc, self.target_speed, max_ang_speed, 
-                    role='target', enable_safety_layer=self.enable_safety_layer
+                    role='target', enable_safety_layer=True  # Always enabled for target
                 )
 
         self._fov_cache_valid = False
@@ -530,15 +530,21 @@ class TrackingEnv(gym.Env):
             self.prev_target_pos = self.last_target_pos.copy()
         self.last_target_pos = self.target.copy()
 
-        # When safety layer is disabled, check for actual collisions with obstacles
+        # When safety layer is disabled, check for actual collisions
         if not self.enable_safety_layer:
             agent_radius = float(getattr(map_config, 'agent_radius', self.pixel_size * 0.5))
-            # Check tracker collision
             tracker_center_x = self.tracker['x'] + self.pixel_size * 0.5
             tracker_center_y = self.tracker['y'] + self.pixel_size * 0.5
             if env_lib.is_point_blocked(tracker_center_x, tracker_center_y, padding=agent_radius):
-                tracker_corrected = True  # Use same flag to trigger collision penalty/termination
-            # Check target collision
+                tracker_corrected = True
+                if self.bounce_on_collision:
+                    bounce_dist = 25.0
+                    heading_rad = math.radians(self.tracker['theta'])
+                    new_x = self.tracker['x'] - bounce_dist * math.cos(heading_rad)
+                    new_y = self.tracker['y'] - bounce_dist * math.sin(heading_rad)
+                    self.tracker['x'] = float(np.clip(new_x, 0, self.width - self.pixel_size))
+                    self.tracker['y'] = float(np.clip(new_y, 0, self.height - self.pixel_size))
+                    self.tracker['v'] = 0.0
             target_center_x = self.target['x'] + self.pixel_size * 0.5
             target_center_y = self.target['y'] + self.pixel_size * 0.5
             if env_lib.is_point_blocked(target_center_x, target_center_y, padding=agent_radius):
@@ -561,7 +567,8 @@ class TrackingEnv(gym.Env):
             target_collision=bool(target_corrected),
             sector_captured=bool(sector_captured),
             capture_progress=int(self._capture_counter),
-            capture_required_steps=int(self.capture_required_steps)
+            capture_required_steps=int(self.capture_required_steps),
+            bounce_on_collision=self.bounce_on_collision
         )
 
         try:
@@ -571,7 +578,6 @@ class TrackingEnv(gym.Env):
             ))
             if self._best_distance is None or cur_dist < (self._best_distance - 1e-6):
                 self._best_distance = cur_dist
-                # 移除密集奖励
                 info['closest_record_improved'] = True
             else:
                 info['closest_record_improved'] = False

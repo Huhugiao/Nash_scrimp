@@ -15,7 +15,8 @@ class Runner(object):
         set_global_seeds(env_id * 123)
         # Use ENABLE_SAFETY_LAYER from RecordingParameters
         enable_safety = getattr(RecordingParameters, 'ENABLE_SAFETY_LAYER', True)
-        self.env = TrackingEnv(enable_safety_layer=enable_safety)
+        bounce = getattr(RecordingParameters, 'BOUNCE_ON_COLLISION', False) and not enable_safety
+        self.env = TrackingEnv(enable_safety_layer=enable_safety, bounce_on_collision=bounce)
         self.local_device = torch.device('cuda') if SetupParameters.USE_GPU_LOCAL else torch.device('cpu')
         
         self.agent_model = Model(self.local_device)
@@ -187,22 +188,6 @@ class Runner(object):
                 lastgaelam = delta + TrainingParameters.GAMMA * TrainingParameters.LAM * next_non_terminal * lastgaelam
                 advantages[t] = lastgaelam
             data['returns'] = advantages + data['values']
-
-            # Collect opponent name for each completed episode
-            log_info = []
-            for _ in range(episodes):
-                # We need to know which opponent was played.
-                # Since multiple episodes can happen in one run, and opponent changes after each episode,
-                # we need to track it.
-                # However, the current loop structure makes it hard to map episodes to opponents exactly 
-                # if we don't store them as they complete.
-                # Let's modify the loop to store opponent name when episode completes.
-                pass 
-
-            # Actually, I need to modify the loop above (lines 130-170) to append to log_info.
-            # But I can't see lines 130-170 here. I need to view them or rewrite the loop.
-            # Wait, I can just modify the return statement if I had the info.
-            # I'll use a new list `completed_opponents` and append to it inside the loop.
             
             pm_state = {k: list(v) for k, v in self.policy_manager.win_history.items()} if self.policy_manager else None
             return {
