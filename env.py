@@ -559,6 +559,9 @@ class TrackingEnv(gym.Env):
             self._capture_counter = 0
         sector_captured = (self._capture_counter >= self.capture_required_steps)
 
+        # Get tracker radar for proximity penalty
+        tracker_radar = self._sense_agent_radar(self.tracker, num_rays=self.radar_rays, full_circle=True)
+        
         reward, terminated, truncated, info = env_lib.reward_calculate(
             self.tracker, self.target,
             prev_tracker=self.prev_tracker_pos,
@@ -568,7 +571,8 @@ class TrackingEnv(gym.Env):
             sector_captured=bool(sector_captured),
             capture_progress=int(self._capture_counter),
             capture_required_steps=int(self.capture_required_steps),
-            bounce_on_collision=self.bounce_on_collision
+            bounce_on_collision=self.bounce_on_collision,
+            radar=tracker_radar
         )
 
         try:

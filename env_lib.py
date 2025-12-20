@@ -330,7 +330,7 @@ def ray_distances_multi(origin, angles_rad, max_range, padding=0.0):
 def reward_calculate(tracker, target, prev_tracker=None, prev_target=None,
                      tracker_collision=False, target_collision=False,
                      sector_captured=False, capture_progress=0, capture_required_steps=0,
-                     bounce_on_collision=False):
+                     bounce_on_collision=False, radar=None):
     """计算奖励函数"""
     info = {
         'capture_progress': int(capture_progress),
@@ -356,6 +356,16 @@ def reward_calculate(tracker, target, prev_tracker=None, prev_target=None,
     alpha = 0.05
     reward += alpha * (prev_dist - curr_dist)
     reward -= 0.01  # time penalty
+
+    # Proximity penalty: if radar detects obstacle closer than safety distance
+    if radar is not None and len(radar) > 0:
+        max_range = float(getattr(map_config, 'fov_range', 250.0))
+        safety_dist = 15.0
+        safety_threshold = (safety_dist / max_range) * 2.0 - 1.0  # ~-0.88
+        min_radar = float(min(radar))
+        if min_radar < safety_threshold:
+            reward -= 1.0
+            info['proximity_warning'] = True
 
     success_reward = float(getattr(map_config, 'success_reward', 20.0))
 
