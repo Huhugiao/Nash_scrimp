@@ -357,15 +357,51 @@ def reward_calculate(tracker, target, prev_tracker=None, prev_target=None,
     reward += alpha * (prev_dist - curr_dist)
     reward -= 0.01  # time penalty
 
-    # Proximity penalty: if radar detects obstacle closer than safety distance
+    # Proximity penalty/reward: 基于到最近障碍物的垂直距离变化
     if radar is not None and len(radar) > 0:
         max_range = float(getattr(map_config, 'fov_range', 250.0))
-        safety_dist = 15.0
-        safety_threshold = (safety_dist / max_range) * 2.0 - 1.0  # ~-0.88
-        min_radar = float(min(radar))
-        if min_radar < safety_threshold:
-            reward -= 1.0
-            info['proximity_warning'] = True
+        agent_radius = float(getattr(map_config, 'agent_radius', 8.0))
+        
+        # 当前帧：找到最近障碍物的边缘距离
+        min_radar_normalized = float(min(radar))
+        curr_center_dist = (min_radar_normalized + 1.0) * 0.5 * max_range
+        curr_edge_dist = curr_center_dist - agent_radius
+        
+        # 前一帧：如果有 prev_tracker，用其位置重新计算雷达（需要环境提供）
+        # 这里简化处理：假设 info 中可以传递 prev_radar
+        # 如果没有，则使用当前距离作为基准（首次调用）
+        if prev_tracker is not None and 'prev_radar' in info:
+            prev_radar = info['prev_radar']
+            prev_min_normalized = float(min(prev_radar))
+            prev_center_dist = (prev_min_normalized + 1.0) * 0.5 * max_range
+            prev_edge_dist = prev_center_dist - agent_radius
+        else:
+            # 首次或无前帧数据，不施加速度奖励
+            prev_edge_dist = curr_edge_dist
+        
+        # 计算垂直距离变化速度
+        obstacle_velocity = curr_edge_dist - prev_edge_dist  # 正值=远离，负值=靠近
+        
+        # 奖励/惩罚系数
+        velocity_coef = 0.02  # 可调整强度
+        
+        if obstacle_velocity < 0:
+            # 靠近障碍物：施加惩罚
+            proximity_penalty = velocity_coef * obstacle_velocity  # 负值惩罚
+            reward += proximity_penalty
+            info['obstacle_approaching'] = True
+            info['obstacle_velocity'] = float(obstacle_velocity)
+            info['proximity_penalty'] = float(proximity_penalty)
+        else:
+            # 远离障碍物：施加奖励
+            proximity_reward = velocity_coef * obstacle_velocity
+            reward += proximity_reward
+            info['obstacle_receding'] = True
+            info['obstacle_velocity'] = float(obstacle_velocity)
+            info['proximity_reward'] = float(proximity_reward)
+        
+        # 记录距离信息
+        info['min_edge_distance'] = float(curr_edge_dist)
 
     success_reward = float(getattr(map_config, 'success_reward', 20.0))
 
