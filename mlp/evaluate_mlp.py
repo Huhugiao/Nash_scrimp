@@ -709,18 +709,18 @@ Available Strategies:
     parser.add_argument('--tracker', type=str, default="policy",
                        choices=list(TRACKER_TYPE_CHOICES),
                        help=f'Tracker type: {", ".join(TRACKER_TYPE_CHOICES)}')
-    parser.add_argument('--tracker_name', type=str, default="rl1219",
+    parser.add_argument('--tracker_name', type=str, default="rl1221",
                        help='Custom name for tracker when type is policy')
     parser.add_argument('--target', type=str, nargs='+', default=["all"],
                        help=f'Target type(s): {", ".join(TARGET_TYPE_CHOICES)}')
 
     parser.add_argument('--tracker_model', type=str,
-                       default='./models/rl_CoverSeeker_collision_12-19-12-30/best_model/checkpoint.pth',
+                       default='./models/rl_CoverSeeker_collision_shaping_12-20-14-23/best_model/checkpoint.pth',
                        help='Path to tracker model (required when --tracker=policy)')
     parser.add_argument('--target_model', type=str, default='./target_models/stealth_ppo_12-10-17-25/stealth_best.pth',
                        help='Path to target model (required when --target=policy)')
 
-    parser.add_argument('--episodes', type=int, default=10,
+    parser.add_argument('--episodes', type=int, default=100,
                        help='Number of episodes to run')
     parser.add_argument('--save_gif_freq', type=int, default=10,
                        help='Save GIF every N episodes (0 to disable)')
@@ -736,7 +736,7 @@ Available Strategies:
                        choices=ObstacleDensity.ALL_LEVELS,
                        help='Obstacle density level (none/sparse/medium/dense)')
 
-    parser.add_argument('--debug', action='store_true', default=False,
+    parser.add_argument('--debug', action='store_true', default=True,
                        help='Enable debug mode: save GIFs and detailed data for failed tracker episodes')
 
     parser.add_argument('--no-safety-layer', action='store_true', default=True,
@@ -764,8 +764,6 @@ Available Strategies:
         enable_safety_layer=not args.no_safety_layer
     )
 
-    # Logic for choosing Single Battle vs Strategy Evaluation
-    # If we have multiple components (multiple targets, multiple trackers, or "all"), use evaluation mode
     is_multi_eval = (
         len(config.target_type) > 1 or 
         "all" in config.target_type or 
@@ -775,15 +773,7 @@ Available Strategies:
     if is_multi_eval:
         run_strategy_evaluation(config)
     else:
-        # Single Battle Mode
-        # Extract single target from list
         single_target = config.target_type[0]
-        # Temporarily patch config.target_type to be string for single battle logic compatibility if needed, 
-        # but BattleConfig now stores list. run_battle expects config.target_type to be used as string in some places?
-        # Actually run_battle uses config.target_type for naming run_dir.
-        
-        # Let's adjust run_battle to handle list or just pass the single string
-        # But run_battle is called by run_strategy_evaluation too.
         
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         main_dir = os.path.join(
@@ -792,11 +782,7 @@ Available Strategies:
         )
         os.makedirs(main_dir, exist_ok=True)
         config.output_dir = main_dir
-        
-        # We need to pass the single strategy name to run_battle effectively
-        # Let's use config.specific_target_strategy logic
         config.specific_target_strategy = single_target
-        # run_battle uses config.target_type for logging, string preferred
         config.target_type = single_target 
         
         run_battle(config)

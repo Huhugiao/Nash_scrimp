@@ -553,6 +553,9 @@ class TrackingEnv(gym.Env):
         # Get tracker radar for proximity penalty
         tracker_radar = self._sense_agent_radar(self.tracker, num_rays=self.radar_rays, full_circle=True)
         
+        # 保存前一帧雷达用于速度计算
+        prev_radar = getattr(self, '_prev_tracker_radar', tracker_radar)
+        
         reward, terminated, truncated, info = env_lib.reward_calculate(
             self.tracker, self.target,
             prev_tracker=self.prev_tracker_pos,

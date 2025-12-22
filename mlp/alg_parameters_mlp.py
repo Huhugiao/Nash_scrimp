@@ -17,8 +17,8 @@ class TrainingParameters:
     训练超参数
     """
     # --- 优化器设置 ---
-    lr = 3e-4                # 初始学习率
-    LR_FINAL = 3e-5          # 最终学习率
+    lr = 3e-5                # 初始学习率
+    LR_FINAL = 1e-5          # 最终学习率
     LR_SCHEDULE = 'cosine'   # 学习率调度方式 ('cosine', 'linear', 'constant')
     
     # --- 训练流程设置 ---
@@ -134,13 +134,15 @@ class RecordingParameters:
     _targets = list(TrainingParameters.RANDOM_OPPONENT_WEIGHTS.get("target", {}).keys())
     EXPERIMENT_NAME = f"rl_{_targets[0] if len(_targets) == 1 else 'all'}"
     EXPERIMENT_NAME += "_collision" if not ENABLE_SAFETY_LAYER else ""
+    EXPERIMENT_NAME += "_bounce" if BOUNCE_ON_COLLISION else ""
+    EXPERIMENT_NAME += "_shaping"
     
     ENTITY = "user"
     EXPERIMENT_NOTE = "MLP PPO training with separate radar encoding"
     TIME = datetime.datetime.now().strftime("_%m-%d-%H-%M")
     
-    RETRAIN = True          # 是否继续训练 (加载权重和进度)
-    FRESH_RETRAIN = False     # 仅加载模型权重，重置训练进度和学习率调度
+    RETRAIN = False          # 是否继续训练 (加载权重和进度)
+    FRESH_RETRAIN = True     # 仅加载模型权重，重置训练进度和学习率调度
     RESTORE_DIR = "./models/rl_CoverSeeker_collision_12-19-12-30/latest_model/checkpoint.pth"       # 恢复模型的目录
     
 
