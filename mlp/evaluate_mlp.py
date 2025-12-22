@@ -26,14 +26,13 @@ from mlp.policymanager_mlp import PolicyManager
 import rule_policies # Added to support rule_policies.SmartGreedyTarget etc.
 from rule_policies import CBFTracker, TRACKER_POLICY_REGISTRY, TARGET_POLICY_REGISTRY
 from rule_policies import apply_hard_mask
-from targetmaker.target_wrapper import RLTargetPolicy
+
 
 # Simplified choices derived from registries
 TRACKER_POLICY_NAMES = tuple(TRACKER_POLICY_REGISTRY.keys())
 TARGET_POLICY_NAMES = tuple(TARGET_POLICY_REGISTRY.keys())
-RL_TARGET_NAMES = ("RL_Survival", "RL_Stealth", "RL_Taunt")
 TRACKER_TYPE_CHOICES = TRACKER_POLICY_NAMES + ("policy", "all")
-TARGET_TYPE_CHOICES = {"Greedy", "all"} | set(RL_TARGET_NAMES)
+TARGET_TYPE_CHOICES = set(TARGET_POLICY_NAMES) | {"all"}
 
 DEFAULT_TRACKER = "CBF"
 DEFAULT_TARGET = "all"
@@ -127,14 +126,7 @@ def run_battle_batch(args):
         target_model.network.eval()
 
 
-    # Pre-load RL Target Policy if applicable
     preloaded_target_policy = None
-    target_type_for_init = config.specific_target_strategy or (config.target_type if isinstance(config.target_type, str) else config.target_type[0])
-    
-    if target_type_for_init.startswith("RL_"):
-        # Load once per batch
-        _, policy_obj = _init_target_policy(config, preloaded_policy=None)
-        preloaded_target_policy = policy_obj
 
     policy_manager = PolicyManager()
 
@@ -501,39 +493,7 @@ def _init_target_policy(config, preloaded_policy=None):
         target_strategy = target_strategy or current_type
         policy_cls = TARGET_POLICY_REGISTRY[current_type]
         return target_strategy, policy_cls()
-    elif current_type.startswith("RL_"):
-        # Handle RL Targets
-        if preloaded_policy is not None:
-             return current_type, preloaded_policy
 
-        if not config.target_model_path:
-            raise ValueError("Must provide --target_model_path when using RL targets")
-        
-        style = current_type.split("_")[1].lower() 
-        if os.path.isdir(config.target_model_path):
-             # Try exact match first
-             candidate = os.path.join(config.target_model_path, f"{style}.pth")
-             if os.path.exists(candidate):
-                 model_file = candidate
-             else:
-                 # Try fuzzy match (e.g. survival_12345.pth)
-                 import glob
-                 candidates = glob.glob(os.path.join(config.target_model_path, f"{style}*.pth"))
-                 if candidates:
-                     # Sort by modification time or name length? 
-                     # Usually we want the one with highest number if it is step count.
-                     # But file system sort is usually fine if format is standard. 
-                     # Let's take the last one alphabetically which usually works for timestamp/step count if fixed width, 
-                     # or just latest modified.
-                     candidates.sort(key=os.path.getmtime)
-                     model_file = candidates[-1]
-                     print(f"Auto-selected latest model file for {style}: {os.path.basename(model_file)}")
-                 else:
-                      raise FileNotFoundError(f"No model file found for style '{style}' in {config.target_model_path}")
-        else:
-             model_file = config.target_model_path
-        
-        return current_type, RLTargetPolicy(model_file)
     else:
         raise ValueError(f"Unsupported target type: {current_type}")
 

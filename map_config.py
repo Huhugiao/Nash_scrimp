@@ -49,13 +49,15 @@ pixel_size = 4
 target_speed = 2.0
 tracker_speed = 2.6  # pixels/step
 
-# Acceleration limits (Removed - System is now Velocity-based)
-# tracker_max_acc, target_max_acc, etc. are deprecated.
 
 # 物理极限 (Max Speed/Angular Speed)
 # tracker_speed defined above (2.4)
-tracker_max_angular_speed = 5 # degrees/step
-target_max_angular_speed = 10.0 # degrees/step
+tracker_max_angular_speed = 5  # degrees/step
+target_max_angular_speed = 10.0  # degrees/step
+
+# 兼容性别名：env_lib.agent_move 使用这些参数名
+tracker_max_turn_deg = tracker_max_angular_speed
+target_max_turn_deg = target_max_angular_speed
 
 # 捕获逻辑（保持接口，但参数更“紧凑”）
 capture_radius = 25.0

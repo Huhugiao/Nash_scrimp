@@ -70,11 +70,8 @@ def write_to_tensorboard(global_summary, step: int, performance_dict: Optional[D
     # 3. Losses (Grouped under Loss/)
     if mb_loss:
         loss_vals = np.nanmean(np.asarray(mb_loss, dtype=np.float32), axis=0)
-        # Original names: ['total', 'policy', 'entropy', 'value', 'adv_std', 'approx_kl', 'value_clip_frac', 'clipfrac', 'grad_norm', 'adv_mean']
-        # User wants to remove value_clip_frac (index 6).
-        # Let's map indices to names manually to be safe and clean.
-        # 0: total, 1: policy, 2: entropy, 3: value, 4: adv_std, 5: approx_kl, 6: SKIP, 7: clipfrac, 8: grad_norm, 9: adv_mean
-        
+        # Original names: ['total', 'policy', 'entropy', 'value', 'adv_std', 'approx_kl', 'residual_penalty', 'clipfrac', 'grad_norm', 'adv_mean']
+        # 6 号位在残差训练时记录 residual_penalty，其余训练可忽略
         mapping = {
             0: 'Total',
             1: 'Policy',
@@ -82,7 +79,7 @@ def write_to_tensorboard(global_summary, step: int, performance_dict: Optional[D
             3: 'Value',
             4: 'Adv_Std',
             5: 'Approx_KL',
-            # 6: value_clip_frac - SKIPPED
+            6: 'Residual_Penalty',
             7: 'Clip_Frac',
             8: 'Grad_Norm',
             9: 'Adv_Mean'

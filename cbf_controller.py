@@ -16,8 +16,8 @@ from map_config import EnvParameters
 # ============================================================================
 
 GAMMA_DISTANCE_THRESHOLD = 15.0      # gamma = 1 if distance > threshold else 5
-CBF_VISIBILITY_MARGIN = 40.0         # Safety margin for visibility barrier
-CBF_OBSTACLE_MARGIN = map_config.agent_radius * 4        
+CBF_VISIBILITY_MARGIN = 10.0         # Reduced from 40 for better feasibility
+CBF_OBSTACLE_MARGIN = map_config.agent_radius * 1.5  # Reduced from 4x for better feasibility
 CBF_OBSTACLE_L_WEIGHT = 1.5          # Angular weight for obstacle constraint (l in cbf_qp.py)
 
 # Tracker Control Gains (追踪控制增益)

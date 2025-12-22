@@ -218,6 +218,7 @@ class Model(object):
         grad_norm = 0.0
         adv_mean = 0.0
         adv_std = 0.0
+        residual_penalty_value = 0.0
 
         if actor_obs is not None:
             # Convert to tensors — expect flattened per-sample inputs
@@ -292,8 +293,16 @@ class Model(object):
             value_loss_t = (torch.max(v_loss1, v_loss2) * mask).sum() / mask.sum().clamp_min(1.0)
             value_loss = value_loss_t.item()
 
+            residual_penalty_value = 0.0
+            residual_penalty_t = None
+            if getattr(self, "residual_penalty_coef", 0.0) > 0.0:
+                residual_penalty_t = (torch.tanh(actions) ** 2).sum(dim=-1)
+                residual_penalty_t = (residual_penalty_t * mask).sum() / mask.sum().clamp_min(1.0)
+                residual_penalty_value = float(residual_penalty_t.item())
+
             total_loss_t = policy_loss_t + TrainingParameters.EX_VALUE_COEF * value_loss_t + TrainingParameters.ENTROPY_COEF * entropy_loss_t
-            
+            if residual_penalty_t is not None:
+                total_loss_t = total_loss_t + self.residual_penalty_coef * residual_penalty_t
             if TrainingParameters.USE_Q_CRITIC:
                 agent_actions_flat = torch.tanh(actions).reshape(-1, actions.shape[-1])
                 returns_flat = returns.reshape(-1)
@@ -303,6 +312,7 @@ class Model(object):
                 q_loss_value = float(q_loss.item())
 
             total_loss_t.backward()
+            total_loss = total_loss_t.item()
             total_loss = total_loss_t.item()
             
             # Save RL gradients
@@ -367,10 +377,12 @@ class Model(object):
                 if param.grad is not None:
                     param.grad = torch.nan_to_num(param.grad)
 
-            self.net_optimizer.step()
-
-        losses = [total_loss, policy_loss, entropy_loss, value_loss,
-                  adv_std, approx_kl, 0.0, clipfrac, grad_norm, adv_mean]
+        if hasattr(self, 'residual_penalty_coef'):
+            losses = [total_loss, policy_loss, entropy_loss, value_loss,
+                      adv_std, approx_kl, residual_penalty_value, clipfrac, grad_norm, adv_mean]
+        else:
+            losses = [total_loss, policy_loss, entropy_loss, value_loss,
+                      adv_std, approx_kl, 0.0, clipfrac, grad_norm, adv_mean]
         return {
             'losses': losses, 
             'il_loss': il_loss_value, 
