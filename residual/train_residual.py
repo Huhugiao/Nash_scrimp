@@ -1,8 +1,9 @@
-
 import os
 import sys
 import math
 import random
+import datetime
+from collections import deque
 import numpy as np
 import torch
 import ray
@@ -15,14 +16,11 @@ os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-try:
-    import setproctitle
-except Exception:
-    setproctitle = None
+import setproctitle
 
-from mlp.alg_parameters_mlp import *
-from mlp.model_residual import ResidualModel
-from mlp.runner_residual import ResidualRunner
+from residual.alg_parameters_residual import *
+from residual.model_residual import ResidualModel
+from residual.runner_residual import ResidualRunner
 from mlp.util_mlp import set_global_seeds, make_gif, write_to_tensorboard
 from mlp.policymanager_mlp import PolicyManager
 
@@ -31,6 +29,7 @@ def extract_rl_data_from_rollout(rollout_data):
     return {
         'actor_obs': data['actor_obs'],
         'critic_obs': data['critic_obs'],
+        'radar_obs': data['radar_obs'],  # For gate training
         'returns': data['returns'],
         'values': data['values'],
         'actions': data['actions'],
@@ -59,6 +58,7 @@ def _flush_segments(rollout, start, end, window_size, segments):
         segments.append({
             'actor_obs': rollout['actor_obs'][cursor:seg_end],
             'critic_obs': rollout['critic_obs'][cursor:seg_end],
+            'radar_obs': rollout['radar_obs'][cursor:seg_end],
             'returns': rollout['returns'][cursor:seg_end],
             'values': rollout['values'][cursor:seg_end],
             'actions': rollout['actions'][cursor:seg_end],
@@ -75,6 +75,7 @@ def collate_segments(batch_segments):
     batch = {
         'actor_obs': np.zeros((batch_size, max_len, NetParameters.ACTOR_RAW_LEN), dtype=np.float32),
         'critic_obs': np.zeros((batch_size, max_len, NetParameters.CRITIC_RAW_LEN), dtype=np.float32),
+        'radar_obs': np.zeros((batch_size, max_len, NetParameters.RADAR_DIM), dtype=np.float32),
         'returns': np.zeros((batch_size, max_len), dtype=np.float32),
         'values': np.zeros((batch_size, max_len), dtype=np.float32),
         'actions': np.zeros((batch_size, max_len, NetParameters.ACTION_DIM), dtype=np.float32),
@@ -85,6 +86,7 @@ def collate_segments(batch_segments):
         l = len(seg['actor_obs'])
         batch['actor_obs'][i, :l] = seg['actor_obs']
         batch['critic_obs'][i, :l] = seg['critic_obs']
+        batch['radar_obs'][i, :l] = seg['radar_obs']
         batch['returns'][i, :l] = seg['returns']
         batch['values'][i, :l] = seg['values']
         batch['actions'][i, :l] = seg['actions']
@@ -104,9 +106,10 @@ def compute_performance_stats(performance_dict):
     return stats
 
 def get_scheduled_lr(current_step):
-    final_lr = 3e-5 # Simple fixed final LR or derived from params
-    initial_lr = ResidualRLParameters.RESIDUAL_LR
-    max_steps = ResidualRLParameters.RESIDUAL_MAX_STEPS
+    """Cosine annealing learning rate scheduler."""
+    initial_lr = TrainingParameters.lr
+    final_lr = TrainingParameters.LR_FINAL
+    max_steps = TrainingParameters.N_MAX_STEPS
     progress = min(max(current_step / max_steps, 0.0), 1.0)
     weight = 0.5 * (1.0 + math.cos(math.pi * progress))
     return final_lr + (initial_lr - final_lr) * weight
@@ -114,14 +117,43 @@ def get_scheduled_lr(current_step):
 def get_scheduled_n_epochs(current_step):
     initial = TrainingParameters.N_EPOCHS_INITIAL
     final = TrainingParameters.N_EPOCHS_FINAL
-    max_steps = ResidualRLParameters.RESIDUAL_MAX_STEPS
+    max_steps = TrainingParameters.N_MAX_STEPS
     progress = min(max(current_step / max_steps, 0.0), 1.0)
     weight = 0.5 * (1.0 + math.cos(math.pi * progress))
     n_epochs = final + (initial - final) * weight
     return max(int(round(n_epochs)), 1)
 
+def run_evaluation(envs, model_weights, opponent_weights, num_episodes):
+    """
+    Run evaluation episodes with greedy policy (no exploration).
+    Returns aggregated performance statistics.
+    """
+    eval_results = {'per_r': [], 'per_episode_len': [], 'win': []}
+    episodes_collected = 0
+    
+    while episodes_collected < num_episodes:
+        # Run one batch of rollouts
+        jobs = [
+            envs[i].run.remote(model_weights, opponent_weights, 0, None)
+            for i in range(len(envs))
+        ]
+        results = ray.get(jobs)
+        
+        for result in results:
+            perf = result['performance']
+            eval_results['per_r'].extend(perf['per_r'])
+            eval_results['per_episode_len'].extend(perf['per_episode_len'])
+            eval_results['win'].extend(perf['win'])
+            episodes_collected += result['episodes']
+            
+            if episodes_collected >= num_episodes:
+                break
+    
+    return eval_results
+
+
 def main():
-    if not ResidualRLParameters.ENABLED:
+    if not ResidualRLConfig.ENABLED:
         print("Residual RL is disabled in parameters.")
         return
 
@@ -131,11 +163,11 @@ def main():
         
     set_global_seeds(SetupParameters.SEED)
     if setproctitle:
-        setproctitle.setproctitle(f"AvoidMaker_{ResidualRLParameters.EXPERIMENT_NAME}")
+        setproctitle.setproctitle(f"AvoidMaker_{ResidualRLConfig.EXPERIMENT_NAME}")
         
     # Paths
     TIME = datetime.datetime.now().strftime("_%m-%d-%H-%M")
-    EXP_NAME = ResidualRLParameters.EXPERIMENT_NAME
+    EXP_NAME = ResidualRLConfig.EXPERIMENT_NAME
     MODEL_PATH = f'./models/{EXP_NAME}{TIME}'
     SUMMARY_PATH = MODEL_PATH
     os.makedirs(MODEL_PATH, exist_ok=True)
@@ -174,13 +206,14 @@ def main():
     
     last_train_log_t = 0
     last_save_t = 0
+    last_eval_t = 0
     
     try:
         print(f"Starting Residual RL Training: {EXP_NAME}")
-        print(f"Base Model: {ResidualRLParameters.BASE_MODEL_PATH}")
-        print(f"Max Steps: {ResidualRLParameters.RESIDUAL_MAX_STEPS}")
+        print(f"Base Model: {ResidualRLConfig.BASE_MODEL_PATH}")
+        print(f"Max Steps: {TrainingParameters.N_MAX_STEPS}")
         
-        while curr_steps < ResidualRLParameters.RESIDUAL_MAX_STEPS:
+        while curr_steps < TrainingParameters.N_MAX_STEPS:
             new_lr = get_scheduled_lr(curr_steps)
             training_model.update_learning_rate(new_lr)
             
@@ -235,6 +268,7 @@ def main():
                         # Flatten
                         actor_flat = batch['actor_obs'].reshape(-1, NetParameters.ACTOR_RAW_LEN)
                         critic_flat = batch['critic_obs'].reshape(-1, NetParameters.CRITIC_RAW_LEN)
+                        radar_flat = batch['radar_obs'].reshape(-1, NetParameters.RADAR_DIM)
                         returns_flat = batch['returns'].reshape(-1)
                         values_flat = batch['values'].reshape(-1)
                         actions_flat = batch['actions'].reshape(-1, NetParameters.ACTION_DIM)
@@ -246,6 +280,7 @@ def main():
                             'global_step': curr_steps,
                             'actor_obs': actor_flat,
                             'critic_obs': critic_flat,
+                            'radar_obs': radar_flat,  # For gate training
                             'returns': returns_flat,
                             'values': values_flat,
                             'actions': actions_flat,
@@ -264,20 +299,64 @@ def main():
                 last_train_log_t = curr_steps
                 train_stats = compute_performance_stats(epoch_perf_buffer) if epoch_perf_buffer['per_r'] else {}
                 
+                # Compute gate statistics
+                all_gate_values = []
+                for result in results:
+                    all_gate_values.extend(result['data']['gate_values'])
+                
+                gate_mean = float(np.mean(all_gate_values)) if all_gate_values else 0.0
+                gate_std = float(np.std(all_gate_values)) if all_gate_values else 0.0
+                
                 log_str = f"[TRAIN] step={curr_steps:,} | ep={curr_episodes:,} | LR={new_lr:.2e}"
                 if train_stats:
                     log_str += f" | Rew={train_stats.get('per_r_mean', 0):.2f} | Win={train_stats.get('win_mean', 0)*100:.1f}%"
+                log_str += f" | Gate={gate_mean:.3f}±{gate_std:.3f}"
                 print(log_str)
                 
                 if global_summary:
                      write_to_tensorboard(global_summary, curr_steps, performance_dict=epoch_perf_buffer, 
                                          mb_loss=epoch_loss_buffer, imitation_loss=[0.0, 0.0], q_loss=0.0, evaluate=False)
                      global_summary.add_scalar('Train/LR', new_lr, curr_steps)
+                     global_summary.add_scalar('Train/GateMean', gate_mean, curr_steps)
+                     global_summary.add_scalar('Train/GateStd', gate_std, curr_steps)
 
                 epoch_perf_buffer = {'per_r': [], 'per_episode_len': [], 'win': []}
                 epoch_loss_buffer = []
 
-            # Save
+            # Periodic Evaluation
+            if curr_steps - last_eval_t >= RecordingParameters.EVAL_INTERVAL:
+                last_eval_t = curr_steps
+                print(f"[EVAL] Running evaluation at step={curr_steps}...")
+                
+                model_weights = training_model.get_weights()
+                eval_results = run_evaluation(envs, model_weights, opponent_weights, RecordingParameters.EVAL_EPISODES)
+                eval_stats = compute_performance_stats(eval_results)
+                
+                eval_reward = eval_stats.get('per_r_mean', 0.0)
+                eval_win_rate = eval_stats.get('win_mean', 0.0) * 100
+                
+                print(f"[EVAL] step={curr_steps:,} | Reward={eval_reward:.2f} | WinRate={eval_win_rate:.1f}%")
+                
+                if global_summary:
+                    global_summary.add_scalar('Eval/Reward', eval_reward, curr_steps)
+                    global_summary.add_scalar('Eval/WinRate', eval_win_rate, curr_steps)
+                    global_summary.add_scalar('Eval/EpisodeLen', eval_stats.get('per_episode_len_mean', 0.0), curr_steps)
+                
+                # Best Model Saving (based on evaluation reward)
+                if eval_reward > best_perf:
+                    best_perf = eval_reward
+                    best_path = os.path.join(MODEL_PATH, 'best_model')
+                    os.makedirs(best_path, exist_ok=True)
+                    torch.save({
+                        'model': training_model.get_weights(),
+                        'step': curr_steps,
+                        'episode': curr_episodes,
+                        'eval_reward': eval_reward,
+                        'eval_win_rate': eval_win_rate
+                    }, os.path.join(best_path, 'checkpoint.pth'))
+                    print(f"[BEST] New best model saved! Reward={eval_reward:.2f} WinRate={eval_win_rate:.1f}%")
+
+            # Save Latest Model
             if curr_steps - last_save_t >= RecordingParameters.SAVE_INTERVAL:
                 last_save_t = curr_steps
                 latest_path = os.path.join(MODEL_PATH, 'latest_model')

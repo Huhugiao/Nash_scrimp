@@ -130,13 +130,10 @@ class RecordingParameters:
     
     # 环境安全层开关 (训练时)
     ENABLE_SAFETY_LAYER = False   # True: 环境辅助避障, False: 纯 RL 自主学习避障
-    BOUNCE_ON_COLLISION = True    # True: 碰撞后弹回25像素+惩罚-3, False: 碰撞后终止+惩罚-20
-    
     # 根据激活的 targets 自动命名
     _targets = list(TrainingParameters.RANDOM_OPPONENT_WEIGHTS.get("target", {}).keys())
     EXPERIMENT_NAME = f"rl_{_targets[0] if len(_targets) == 1 else 'all'}"
     EXPERIMENT_NAME += "_collision" if not ENABLE_SAFETY_LAYER else ""
-    EXPERIMENT_NAME += "_bounce" if BOUNCE_ON_COLLISION else ""
     
     ENTITY = "user"
     EXPERIMENT_NOTE = "MLP PPO training with separate radar encoding"
@@ -146,7 +143,7 @@ class RecordingParameters:
     FRESH_RETRAIN = False     # 仅加载模型权重，重置训练进度和学习率调度
     RESTORE_DIR = "./models/rl_CoverSeeker_collision_12-19-12-30/latest_model/checkpoint.pth"       # 恢复模型的目录
     
-    WANDB = False            # 是否使用WandB
+
     TENSORBOARD = True       # 是否使用TensorBoard
     TXT_LOG = True           # 是否记录TXT日志
     
@@ -167,3 +164,32 @@ class RecordingParameters:
         'total', 'policy', 'entropy', 'value', 'adv_std', 
         'approx_kl', 'value_clip_frac', 'clipfrac', 'grad_norm', 'adv_mean'
     ]
+
+
+class ResidualRLParameters:
+    """
+    Residual RL 训练参数
+    条件式残差网络：基础模型冻结，残差网络在危险时激活进行避障修正
+    """
+    ENABLED = True
+    EXPERIMENT_NAME = "residual_avoidance"
+    
+    # Base model path (frozen, pre-trained tracker)
+    BASE_MODEL_PATH = "./models/rl_CoverSeeker_collision_12-19-12-30/best_model/checkpoint.pth"
+    
+    # Residual network architecture (smaller than main network)
+    RESIDUAL_HIDDEN_DIM = 64         # 隐藏层维度
+    RESIDUAL_NUM_LAYERS = 2          # 隐藏层数
+    RESIDUAL_MAX_SCALE = 0.5         # Residual 最大幅度 [-0.5, 0.5]
+    
+    # Danger gate settings (controls when residual activates)
+    DANGER_THRESHOLD = 0.3           # 归一化雷达距离 < 此值时认为危险
+    USE_LEARNED_GATE = True          # True: 学习门控权重, False: 规则门控
+    GATE_HIDDEN_DIM = 32             # 门控网络隐藏维度
+    
+    # Training hyperparameters
+    RESIDUAL_LR = 1e-4               # 学习率 (比主网络低)
+    RESIDUAL_MAX_STEPS = 5e6         # 最大训练步数
+    ACTION_PENALTY_COEF = 0.01       # L2 惩罚系数 (鼓励小 residual)
+    GATE_ENTROPY_COEF = 0.01         # 门控熵正则化 (鼓励探索)
+    GATE_LR_MULTIPLIER = 2.0         # Gate 学习率倍率

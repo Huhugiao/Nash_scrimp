@@ -1,9 +1,9 @@
 import numpy as np
 import torch
 import ray
-from mlp.alg_parameters_mlp import *
+from residual.alg_parameters_residual import *
 from mlp.model_mlp import Model as BaseModel  # For loading base policy
-from mlp.nets_residual import ResidualPolicyNetwork
+from residual.nets_residual import ResidualPolicyNetwork
 from mlp.util_mlp import set_global_seeds
 from env import TrackingEnv
 from mlp.policymanager_mlp import PolicyManager
@@ -11,13 +11,15 @@ from mlp.policymanager_mlp import PolicyManager
 @ray.remote(num_cpus=1, num_gpus=SetupParameters.NUM_GPU / max((TrainingParameters.N_ENVS + 1), 1))
 class ResidualRunner(object):
     """
-    Runner for Residual RL Training.
+    Runner for Residual RL Training (Simplified Radar-Only).
     
     Manages interaction:
     1. Get Base Action (Frozen RL)
-    2. Get Residual Action (Trainable)
-    3. Fuse: action = clip(base + residual)
+    2. Get Residual Action from radar (Trainable)
+    3. Fuse: action = base + residual
     4. Step Environment
+    
+    Note: No Gate - Actor learns to output ~0 when safe via L2 penalty.
     """
     def __init__(self, env_id):
         self.ID = env_id
@@ -26,9 +28,9 @@ class ResidualRunner(object):
         self.local_device = torch.device('cuda') if SetupParameters.USE_GPU_LOCAL else torch.device('cpu')
         
         # --- Load Frozen Base Model ---
-        print(f"ResidualRunner {env_id}: Loading base model from {ResidualRLParameters.BASE_MODEL_PATH}")
+        print(f"ResidualRunner {env_id}: Loading base model from {ResidualRLConfig.BASE_MODEL_PATH}")
         self.base_model = BaseModel(self.local_device)
-        checkpoint = torch.load(ResidualRLParameters.BASE_MODEL_PATH, map_location=self.local_device)
+        checkpoint = torch.load(ResidualRLConfig.BASE_MODEL_PATH, map_location=self.local_device)
         # Handle cases where checkpoint structure might differ
         if 'model_weights' in checkpoint:
             self.base_model.set_weights(checkpoint['model_weights'])
@@ -54,15 +56,17 @@ class ResidualRunner(object):
 
     def reset_env(self):
         obs_tuple = self.env.reset()
+        # Gymnasium reset returns (obs, info), obs is (tracker_obs, target_obs)
         if isinstance(obs_tuple, tuple) and len(obs_tuple) == 2:
-            try:
-                self.tracker_obs, self.target_obs = obs_tuple[0]
-            except Exception:
-                self.tracker_obs = obs_tuple[0]
-                self.target_obs = obs_tuple[0]
+            obs, info = obs_tuple
+            if isinstance(obs, (tuple, list)) and len(obs) == 2:
+                self.tracker_obs, self.target_obs = obs
+            else:
+                self.tracker_obs = obs
+                self.target_obs = obs
         else:
-            self.tracker_obs = obs_tuple[0] if isinstance(obs_tuple, tuple) else obs_tuple
-            self.target_obs = self.tracker_obs
+            self.tracker_obs = obs_tuple
+            self.target_obs = obs_tuple
         
         self.tracker_obs = np.asarray(self.tracker_obs, dtype=np.float32)
         self.target_obs = np.asarray(self.target_obs, dtype=np.float32)
@@ -81,7 +85,7 @@ class ResidualRunner(object):
 
     def run(self, residual_weights, opponent_weights, total_steps, policy_manager_state=None):
         """
-        Execute rollout with Residual Policy.
+        Execute rollout with Gated Residual Policy.
         """
         with torch.no_grad():
             # Sync weights
@@ -100,13 +104,18 @@ class ResidualRunner(object):
             data = {
                 'actor_obs': np.zeros((n_steps, NetParameters.ACTOR_RAW_LEN), dtype=np.float32),
                 'critic_obs': np.zeros((n_steps, NetParameters.CRITIC_RAW_LEN), dtype=np.float32),
+                'radar_obs': np.zeros((n_steps, NetParameters.RADAR_DIM), dtype=np.float32),  # For gate training
                 'rewards': np.zeros(n_steps, dtype=np.float32),
                 'values': np.zeros(n_steps, dtype=np.float32),
-                'actions': np.zeros((n_steps, NetParameters.ACTION_DIM), dtype=np.float32), # This stores residual action
+                'actions': np.zeros((n_steps, NetParameters.ACTION_DIM), dtype=np.float32),
                 'logp': np.zeros(n_steps, dtype=np.float32),
                 'dones': np.zeros(n_steps, dtype=np.bool_),
                 'episode_starts': np.zeros(n_steps, dtype=np.bool_),
-                'base_actions': np.zeros((n_steps, NetParameters.ACTION_DIM), dtype=np.float32), # Store base action for analysis
+                
+                # Extra logs
+                'base_actions': np.zeros((n_steps, NetParameters.ACTION_DIM), dtype=np.float32),
+                'residual_actions': np.zeros((n_steps, NetParameters.ACTION_DIM), dtype=np.float32),
+                'gate_values': np.zeros(n_steps, dtype=np.float32),
                 'episode_success': []
             }
             
@@ -126,62 +135,71 @@ class ResidualRunner(object):
                 critic_obs_full = np.concatenate([self.tracker_obs, self.target_obs])
                 
                 # --- 1. Get Base Action (Frozen) ---
-                # We use evaluate() which returns deterministic/greedy action usually, but step() gives exploration.
-                # Since base is trained and frozen, we likely want its "best" action, so evaluate(greedy=True).
-                # But if we want it to react naturally, maybe regular step? Let's use evaluate(greedy=True) for stability.
                 base_action, _, _, _ = self.base_model.evaluate(self.tracker_obs, critic_obs_full, greedy=True)
+                base_action_tensor = torch.from_numpy(base_action).float().to(self.local_device).unsqueeze(0)
                 
-                # --- 2. Get Residual Action (Trainable) ---
-                # Convert obs to tensor for residual model
-                obs_tensor = torch.from_numpy(self.tracker_obs).float().to(self.local_device).unsqueeze(0)
-                mean, log_std = self.residual_model.actor(obs_tensor)
+                # --- 2. Extract radar observation (64-dim) ---
+                radar_obs = self.tracker_obs[NetParameters.ACTOR_SCALAR_LEN:]
+                radar_tensor = torch.from_numpy(radar_obs).float().to(self.local_device).unsqueeze(0)
                 
-                # Sample residual action (exploration)
+                # --- 3. Get Residual Action (Stochastic) from radar ---
+                mean, log_std = self.residual_model.actor(radar_tensor)
                 std = torch.exp(log_std)
                 noise = torch.randn_like(mean)
-                residual_pre_tanh = mean + std * noise 
+                residual_action_sampled = mean + std * noise
                 
-                residual_action_tanh = torch.tanh(residual_pre_tanh)
-                residual_pre_tanh_np = residual_pre_tanh.cpu().numpy()[0]
-                residual_action_np = residual_action_tanh.cpu().numpy()[0]
+                # Compute log probability
+                log_prob = -0.5 * (((residual_action_sampled - mean) / std).pow(2) + 2 * log_std + np.log(2 * np.pi)).sum(-1)
                 
-                # Calculate log prob (for verification, though PPO recomputes it)
-                # Note: We need log_prob of the *residual action* from the *residual distribution*.
-                log_prob = -0.5 * (((residual_pre_tanh - mean) / std).pow(2) + 2 * log_std + np.log(2 * np.pi)).sum(-1)
-                log_prob -= (2 * (np.log(2) - residual_pre_tanh - torch.nn.functional.softplus(-2 * residual_pre_tanh))).sum(-1)
-                log_prob_np = log_prob.cpu().numpy()[0]
+                # --- 4. Fuse Actions (No Gate) ---
+                fused_action = ResidualPolicyNetwork.fuse_actions(
+                    base_action_tensor, 
+                    residual_action_sampled
+                )
+                final_action_np = fused_action.cpu().numpy()[0]
                 
-                # Get value estimate
-                critic_tensor = torch.from_numpy(critic_obs_full).float().to(self.local_device).unsqueeze(0)
-                value_pred = self.residual_model.critic(critic_tensor).item()
+                # --- 5. Get Value from radar ---
+                value_pred = self.residual_model.critic(radar_tensor).item()
                 
-                # --- 3. Action Fusion ---
-                # Final Action = clip(Base + Residual, -1, 1)
-                final_action = np.clip(base_action + residual_action_np, -1.0, 1.0)
-                
-                # --- 4. Step Environment ---
+                # --- 6. Step Environment ---
                 target_action = self._get_opponent_action(self.target_obs, self.tracker_obs)
                 
-                # Update env step call with kwarg (will be implemented in env.py later)
-                # IMPORTANT: We rely on env.step accepting residual_action
-                obs_result, reward, terminated, truncated, info = self.env.step(
-                    (final_action, target_action),
-                    residual_action=residual_action_np,
-                    action_penalty_coef=ResidualRLParameters.ACTION_PENALTY_COEF
+                obs_result, env_reward, terminated, truncated, info = self.env.step(
+                    (final_action_np, target_action)
                 )
+                
+                # === Reward for Residual Learning (No Gate) ===
+                # Reward = Collision Penalty + L2 Regularization on Residual
+                # Actor learns to output ~0 when safe via L2 penalty
+                
+                # 1. Collision penalty
+                if info.get('tracker_collision', False):
+                    collision_penalty = -10.0
+                else:
+                    collision_penalty = 0.0
+                
+                # 2. L2 penalty on raw residual action magnitude
+                residual_magnitude = float(np.linalg.norm(residual_action_sampled.cpu().numpy()[0]))
+                l2_penalty = -ResidualRLConfig.ACTION_PENALTY_COEF * residual_magnitude
+                
+                reward = collision_penalty + l2_penalty
                 
                 done = terminated or truncated
 
                 # Store data
                 data['actor_obs'][i] = self.tracker_obs
                 data['critic_obs'][i] = critic_obs_full
+                data['radar_obs'][i] = radar_obs  # 64-dim radar for training
                 data['values'][i] = value_pred
-                data['actions'][i] = residual_pre_tanh_np # Store PRE-TANH for PPO Training!
-                data['logp'][i] = log_prob_np
+                data['actions'][i] = residual_action_sampled.cpu().numpy()[0]
+                data['logp'][i] = log_prob.cpu().numpy()[0]
                 data['rewards'][i] = reward
                 data['dones'][i] = done
                 data['episode_starts'][i] = episode_start
+                
                 data['base_actions'][i] = base_action
+                data['residual_actions'][i] = residual_action_sampled.cpu().numpy()[0]
+                data['gate_values'][i] = 1.0  # Always 1.0 (no gate)
                 
                 episode_start = False
                 episode_reward += float(reward)
@@ -227,10 +245,10 @@ class ResidualRunner(object):
                     current_episode_idx = i + 1
                     self.reset_env()
 
-            # GAE Calculation (Standard)
-            critic_obs_last = np.concatenate([self.tracker_obs, self.target_obs])
-            critic_tensor_last = torch.from_numpy(critic_obs_last).float().to(self.local_device).unsqueeze(0)
-            last_value = self.residual_model.critic(critic_tensor_last).item()
+            # GAE Calculation
+            radar_last = self.tracker_obs[NetParameters.ACTOR_SCALAR_LEN:]
+            radar_tensor_last = torch.from_numpy(radar_last).float().to(self.local_device).unsqueeze(0)
+            last_value = self.residual_model.critic(radar_tensor_last).item()
             
             advantages = np.zeros_like(data['rewards'])
             lastgaelam = 0.0

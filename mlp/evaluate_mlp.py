@@ -127,23 +127,8 @@ def run_battle_batch(args):
     batch_results = []
 
     for episode_idx in episode_indices:
-        try:
-            result = run_single_episode(config, episode_idx, tracker_model, target_model, device, policy_manager, preloaded_target_policy=preloaded_target_policy)
-            batch_results.append(result)
-        except Exception as e:
-            print(f"Error in episode {episode_idx}: {e}")
-            batch_results.append({
-                "episode_id": episode_idx,
-                "steps": 0,
-                "reward": 0.0,
-                "tracker_caught_target": False,
-                "target_reached_exit": False,
-                "tracker_type": config.tracker_type,
-                "target_type": config.target_type,
-                "tracker_strategy": config.specific_tracker_strategy or config.tracker_type,
-                "target_strategy": config.specific_target_strategy or config.target_type,
-                "debug_info": {"error": str(e)} if config.debug else None
-            })
+        result = run_single_episode(config, episode_idx, tracker_model, target_model, device, policy_manager, preloaded_target_policy=preloaded_target_policy)
+        batch_results.append(result)
 
     return batch_results
 
@@ -151,21 +136,20 @@ def run_battle_batch(args):
 def run_single_episode(config, episode_idx, tracker_model, target_model, device, policy_manager, preloaded_target_policy=None, force_save_gif=False):
     map_config.set_obstacle_density(config.obstacle_density)
     env = TrackingEnv(enable_safety_layer=config.enable_safety_layer)
-    try:
-        obs_result = env.reset()
-        # unpack observation
-        if isinstance(obs_result, tuple) and len(obs_result) == 2:
-            obs = obs_result[0]
-            if isinstance(obs, (tuple, list)) and len(obs) == 2:
-                tracker_obs, target_obs = obs
-            else:
-                tracker_obs = target_obs = obs
+    obs_result = env.reset()
+    # unpack observation
+    if isinstance(obs_result, tuple) and len(obs_result) == 2:
+        obs = obs_result[0]
+        if isinstance(obs, (tuple, list)) and len(obs) == 2:
+            tracker_obs, target_obs = obs
         else:
-            obs = obs_result
-            if isinstance(obs, (tuple, list)) and len(obs) == 2:
-                tracker_obs, target_obs = obs
-            else:
-                tracker_obs = target_obs = obs
+            tracker_obs = target_obs = obs
+    else:
+        obs = obs_result
+        if isinstance(obs, (tuple, list)) and len(obs) == 2:
+            tracker_obs, target_obs = obs
+        else:
+            tracker_obs = target_obs = obs
 
         done = False
         episode_step = 0
@@ -199,12 +183,9 @@ def run_single_episode(config, episode_idx, tracker_model, target_model, device,
             target_policy_obj.reset()
 
         if should_record:
-            try:
-                frame = env.render(mode='rgb_array')
-                if frame is not None:
-                    episode_frames.append(frame)
-            except Exception:
-                should_record = False
+            frame = env.render(mode='rgb_array')
+            if frame is not None:
+                episode_frames.append(frame)
 
         with torch.no_grad():
             while not done and episode_step < EnvParameters.EPISODE_LEN:
@@ -291,12 +272,9 @@ def run_single_episode(config, episode_idx, tracker_model, target_model, device,
                     stats['collision_type'] = "tracker_collision"
 
                 if should_record:
-                    try:
-                        frame = env.render(mode='rgb_array')
-                        if frame is not None:
-                            episode_frames.append(frame)
-                    except Exception:
-                        should_record = False
+                    frame = env.render(mode='rgb_array')
+                    if frame is not None:
+                        episode_frames.append(frame)
 
         save_gif = False
         if config.debug:
@@ -309,14 +287,11 @@ def run_single_episode(config, episode_idx, tracker_model, target_model, device,
         save_dir = config.run_dir if config.run_dir else (config.main_output_dir or config.output_dir)
 
         if save_gif and len(episode_frames) > 1:
-            try:
-                if config.debug:
-                    gif_path = os.path.join(save_dir, f"debug_fail_episode_{episode_idx:03d}.gif")
-                else:
-                    gif_path = os.path.join(save_dir, f"episode_{episode_idx:03d}.gif")
-                make_gif(episode_frames, gif_path, fps=EnvParameters.N_ACTIONS // 2)
-            except Exception:
-                pass
+            if config.debug:
+                gif_path = os.path.join(save_dir, f"debug_fail_episode_{episode_idx:03d}.gif")
+            else:
+                gif_path = os.path.join(save_dir, f"episode_{episode_idx:03d}.gif")
+            make_gif(episode_frames, gif_path, fps=EnvParameters.N_ACTIONS // 2)
 
         debug_info = None
         if config.debug and not tracker_caught_target:
@@ -388,9 +363,6 @@ def run_single_episode(config, episode_idx, tracker_model, target_model, device,
                     debug_info["tracker_pos"] = np.array(t_pos).tolist()
                 if g_pos is not None:
                     debug_info["target_pos"] = np.array(g_pos).tolist()
-
-            except Exception as e:
-                print(f"Failed to construct debug info: {e}")
 
         return {
             "episode_id": episode_idx,
@@ -667,15 +639,11 @@ def run_battle(config, strategy_name=None):
         batch_episodes = list(range(batch_start, batch_end))
         batches.append((config, batch_episodes))
 
-    try:
-        ctx = multiprocessing.get_context('spawn')
-        with ctx.Pool(processes=num_processes) as pool:
-            batch_results = pool.map(run_battle_batch, batches)
-        for batch in batch_results:
-            results.extend(batch)
-    except Exception as e:
-        print(f"Error in parallel execution: {e}")
-        return None, None
+    ctx = multiprocessing.get_context('spawn')
+    with ctx.Pool(processes=num_processes) as pool:
+        batch_results = pool.map(run_battle_batch, batches)
+    for batch in batch_results:
+        results.extend(batch)
 
     if not results:
         print("No successful episodes completed!")
@@ -685,12 +653,9 @@ def run_battle(config, strategy_name=None):
         debug_failures = [r['debug_info'] for r in results if r.get('debug_info') is not None]
         if debug_failures:
             debug_path = os.path.join(config.run_dir, "debug_failures.json")
-            try:
-                with open(debug_path, 'w') as f:
-                    json.dump(debug_failures, f, indent=2)
-                print(f"Saved {len(debug_failures)} failure records to {debug_path}")
-            except Exception as e:
-                print(f"Failed to save debug failures: {e}")
+            with open(debug_path, 'w') as f:
+                json.dump(debug_failures, f, indent=2)
+            print(f"Saved {len(debug_failures)} failure records to {debug_path}")
 
     df = pd.DataFrame(results)
 
@@ -700,24 +665,20 @@ def run_battle(config, strategy_name=None):
     tracker_win_rate = float(df['tracker_caught_target'].mean()) if len(df) > 0 else 0.0
     target_win_rate = float(df['target_reached_exit'].mean()) if len(df) > 0 else 0.0
 
-    try:
-        results_path = os.path.join(config.run_dir, "results.csv")
-        df.to_csv(results_path, index=False)
+    results_path = os.path.join(config.run_dir, "results.csv")
+    df.to_csv(results_path, index=False)
 
-        stats = {
-            "total_episodes": len(df),
-            "avg_steps": avg_steps,
-            "avg_reward": avg_reward,
-            "tracker_win_rate": tracker_win_rate,
-            "target_win_rate": target_win_rate,
-            "tracker_strategy": config.specific_tracker_strategy or config.tracker_type,
-            "target_strategy": config.specific_target_strategy or config.target_type
-        }
-        stats_path = os.path.join(config.run_dir, "stats.csv")
-        pd.DataFrame([stats]).to_csv(stats_path, index=False)
-
-    except Exception as e:
-        print(f"Warning: Failed to save results: {e}")
+    stats = {
+        "total_episodes": len(df),
+        "avg_steps": avg_steps,
+        "avg_reward": avg_reward,
+        "tracker_win_rate": tracker_win_rate,
+        "target_win_rate": target_win_rate,
+        "tracker_strategy": config.specific_tracker_strategy or config.tracker_type,
+        "target_strategy": config.specific_target_strategy or config.target_type
+    }
+    stats_path = os.path.join(config.run_dir, "stats.csv")
+    pd.DataFrame([stats]).to_csv(stats_path, index=False))
 
     total_time = time.time() - start_time
 
@@ -730,10 +691,7 @@ def run_battle(config, strategy_name=None):
 
 
 if __name__ == "__main__":
-    try:
-        multiprocessing.set_start_method('spawn', force=True)
-    except RuntimeError:
-        pass
+    multiprocessing.set_start_method('spawn', force=True)
 
     available_tracker_strategies = get_available_policies("tracker")
     available_target_strategies = get_available_policies("target")

@@ -14,10 +14,7 @@ os.environ["MKL_NUM_THREADS"] = "1"
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-try:
-    import setproctitle
-except Exception:
-    setproctitle = None
+import setproctitle
 
 from torch.utils.tensorboard import SummaryWriter
 from map_config import EnvParameters
@@ -312,12 +309,9 @@ def _record_eval_gif(eval_env, agent_model, opponent_model, device, gif_path):
 	if eval_pm:
 		current_policy, current_opponent_id = eval_pm.sample_policy("target")
 		eval_pm.reset()
-	try:
-		frame = eval_env.render(mode='rgb_array')
-		if frame is not None:
-			frames.append(frame)
-	except Exception:
-		pass
+	frame = eval_env.render(mode='rgb_array')
+	if frame is not None:
+		frames.append(frame)
 	with torch.no_grad():
 		while not done and ep_len < EnvParameters.EPISODE_LEN:
 			critic_obs = np.concatenate([tracker_obs, target_obs], axis=0)
@@ -333,12 +327,9 @@ def _record_eval_gif(eval_env, agent_model, opponent_model, device, gif_path):
 			done = terminated or truncated
 			ep_len += 1
 			tracker_obs, target_obs = _parse_eval_obs(obs_result)
-			try:
-				frame = eval_env.render(mode='rgb_array')
-				if frame is not None:
-					frames.append(frame)
-			except Exception:
-				break
+			frame = eval_env.render(mode='rgb_array')
+			if frame is not None:
+				frames.append(frame)
 	if len(frames) > 1:
 		os.makedirs(os.path.dirname(gif_path), exist_ok=True)
 		make_gif(frames, gif_path, fps=EnvParameters.N_ACTIONS // 2)

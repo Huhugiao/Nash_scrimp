@@ -2,11 +2,8 @@ import math
 import numpy as np
 import map_config
 
-try:
-    import pygame
-    import pygame.gfxdraw
-except ImportError:
-    pygame = None
+import pygame
+import pygame.gfxdraw
 
 # --- Numba Acceleration ---
 try:
@@ -330,7 +327,7 @@ def ray_distances_multi(origin, angles_rad, max_range, padding=0.0):
 def reward_calculate(tracker, target, prev_tracker=None, prev_target=None,
                      tracker_collision=False, target_collision=False,
                      sector_captured=False, capture_progress=0, capture_required_steps=0,
-                     bounce_on_collision=False, radar=None):
+                     radar=None):
     """计算奖励函数"""
     info = {
         'capture_progress': int(capture_progress),
@@ -374,13 +371,9 @@ def reward_calculate(tracker, target, prev_tracker=None, prev_target=None,
         info['reason'] = 'tracker_caught_target'
         reward += success_reward
     elif tracker_collision:
-        if bounce_on_collision:
-            reward -= 3.0
-            info['reason'] = 'tracker_collision_bounce'
-        else:
-            terminated = True
-            reward -= success_reward
-            info['reason'] = 'tracker_collision'
+        terminated = True
+        reward -= success_reward
+        info['reason'] = 'tracker_collision'
 
     return float(reward), bool(terminated), False, info
 
@@ -531,7 +524,6 @@ def _draw_fov(surface, tracker, fov_points=None):
     """基于预计算的 fov_points 绘制半透明扇形。"""
     if pygame is None or not fov_points or len(fov_points) < 3:
         return
-    try:
         # 1. 绘制填充 (Fill)
         # 使用稍淡一点的颜色，减少视觉干扰
         fill_color = (80, 140, 255, 30) 
@@ -553,9 +545,6 @@ def _draw_fov(surface, tracker, fov_points=None):
         
         pygame.draw.line(surface, outline_color, c_int, pl_int, 1)
         pygame.draw.line(surface, outline_color, c_int, pr_int, 1)
-        
-    except Exception:
-        pass
 
 def _trace_ray_for_fov(origin, angle_rad, max_range):
     """占据栅格 DDA 不可用时的备份射线（粗到细）。"""
@@ -614,17 +603,14 @@ def _draw_capture_sector(surface, tracker):
         pts.append((cx + dist * ss * math.cos(ang), cy + dist * ss * math.sin(ang)))
 
     if len(pts) > 2:
-        try:
-            # 1. 填充
-            fill_color = getattr(map_config, 'CAPTURE_SECTOR_COLOR', (80, 200, 120, 40))
-            pygame.gfxdraw.filled_polygon(surface, pts, fill_color)
-            
-            # 2. 轮廓 - 增加清晰度
-            outline_color = (80, 200, 120, 200)
-            pygame.gfxdraw.aapolygon(surface, pts, outline_color)
-            pygame.draw.lines(surface, outline_color, True, pts, 1)
-        except Exception:
-            pass
+        # 1. 填充
+        fill_color = getattr(map_config, 'CAPTURE_SECTOR_COLOR', (80, 200, 120, 40))
+        pygame.gfxdraw.filled_polygon(surface, pts, fill_color)
+        
+        # 2. 轮廓 - 增加清晰度
+        outline_color = (80, 200, 120, 200)
+        pygame.gfxdraw.aapolygon(surface, pts, outline_color)
+        pygame.draw.lines(surface, outline_color, True, pts, 1)
 
 def get_canvas(target, tracker, tracker_traj, target_traj, surface=None, fov_points=None):
     w, h = map_config.width, map_config.height

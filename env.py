@@ -17,11 +17,10 @@ class TrackingEnv(gym.Env):
         'render_fps': 40
     }
 
-    def __init__(self, spawn_outside_fov=False, enable_safety_layer=True, bounce_on_collision=False):
+    def __init__(self, spawn_outside_fov=False, enable_safety_layer=True):
         super().__init__()
         self.spawn_outside_fov = bool(spawn_outside_fov)
         self.enable_safety_layer = bool(enable_safety_layer)
-        self.bounce_on_collision = bool(bounce_on_collision)
         self.mask_flag = getattr(map_config, 'mask_flag', False)
         self.width = map_config.width
         self.height = map_config.height
@@ -537,14 +536,6 @@ class TrackingEnv(gym.Env):
             tracker_center_y = self.tracker['y'] + self.pixel_size * 0.5
             if env_lib.is_point_blocked(tracker_center_x, tracker_center_y, padding=agent_radius):
                 tracker_corrected = True
-                if self.bounce_on_collision:
-                    bounce_dist = 25.0
-                    heading_rad = math.radians(self.tracker['theta'])
-                    new_x = self.tracker['x'] - bounce_dist * math.cos(heading_rad)
-                    new_y = self.tracker['y'] - bounce_dist * math.sin(heading_rad)
-                    self.tracker['x'] = float(np.clip(new_x, 0, self.width - self.pixel_size))
-                    self.tracker['y'] = float(np.clip(new_y, 0, self.height - self.pixel_size))
-                    self.tracker['v'] = 0.0
             target_center_x = self.target['x'] + self.pixel_size * 0.5
             target_center_y = self.target['y'] + self.pixel_size * 0.5
             if env_lib.is_point_blocked(target_center_x, target_center_y, padding=agent_radius):
@@ -571,25 +562,21 @@ class TrackingEnv(gym.Env):
             sector_captured=bool(sector_captured),
             capture_progress=int(self._capture_counter),
             capture_required_steps=int(self.capture_required_steps),
-            bounce_on_collision=self.bounce_on_collision,
             radar=tracker_radar
         )
 
-        try:
-            cur_dist = float(math.hypot(
-                self.tracker['x'] - self.target['x'],
-                self.tracker['y'] - self.target['y']
-            ))
-            if self._best_distance is None or cur_dist < (self._best_distance - 1e-6):
-                self._best_distance = cur_dist
-                info['closest_record_improved'] = True
-            else:
-                info['closest_record_improved'] = False
-            info['closest_record_value'] = float(
-                self._best_distance if self._best_distance is not None else cur_dist
-            )
-        except Exception:
-            pass
+        cur_dist = float(math.hypot(
+            self.tracker['x'] - self.target['x'],
+            self.tracker['y'] - self.target['y']
+        ))
+        if self._best_distance is None or cur_dist < (self._best_distance - 1e-6):
+            self._best_distance = cur_dist
+            info['closest_record_improved'] = True
+        else:
+            info['closest_record_improved'] = False
+        info['closest_record_value'] = float(
+            self._best_distance if self._best_distance is not None else cur_dist
+        )
 
         self.current_obs = self._get_obs_features()
         if self.step_count >= EnvParameters.EPISODE_LEN and not terminated:
@@ -604,16 +591,13 @@ class TrackingEnv(gym.Env):
         if hasattr(map_config, "regenerate_obstacles"):
             density_level = getattr(map_config, 'current_obstacle_density', None)
             map_config.regenerate_obstacles(density_level=density_level)
-        try:
-            env_lib.build_occupancy(
-                width=self.width,
-                height=self.height,
-                cell=getattr(map_config, 'occ_cell',
-                             getattr(map_config, 'pixel_size', self.pixel_size)),
-                obstacles=getattr(map_config, 'obstacles', [])
-            )
-        except Exception:
-            pass
+        env_lib.build_occupancy(
+            width=self.width,
+            height=self.height,
+            cell=getattr(map_config, 'occ_cell',
+                         getattr(map_config, 'pixel_size', self.pixel_size)),
+            obstacles=getattr(map_config, 'obstacles', [])
+        )
 
         self.step_count = 0
         self.target_frame_count = 0
@@ -643,13 +627,10 @@ class TrackingEnv(gym.Env):
         self.steps_since_observed = 0
         self._capture_counter = 0
 
-        try:
-            self._best_distance = float(math.hypot(
-                self.tracker['x'] - self.target['x'],
-                self.tracker['y'] - self.target['y']
-            ))
-        except Exception:
-            self._best_distance = None
+        self._best_distance = float(math.hypot(
+            self.tracker['x'] - self.target['x'],
+            self.tracker['y'] - self.target['y']
+        ))
 
         self._fov_cache = None
         self._fov_cache_valid = False

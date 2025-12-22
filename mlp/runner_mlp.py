@@ -15,8 +15,7 @@ class Runner(object):
         set_global_seeds(env_id * 123)
         # Use ENABLE_SAFETY_LAYER from RecordingParameters
         enable_safety = getattr(RecordingParameters, 'ENABLE_SAFETY_LAYER', True)
-        bounce = getattr(RecordingParameters, 'BOUNCE_ON_COLLISION', False) and not enable_safety
-        self.env = TrackingEnv(enable_safety_layer=enable_safety, bounce_on_collision=bounce)
+        self.env = TrackingEnv(enable_safety_layer=enable_safety)
         self.local_device = torch.device('cuda') if SetupParameters.USE_GPU_LOCAL else torch.device('cpu')
         
         self.agent_model = Model(self.local_device)
@@ -32,11 +31,9 @@ class Runner(object):
     def reset_env(self):
         obs_tuple = self.env.reset()
         if isinstance(obs_tuple, tuple) and len(obs_tuple) == 2:
-            try:
+            self.tracker_obs, self.target_obs = obs_tuple[0], obs_tuple[0]
+            if isinstance(obs_tuple[0], (tuple, list)) and len(obs_tuple[0]) == 2:
                 self.tracker_obs, self.target_obs = obs_tuple[0]
-            except Exception:
-                self.tracker_obs = obs_tuple[0]
-                self.target_obs = obs_tuple[0]
         else:
             self.tracker_obs = obs_tuple[0] if isinstance(obs_tuple, tuple) else obs_tuple
             self.target_obs = self.tracker_obs

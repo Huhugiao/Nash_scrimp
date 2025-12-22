@@ -17,13 +17,10 @@ def get_grad_projection(g1, g2):
 class Model(object):
     @staticmethod
     def _angle_limit() -> float:
-        try:
-            map_cfg = importlib.import_module('map_config')
-            # Try new parameter first, then fallback
-            limit = float(getattr(map_cfg, 'tracker_max_angular_speed', 
-                          getattr(map_cfg, 'max_turn_deg', 45.0)))
-        except Exception:
-            limit = 45.0
+        import importlib
+        map_cfg = importlib.import_module('map_config')
+        limit = float(getattr(map_cfg, 'tracker_max_angular_speed', 
+                      getattr(map_cfg, 'max_turn_deg', 45.0)))
         return max(1.0, limit)
 
     @staticmethod

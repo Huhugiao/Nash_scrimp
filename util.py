@@ -6,16 +6,7 @@ import torch
 from typing import Dict, List, Optional
 import map_config
 
-# 仅使用 PIL，移除 imageio
-try:
-    from PIL import Image as PILImage
-except ImportError:
-    PILImage = None
-
-try:
-    import wandb
-except Exception:
-    wandb = None
+from PIL import Image as PILImage
 
 from mlp.alg_parameters_mlp import *  # 使用通用参数
 from map_config import EnvParameters
@@ -129,43 +120,38 @@ def make_gif(images, file_name, fps=20):
     os.makedirs(osp.dirname(file_name), exist_ok=True)
     duration_ms = int(1000.0 / max(int(fps), 1))
 
-    try:
-        pil_frames = []
-        for fr in frames:
-            h, w = fr.shape[0], fr.shape[1]
-            scale = 1.0
-            if max(h, w) > max_side and max_side > 0:
-                scale = float(max_side) / float(max(h, w))
-            
-            img = PILImage.fromarray(fr)
-            if scale < 0.999:
-                new_w = max(1, int(round(w * scale)))
-                new_h = max(1, int(round(h * scale)))
-                img = img.resize((new_w, new_h), resample=PILImage.LANCZOS)
-            pil_frames.append(img)
-
-        if not pil_frames:
-            return
-
-        base_img = pil_frames[0].quantize(method=PILImage.ADAPTIVE, colors=256, dither=PILImage.NONE)
-        final_frames = [base_img]
-        for img in pil_frames[1:]:
-            q_img = img.quantize(palette=base_img, dither=PILImage.NONE)
-            final_frames.append(q_img)
-
-        final_frames[0].save(
-            file_name,
-            save_all=True,
-            append_images=final_frames[1:],
-            optimize=True,
-            duration=duration_ms,
-            loop=0
-        )
-        # Consolidated print as requested
-        print(f"GIF saved: {file_name} (frames={len(frames)})")
+    pil_frames = []
+    for fr in frames:
+        h, w = fr.shape[0], fr.shape[1]
+        scale = 1.0
+        if max(h, w) > max_side and max_side > 0:
+            scale = float(max_side) / float(max(h, w))
         
-    except Exception as e:
-        print(f"Failed to write gif {file_name}: {e}")
+        img = PILImage.fromarray(fr)
+        if scale < 0.999:
+            new_w = max(1, int(round(w * scale)))
+            new_h = max(1, int(round(h * scale)))
+            img = img.resize((new_w, new_h), resample=PILImage.LANCZOS)
+        pil_frames.append(img)
+
+    if not pil_frames:
+        return
+
+    base_img = pil_frames[0].quantize(method=PILImage.ADAPTIVE, colors=256, dither=PILImage.NONE)
+    final_frames = [base_img]
+    for img in pil_frames[1:]:
+        q_img = img.quantize(palette=base_img, dither=PILImage.NONE)
+        final_frames.append(q_img)
+
+    final_frames[0].save(
+        file_name,
+        save_all=True,
+        append_images=final_frames[1:],
+        optimize=True,
+        duration=duration_ms,
+        loop=0
+    )
+    print(f"GIF saved: {file_name} (frames={len(frames)})")
 
 
 def update_perf(one_ep, perf):
