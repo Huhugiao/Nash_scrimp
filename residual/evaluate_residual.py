@@ -84,13 +84,14 @@ def _get_target_policy(name: str):
     return TARGET_POLICY_REGISTRY[name]()
 
 
-def _fuse_action(base_action: np.ndarray, radar_obs: np.ndarray, residual_net: ResidualPolicyNetwork, device: torch.device) -> np.ndarray:
-    """Fuse base action with deterministic residual correction."""
+def _fuse_action(base_action: np.ndarray, radar_obs: np.ndarray, velocity_obs: np.ndarray, residual_net: ResidualPolicyNetwork, device: torch.device) -> np.ndarray:
+    """Fuse base action with deterministic gated residual correction."""
     radar_tensor = torch.as_tensor(radar_obs, dtype=torch.float32, device=device).unsqueeze(0)
     base_tensor = torch.as_tensor(base_action, dtype=torch.float32, device=device).unsqueeze(0)
+    velocity_tensor = torch.as_tensor(velocity_obs, dtype=torch.float32, device=device).unsqueeze(0)
     with torch.no_grad():
-        mean, _ = residual_net.actor(radar_tensor)
-        fused = ResidualPolicyNetwork.fuse_actions(base_tensor, mean)
+        mean, _, gate = residual_net.actor(radar_tensor, base_tensor, velocity_tensor)
+        fused = ResidualPolicyNetwork.fuse_actions(base_tensor, mean, gate)
     return fused.cpu().numpy()[0]
 
 
@@ -144,7 +145,8 @@ def run_single_episode(mode: str,
 
                 if mode == "residual":
                     radar_obs = tracker_actor_obs[NetParameters.ACTOR_SCALAR_LEN:]
-                    tracker_action = _fuse_action(base_action, radar_obs, residual_net, device)
+                    velocity_obs = tracker_actor_obs[0:2]  # linear_vel, angular_vel
+                    tracker_action = _fuse_action(base_action, radar_obs, velocity_obs, residual_net, device)
                 else:
                     tracker_action = np.asarray(base_action, dtype=np.float32)
 

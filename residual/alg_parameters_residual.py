@@ -76,6 +76,8 @@ class NetParameters:
     CONTEXT_WINDOW = 32
     
     # --- 残差网络特有参数 ---
+    VELOCITY_DIM = 2  # 线速度 + 角速度
+    RESIDUAL_INPUT_DIM = RADAR_DIM + ACTION_DIM + VELOCITY_DIM  # 64 + 2 + 2 = 68
     RESIDUAL_HIDDEN_DIM = 64          # 隐藏层维度 (比MLP小)
     RESIDUAL_NUM_LAYERS = 2           # 隐藏层数
     RESIDUAL_MAX_SCALE = 0.5          # Residual 最大幅度 [-0.5, 0.5]

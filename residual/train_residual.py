@@ -29,7 +29,9 @@ def extract_rl_data_from_rollout(rollout_data):
     return {
         'actor_obs': data['actor_obs'],
         'critic_obs': data['critic_obs'],
-        'radar_obs': data['radar_obs'],  # For gate training
+        'radar_obs': data['radar_obs'],
+        'velocity_obs': data['velocity_obs'],  # For actor input
+        'base_actions': data['base_actions'],  # For gated actor input
         'returns': data['returns'],
         'values': data['values'],
         'actions': data['actions'],
@@ -59,6 +61,8 @@ def _flush_segments(rollout, start, end, window_size, segments):
             'actor_obs': rollout['actor_obs'][cursor:seg_end],
             'critic_obs': rollout['critic_obs'][cursor:seg_end],
             'radar_obs': rollout['radar_obs'][cursor:seg_end],
+            'velocity_obs': rollout['velocity_obs'][cursor:seg_end],
+            'base_actions': rollout['base_actions'][cursor:seg_end],
             'returns': rollout['returns'][cursor:seg_end],
             'values': rollout['values'][cursor:seg_end],
             'actions': rollout['actions'][cursor:seg_end],
@@ -76,6 +80,8 @@ def collate_segments(batch_segments):
         'actor_obs': np.zeros((batch_size, max_len, NetParameters.ACTOR_RAW_LEN), dtype=np.float32),
         'critic_obs': np.zeros((batch_size, max_len, NetParameters.CRITIC_RAW_LEN), dtype=np.float32),
         'radar_obs': np.zeros((batch_size, max_len, NetParameters.RADAR_DIM), dtype=np.float32),
+        'velocity_obs': np.zeros((batch_size, max_len, NetParameters.VELOCITY_DIM), dtype=np.float32),
+        'base_actions': np.zeros((batch_size, max_len, NetParameters.ACTION_DIM), dtype=np.float32),
         'returns': np.zeros((batch_size, max_len), dtype=np.float32),
         'values': np.zeros((batch_size, max_len), dtype=np.float32),
         'actions': np.zeros((batch_size, max_len, NetParameters.ACTION_DIM), dtype=np.float32),
@@ -87,6 +93,8 @@ def collate_segments(batch_segments):
         batch['actor_obs'][i, :l] = seg['actor_obs']
         batch['critic_obs'][i, :l] = seg['critic_obs']
         batch['radar_obs'][i, :l] = seg['radar_obs']
+        batch['velocity_obs'][i, :l] = seg['velocity_obs']
+        batch['base_actions'][i, :l] = seg['base_actions']
         batch['returns'][i, :l] = seg['returns']
         batch['values'][i, :l] = seg['values']
         batch['actions'][i, :l] = seg['actions']
@@ -269,6 +277,8 @@ def main():
                         actor_flat = batch['actor_obs'].reshape(-1, NetParameters.ACTOR_RAW_LEN)
                         critic_flat = batch['critic_obs'].reshape(-1, NetParameters.CRITIC_RAW_LEN)
                         radar_flat = batch['radar_obs'].reshape(-1, NetParameters.RADAR_DIM)
+                        velocity_flat = batch['velocity_obs'].reshape(-1, NetParameters.VELOCITY_DIM)
+                        base_actions_flat = batch['base_actions'].reshape(-1, NetParameters.ACTION_DIM)
                         returns_flat = batch['returns'].reshape(-1)
                         values_flat = batch['values'].reshape(-1)
                         actions_flat = batch['actions'].reshape(-1, NetParameters.ACTION_DIM)
@@ -280,7 +290,9 @@ def main():
                             'global_step': curr_steps,
                             'actor_obs': actor_flat,
                             'critic_obs': critic_flat,
-                            'radar_obs': radar_flat,  # For gate training
+                            'radar_obs': radar_flat,
+                            'velocity_obs': velocity_flat,  # For actor input
+                            'base_actions': base_actions_flat,  # For gated actor input
                             'returns': returns_flat,
                             'values': values_flat,
                             'actions': actions_flat,

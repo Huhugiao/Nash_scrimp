@@ -11,7 +11,7 @@ from residual.alg_parameters_residual import (
 class ResidualModel:
     """
     Model wrapper for training ResidualPolicyNetwork using PPO.
-    Simplified: Radar-only input, no gate.
+    Gated Residual: Uses radar + base_action as input, learns safety gate.
     """
     def __init__(self, device, global_model=False):
         self.device = device
@@ -54,12 +54,12 @@ class ResidualModel:
         log_det_jac = torch.log(1.0 - torch.tanh(pre_tanh) ** 2 + 1e-6)
         return (base_log_prob - log_det_jac).sum(dim=-1)
 
-    def train(self, radar_obs=None, returns=None, values=None, 
+    def train(self, radar_obs=None, base_actions=None, velocity_obs=None, returns=None, values=None, 
               actions=None, old_log_probs=None, mask=None,
               writer=None, global_step=None, **kwargs):
         """
         PPO training step for Residual Network.
-        Simplified: Radar-only input for both actor and critic.
+        Gated: Uses radar + base_action + velocity as actor input.
         """
         if self.net_optimizer is None:
             raise RuntimeError("Cannot train without optimizer (not a global model)")
@@ -96,8 +96,15 @@ class ResidualModel:
                 mask = torch.as_tensor(mask, dtype=torch.float32, device=self.device)
                 if mask.dim() == 0: mask = mask.unsqueeze(0)
 
-            # Forward pass through residual network (radar only)
-            mean, log_std = self.network.actor(radar_obs)
+            # Convert base_actions and velocity to tensors
+            base_actions_t = torch.as_tensor(base_actions, dtype=torch.float32, device=self.device)
+            if base_actions_t.dim() == 1: base_actions_t = base_actions_t.unsqueeze(0)
+            
+            velocity_t = torch.as_tensor(velocity_obs, dtype=torch.float32, device=self.device)
+            if velocity_t.dim() == 1: velocity_t = velocity_t.unsqueeze(0)
+
+            # Forward pass through residual network (radar + base_action + velocity)
+            mean, log_std, _ = self.network.actor(radar_obs, base_actions_t, velocity_t)
             new_values = self.network.critic(radar_obs).squeeze(-1)
             
             # Compute new log probs
