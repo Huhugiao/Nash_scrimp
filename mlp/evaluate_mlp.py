@@ -1,9 +1,7 @@
 import os
 import sys
-# Add project root to sys.path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# 设置SDL为dummy模式，避免在多进程或无显示环境中初始化图形界面导致错误
 os.environ["SDL_VIDEODRIVER"] = "dummy"
 
 import numpy as np
@@ -136,20 +134,22 @@ def run_battle_batch(args):
 def run_single_episode(config, episode_idx, tracker_model, target_model, device, policy_manager, preloaded_target_policy=None, force_save_gif=False):
     map_config.set_obstacle_density(config.obstacle_density)
     env = TrackingEnv(enable_safety_layer=config.enable_safety_layer)
-    obs_result = env.reset()
-    # unpack observation
-    if isinstance(obs_result, tuple) and len(obs_result) == 2:
-        obs = obs_result[0]
-        if isinstance(obs, (tuple, list)) and len(obs) == 2:
-            tracker_obs, target_obs = obs
+    try:
+        obs_result = env.reset()
+
+        # unpack observation
+        if isinstance(obs_result, tuple) and len(obs_result) == 2:
+            obs = obs_result[0]
+            if isinstance(obs, (tuple, list)) and len(obs) == 2:
+                tracker_obs, target_obs = obs
+            else:
+                tracker_obs = target_obs = obs
         else:
-            tracker_obs = target_obs = obs
-    else:
-        obs = obs_result
-        if isinstance(obs, (tuple, list)) and len(obs) == 2:
-            tracker_obs, target_obs = obs
-        else:
-            tracker_obs = target_obs = obs
+            obs = obs_result
+            if isinstance(obs, (tuple, list)) and len(obs) == 2:
+                tracker_obs, target_obs = obs
+            else:
+                tracker_obs = target_obs = obs
 
         done = False
         episode_step = 0
@@ -295,74 +295,74 @@ def run_single_episode(config, episode_idx, tracker_model, target_model, device,
 
         debug_info = None
         if config.debug and not tracker_caught_target:
-            try:
-                final_state = env.get_privileged_state() if hasattr(env, "get_privileged_state") else {}
-                obstacles_summary = "Unknown"
-                if hasattr(env, 'obstacles'):
-                    obstacles_summary = []
-                    for o in env.obstacles:
-                        if hasattr(o, 'to_dict'):
-                            obstacles_summary.append(o.to_dict())
-                        else:
-                            obstacles_summary.append(str(o))
+            final_state = env.get_privileged_state() if hasattr(env, "get_privileged_state") else {}
 
-                tracker_st = final_state.get('tracker', {})
-                target_st = final_state.get('target', {})
+            obstacles_summary = "Unknown"
+            if hasattr(env, 'obstacles'):
+                obstacles_summary = []
+                for o in env.obstacles:
+                    if hasattr(o, 'to_dict'):
+                        obstacles_summary.append(o.to_dict())
+                    else:
+                        obstacles_summary.append(str(o))
 
-                def get_pos(obj):
-                    if isinstance(obj, dict):
-                        return obj.get('pos', obj.get('position'))
-                    return getattr(obj, 'pos', getattr(obj, 'position', None))
+            tracker_st = final_state.get('tracker', {})
+            target_st = final_state.get('target', {})
 
-                t_pos = get_pos(tracker_st)
-                g_pos = get_pos(target_st)
+            def get_pos(obj):
+                if isinstance(obj, dict):
+                    return obj.get('pos', obj.get('position'))
+                return getattr(obj, 'pos', getattr(obj, 'position', None))
 
-                dist = -1.0
-                if t_pos is not None and g_pos is not None:
-                    dist = float(np.linalg.norm(np.array(t_pos) - np.array(g_pos)))
+            t_pos = get_pos(tracker_st)
+            g_pos = get_pos(target_st)
 
-                max_range = EnvParameters.FOV_RANGE
-                min_dist_px = (stats['min_obs_dist'] + 1.0) * 0.5 * max_range
+            dist = -1.0
+            if t_pos is not None and g_pos is not None:
+                dist = float(np.linalg.norm(np.array(t_pos) - np.array(g_pos)))
 
-                cause = "Timeout"
-                details = []
+            max_range = EnvParameters.FOV_RANGE
+            min_dist_px = (stats['min_obs_dist'] + 1.0) * 0.5 * max_range
 
-                if stats['collision']:
-                    cause = "Collision"
-                    details.append("Crashed into obstacle")
-                elif max(stats['max_stuck_seq'], stats['current_stuck_seq']) > 30:
-                    cause = "Stuck"
-                    details.append(f"Stuck for {max(stats['max_stuck_seq'], stats['current_stuck_seq'])} consecutive steps")
-                elif stats['lost_steps'] > episode_step * 0.6:
-                    cause = "Lost Target"
-                    details.append(f"Target invisible for {stats['lost_steps']/max(1, episode_step):.1%} of time")
-                elif min_dist_px < 15.0:
-                    cause = "Trapped/Close Obstacle"
-                    details.append(f"Got very close to obstacle ({min_dist_px:.1f}px)")
+            cause = "Timeout"
+            details = []
 
-                debug_info = {
-                    "episode_id": episode_idx,
-                    "reason": info.get('reason', 'timeout' if truncated else 'unknown'),
-                    "failure_cause": cause,
-                    "details": "; ".join(details),
-                    "metrics": {
-                        "stuck_steps": stats['stuck_steps'],
-                        "max_stuck_seq": max(stats['max_stuck_seq'], stats['current_stuck_seq']),
-                        "lost_steps": stats['lost_steps'],
-                        "min_obs_dist_px": min_dist_px,
-                        "total_steps": episode_step
-                    },
-                    "distance": dist,
-                    "obstacle_density": config.obstacle_density,
-                    "obstacles": obstacles_summary,
-                    "tracker_raw": str(tracker_st),
-                    "target_raw": str(target_st)
-                }
+            if stats['collision']:
+                cause = "Collision"
+                details.append("Crashed into obstacle")
+            elif max(stats['max_stuck_seq'], stats['current_stuck_seq']) > 30:
+                cause = "Stuck"
+                details.append(f"Stuck for {max(stats['max_stuck_seq'], stats['current_stuck_seq'])} consecutive steps")
+            elif stats['lost_steps'] > episode_step * 0.6:
+                cause = "Lost Target"
+                details.append(f"Target invisible for {stats['lost_steps']/max(1, episode_step):.1%} of time")
+            elif min_dist_px < 15.0:
+                cause = "Trapped/Close Obstacle"
+                details.append(f"Got very close to obstacle ({min_dist_px:.1f}px)")
 
-                if t_pos is not None:
-                    debug_info["tracker_pos"] = np.array(t_pos).tolist()
-                if g_pos is not None:
-                    debug_info["target_pos"] = np.array(g_pos).tolist()
+            debug_info = {
+                "episode_id": episode_idx,
+                "reason": info.get('reason', 'timeout' if truncated else 'unknown'),
+                "failure_cause": cause,
+                "details": "; ".join(details),
+                "metrics": {
+                    "stuck_steps": stats['stuck_steps'],
+                    "max_stuck_seq": max(stats['max_stuck_seq'], stats['current_stuck_seq']),
+                    "lost_steps": stats['lost_steps'],
+                    "min_obs_dist_px": min_dist_px,
+                    "total_steps": episode_step
+                },
+                "distance": dist,
+                "obstacle_density": config.obstacle_density,
+                "obstacles": obstacles_summary,
+                "tracker_raw": str(tracker_st),
+                "target_raw": str(target_st)
+            }
+
+            if t_pos is not None:
+                debug_info["tracker_pos"] = np.array(t_pos).tolist()
+            if g_pos is not None:
+                debug_info["target_pos"] = np.array(g_pos).tolist()
 
         return {
             "episode_id": episode_idx,
@@ -376,7 +376,6 @@ def run_single_episode(config, episode_idx, tracker_model, target_model, device,
             "target_strategy": target_strategy,
             "debug_info": debug_info
         }
-
     finally:
         env.close()
 
@@ -402,14 +401,6 @@ def _init_tracker_policy(config):
 
 def _init_target_policy(config, preloaded_policy=None):
     target_strategy = config.specific_target_strategy
-    
-    # Map "RL_Survival" -> "RL_Survival" handled below, no specialized logic needed here other than
-    # creating the policy object. 
-    # If list is passed to config.target_type in BattleConfig, we handle specific strategy one by one.
-    
-    # Note: run_strategy_evaluation iterates and sets config.specific_target_strategy.
-    # Single battle sets it too.
-    
     current_type = config.specific_target_strategy or (config.target_type if isinstance(config.target_type, str) else config.target_type[0])
 
     if current_type == "all":
@@ -678,7 +669,7 @@ def run_battle(config, strategy_name=None):
         "target_strategy": config.specific_target_strategy or config.target_type
     }
     stats_path = os.path.join(config.run_dir, "stats.csv")
-    pd.DataFrame([stats]).to_csv(stats_path, index=False))
+    pd.DataFrame([stats]).to_csv(stats_path, index=False)
 
     total_time = time.time() - start_time
 

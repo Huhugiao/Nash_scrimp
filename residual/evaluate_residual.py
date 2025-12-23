@@ -379,7 +379,7 @@ def main():
     parser.add_argument("--target_policy", default=DEFAULT_TARGET_POLICY, help="Target policy to evaluate against (use 'all' for all policies)")
     parser.add_argument("--episodes", type=int, default=100, help="Number of episodes per tracker mode")
     parser.add_argument("--save_gif_freq", type=int, default=30, help="Save GIF every N episodes (0 to disable)")
-    parser.add_argument("--output_dir", type=str, default="./residual_evals", help="Directory to store evaluation outputs")
+    parser.add_argument("--output_dir", type=str, default="./battles/residual", help="Directory to store evaluation outputs")
     parser.add_argument("--seed", type=int, default=1234, help="Random seed")
     parser.add_argument("--obstacles", type=str, default=ObstacleDensity.DENSE, choices=ObstacleDensity.ALL_LEVELS, help="Obstacle density level")
     parser.add_argument("--no-safety-layer", action="store_true", help="Disable environment safety layer")

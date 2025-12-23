@@ -83,10 +83,6 @@ class NetParameters:
     RESIDUAL_MAX_SCALE = 0.5          # Residual 最大幅度 [-0.5, 0.5]
 
 
-
-# Note: Gate has been removed - Actor learns to output ~0 when safe via L2 penalty
-
-
 class ResidualRLConfig:
     """残差RL主配置"""
     ENABLED = True
