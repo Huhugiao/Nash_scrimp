@@ -134,7 +134,6 @@ class RecordingParameters:
     _targets = list(TrainingParameters.RANDOM_OPPONENT_WEIGHTS.get("target", {}).keys())
     EXPERIMENT_NAME = f"rl_{_targets[0] if len(_targets) == 1 else 'all'}"
     EXPERIMENT_NAME += "_collision" if not ENABLE_SAFETY_LAYER else ""
-    EXPERIMENT_NAME += "_bounce" if BOUNCE_ON_COLLISION else ""
     EXPERIMENT_NAME += "_shaping"
     
     ENTITY = "user"
