@@ -30,8 +30,9 @@ def extract_rl_data_from_rollout(rollout_data):
         'actor_obs': data['actor_obs'],
         'critic_obs': data['critic_obs'],
         'radar_obs': data['radar_obs'],
-        'velocity_obs': data['velocity_obs'],  # For actor input
-        'base_actions': data['base_actions'],  # For gated actor input
+        'velocity_obs': data['velocity_obs'],
+        'base_actions': data['base_actions'],
+        'collision_mask': data['collision_mask'],  # For gate supervision
         'returns': data['returns'],
         'values': data['values'],
         'actions': data['actions'],
@@ -63,6 +64,7 @@ def _flush_segments(rollout, start, end, window_size, segments):
             'radar_obs': rollout['radar_obs'][cursor:seg_end],
             'velocity_obs': rollout['velocity_obs'][cursor:seg_end],
             'base_actions': rollout['base_actions'][cursor:seg_end],
+            'collision_mask': rollout['collision_mask'][cursor:seg_end],
             'returns': rollout['returns'][cursor:seg_end],
             'values': rollout['values'][cursor:seg_end],
             'actions': rollout['actions'][cursor:seg_end],
@@ -82,6 +84,7 @@ def collate_segments(batch_segments):
         'radar_obs': np.zeros((batch_size, max_len, NetParameters.RADAR_DIM), dtype=np.float32),
         'velocity_obs': np.zeros((batch_size, max_len, NetParameters.VELOCITY_DIM), dtype=np.float32),
         'base_actions': np.zeros((batch_size, max_len, NetParameters.ACTION_DIM), dtype=np.float32),
+        'collision_mask': np.zeros((batch_size, max_len), dtype=np.float32),
         'returns': np.zeros((batch_size, max_len), dtype=np.float32),
         'values': np.zeros((batch_size, max_len), dtype=np.float32),
         'actions': np.zeros((batch_size, max_len, NetParameters.ACTION_DIM), dtype=np.float32),
@@ -95,6 +98,7 @@ def collate_segments(batch_segments):
         batch['radar_obs'][i, :l] = seg['radar_obs']
         batch['velocity_obs'][i, :l] = seg['velocity_obs']
         batch['base_actions'][i, :l] = seg['base_actions']
+        batch['collision_mask'][i, :l] = seg['collision_mask']
         batch['returns'][i, :l] = seg['returns']
         batch['values'][i, :l] = seg['values']
         batch['actions'][i, :l] = seg['actions']
@@ -279,6 +283,7 @@ def main():
                         radar_flat = batch['radar_obs'].reshape(-1, NetParameters.RADAR_DIM)
                         velocity_flat = batch['velocity_obs'].reshape(-1, NetParameters.VELOCITY_DIM)
                         base_actions_flat = batch['base_actions'].reshape(-1, NetParameters.ACTION_DIM)
+                        collision_mask_flat = batch['collision_mask'].reshape(-1)
                         returns_flat = batch['returns'].reshape(-1)
                         values_flat = batch['values'].reshape(-1)
                         actions_flat = batch['actions'].reshape(-1, NetParameters.ACTION_DIM)
@@ -291,14 +296,15 @@ def main():
                             'actor_obs': actor_flat,
                             'critic_obs': critic_flat,
                             'radar_obs': radar_flat,
-                            'velocity_obs': velocity_flat,  # For actor input
-                            'base_actions': base_actions_flat,  # For gated actor input
+                            'velocity_obs': velocity_flat,
+                            'base_actions': base_actions_flat,
+                            'collision_mask': collision_mask_flat,  # For gate supervision
                             'returns': returns_flat,
                             'values': values_flat,
                             'actions': actions_flat,
                             'old_log_probs': old_logp_flat,
                             'mask': mask_flat,
-                            'il_batch': None # No IL
+                            'il_batch': None
                         }
                         
                         result = training_model.train(**train_args)
@@ -311,26 +317,15 @@ def main():
                 last_train_log_t = curr_steps
                 train_stats = compute_performance_stats(epoch_perf_buffer) if epoch_perf_buffer['per_r'] else {}
                 
-                # Compute gate statistics
-                all_gate_values = []
-                for result in results:
-                    all_gate_values.extend(result['data']['gate_values'])
-                
-                gate_mean = float(np.mean(all_gate_values)) if all_gate_values else 0.0
-                gate_std = float(np.std(all_gate_values)) if all_gate_values else 0.0
-                
                 log_str = f"[TRAIN] step={curr_steps:,} | ep={curr_episodes:,} | LR={new_lr:.2e}"
                 if train_stats:
                     log_str += f" | Rew={train_stats.get('per_r_mean', 0):.2f} | Win={train_stats.get('win_mean', 0)*100:.1f}%"
-                log_str += f" | Gate={gate_mean:.3f}±{gate_std:.3f}"
                 print(log_str)
                 
                 if global_summary:
                      write_to_tensorboard(global_summary, curr_steps, performance_dict=epoch_perf_buffer, 
                                          mb_loss=epoch_loss_buffer, imitation_loss=[0.0, 0.0], q_loss=0.0, evaluate=False)
                      global_summary.add_scalar('Train/LR', new_lr, curr_steps)
-                     global_summary.add_scalar('Train/GateMean', gate_mean, curr_steps)
-                     global_summary.add_scalar('Train/GateStd', gate_std, curr_steps)
 
                 epoch_perf_buffer = {'per_r': [], 'per_episode_len': [], 'win': []}
                 epoch_loss_buffer = []

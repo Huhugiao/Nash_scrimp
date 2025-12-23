@@ -85,13 +85,13 @@ def _get_target_policy(name: str):
 
 
 def _fuse_action(base_action: np.ndarray, radar_obs: np.ndarray, velocity_obs: np.ndarray, residual_net: ResidualPolicyNetwork, device: torch.device) -> np.ndarray:
-    """Fuse base action with deterministic gated residual correction."""
+    """Fuse base action with deterministic residual correction."""
     radar_tensor = torch.as_tensor(radar_obs, dtype=torch.float32, device=device).unsqueeze(0)
     base_tensor = torch.as_tensor(base_action, dtype=torch.float32, device=device).unsqueeze(0)
     velocity_tensor = torch.as_tensor(velocity_obs, dtype=torch.float32, device=device).unsqueeze(0)
     with torch.no_grad():
-        mean, _, gate = residual_net.actor(radar_tensor, base_tensor, velocity_tensor)
-        fused = ResidualPolicyNetwork.fuse_actions(base_tensor, mean, gate)
+        mean, _ = residual_net.actor(radar_tensor, base_tensor, velocity_tensor)
+        fused = ResidualPolicyNetwork.fuse_actions(base_tensor, mean)
     return fused.cpu().numpy()[0]
 
 

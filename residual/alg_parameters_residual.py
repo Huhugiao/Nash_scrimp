@@ -92,7 +92,7 @@ class ResidualRLConfig:
     BASE_MODEL_PATH = "./models/rl_CoverSeeker_collision_12-19-12-30/best_model/checkpoint.pth"
     
     # 惩罚系数
-    ACTION_PENALTY_COEF = 0.002       # L2 惩罚 (鼓励小 residual，降低以避免过度惩罚)
+    ACTION_PENALTY_COEF = 0.002       # L2 惩罚 (鼓励小 residual)
 
 
 class RecordingParameters:

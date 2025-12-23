@@ -105,7 +105,7 @@ class ResidualRunner(object):
                 'actor_obs': np.zeros((n_steps, NetParameters.ACTOR_RAW_LEN), dtype=np.float32),
                 'critic_obs': np.zeros((n_steps, NetParameters.CRITIC_RAW_LEN), dtype=np.float32),
                 'radar_obs': np.zeros((n_steps, NetParameters.RADAR_DIM), dtype=np.float32),
-                'velocity_obs': np.zeros((n_steps, NetParameters.VELOCITY_DIM), dtype=np.float32),  # linear + angular vel
+                'velocity_obs': np.zeros((n_steps, NetParameters.VELOCITY_DIM), dtype=np.float32),
                 'rewards': np.zeros(n_steps, dtype=np.float32),
                 'values': np.zeros(n_steps, dtype=np.float32),
                 'actions': np.zeros((n_steps, NetParameters.ACTION_DIM), dtype=np.float32),
@@ -116,7 +116,6 @@ class ResidualRunner(object):
                 # Extra logs
                 'base_actions': np.zeros((n_steps, NetParameters.ACTION_DIM), dtype=np.float32),
                 'residual_actions': np.zeros((n_steps, NetParameters.ACTION_DIM), dtype=np.float32),
-                'gate_values': np.zeros(n_steps, dtype=np.float32),
                 'episode_success': []
             }
             
@@ -147,8 +146,8 @@ class ResidualRunner(object):
                 velocity_obs = self.tracker_obs[0:2]
                 velocity_tensor = torch.from_numpy(velocity_obs).float().to(self.local_device).unsqueeze(0)
                 
-                # --- 3. Get Residual Action + Gate (Stochastic) from radar + base_action + velocity ---
-                mean, log_std, gate = self.residual_model.actor(radar_tensor, base_action_tensor, velocity_tensor)
+                # --- 3. Get Residual Action (Stochastic) from radar + base_action + velocity ---
+                mean, log_std = self.residual_model.actor(radar_tensor, base_action_tensor, velocity_tensor)
                 std = torch.exp(log_std)
                 noise = torch.randn_like(mean)
                 residual_action_sampled = mean + std * noise
@@ -156,11 +155,10 @@ class ResidualRunner(object):
                 # Compute log probability
                 log_prob = -0.5 * (((residual_action_sampled - mean) / std).pow(2) + 2 * log_std + np.log(2 * np.pi)).sum(-1)
                 
-                # --- 4. Gated Fusion: gate=1 trusts base, gate=0 applies residual ---
+                # --- 4. Simple Additive Fusion ---
                 fused_action = ResidualPolicyNetwork.fuse_actions(
                     base_action_tensor, 
-                    residual_action_sampled,
-                    gate
+                    residual_action_sampled
                 )
                 final_action_np = fused_action.cpu().numpy()[0]
                 
@@ -206,7 +204,6 @@ class ResidualRunner(object):
                 
                 data['base_actions'][i] = base_action
                 data['residual_actions'][i] = residual_action_sampled.cpu().numpy()[0]
-                data['gate_values'][i] = gate.cpu().numpy()[0, 0]  # Learned gate value
                 
                 episode_start = False
                 episode_reward += float(reward)

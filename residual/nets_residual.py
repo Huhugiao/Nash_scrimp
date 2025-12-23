@@ -6,12 +6,9 @@ from residual.alg_parameters_residual import NetParameters
 
 class ResidualActorNetwork(nn.Module):
     """
-    Gated Residual Actor: Outputs bounded correction to base action + safety gate
-    Input: Radar (64-dim) + Base Action (2-dim) = 66-dim
-    Output: 
-        - residual_mean: [-max_scale, +max_scale]
-        - log_std: for stochastic policy
-        - gate: [0, 1] where 1=safe (use base), 0=danger (apply residual)
+    Residual Actor: Outputs bounded correction to base action
+    Input: Radar (64-dim) + Base Action (2-dim) + Velocity (2-dim) = 68-dim
+    Output: residual_mean [-max_scale, +max_scale], log_std
     """
     def __init__(self, 
                  input_dim=None,
@@ -21,9 +18,8 @@ class ResidualActorNetwork(nn.Module):
                  max_scale=None):
         super().__init__()
         
-        # Use defaults from parameters
         if input_dim is None:
-            input_dim = NetParameters.RESIDUAL_INPUT_DIM  # 66 = radar(64) + base_action(2)
+            input_dim = NetParameters.RESIDUAL_INPUT_DIM  # 68
         if action_dim is None:
             action_dim = NetParameters.ACTION_DIM
         if hidden_dim is None:
@@ -47,14 +43,10 @@ class ResidualActorNetwork(nn.Module):
         self.feature_net = nn.Sequential(*layers)
         self.mean_head = nn.Linear(hidden_dim, action_dim)
         self.log_std_head = nn.Linear(hidden_dim, action_dim)
-        self.gate_head = nn.Linear(hidden_dim, 1)  # Safety gate output
         
         # Initialize with small weights (start with small residuals)
         nn.init.orthogonal_(self.mean_head.weight, gain=0.01)
         nn.init.constant_(self.mean_head.bias, 0.0)
-        # Initialize gate to output ~1 (safe) initially
-        nn.init.constant_(self.gate_head.weight, 0.0)
-        nn.init.constant_(self.gate_head.bias, 2.0)  # sigmoid(2) ≈ 0.88, starts safe
         
     def forward(self, radar, base_action, velocity):
         """
@@ -65,23 +57,17 @@ class ResidualActorNetwork(nn.Module):
         Returns:
             mean: (batch, action_dim) - bounded in [-max_scale, max_scale]
             log_std: (batch, action_dim)
-            gate: (batch, 1) - safety gate in [0, 1]
         """
-        # Concatenate inputs: radar + base_action + velocity = 68 dim
         combined = torch.cat([radar, base_action, velocity], dim=-1)
         features = self.feature_net(combined)
         
         raw_mean = self.mean_head(features)
         log_std = self.log_std_head(features)
-        gate = torch.sigmoid(self.gate_head(features))  # [0, 1]
         
-        # Bound mean output
         scaled_mean = torch.tanh(raw_mean) * self.max_scale
-        
-        # Clamp log_std to reasonable range
         log_std = torch.clamp(log_std, -20, 2)
         
-        return scaled_mean, log_std, gate
+        return scaled_mean, log_std
 
 
 class ResidualCriticNetwork(nn.Module):
@@ -96,7 +82,7 @@ class ResidualCriticNetwork(nn.Module):
         super().__init__()
         
         if input_dim is None:
-            input_dim = NetParameters.RADAR_DIM  # 64维雷达
+            input_dim = NetParameters.RADAR_DIM
         if hidden_dim is None:
             hidden_dim = NetParameters.RESIDUAL_HIDDEN_DIM
         if num_layers is None:
@@ -110,50 +96,40 @@ class ResidualCriticNetwork(nn.Module):
                 nn.ReLU()
             ])
             in_dim = hidden_dim
+            
+        self.feature_net = nn.Sequential(*layers)
+        self.value_head = nn.Linear(hidden_dim, 1)
         
-        layers.append(nn.Linear(hidden_dim, 1))
-        self.network = nn.Sequential(*layers)
-        
+        nn.init.orthogonal_(self.value_head.weight, gain=1.0)
+        nn.init.constant_(self.value_head.bias, 0.0)
+    
     def forward(self, radar):
-        """
-        Args:
-            radar: (batch, 64) - normalized radar readings
-        Returns:
-            value: (batch, 1)
-        """
-        return self.network(radar)
+        features = self.feature_net(radar)
+        return self.value_head(features)
 
 
 class ResidualPolicyNetwork(nn.Module):
     """
-    Gated Residual Policy Module:
-    - Actor: Outputs bounded residual action + safety gate from radar + base_action
+    Residual Policy Module:
+    - Actor: Outputs bounded residual action from radar + base_action + velocity
     - Critic: Estimates value from radar
-    - Gate: Learned safety gate (1=safe, use base; 0=danger, apply residual)
+    - Fusion: Simple addition (base + residual, clamped)
     """
     def __init__(self):
         super().__init__()
-        
         self.actor = ResidualActorNetwork()
         self.critic = ResidualCriticNetwork()
     
     @staticmethod
-    def fuse_actions(base_action, residual_action, gate):
+    def fuse_actions(base_action, residual_action):
         """
-        Gated fusion of base and residual actions.
+        Simple additive fusion of base and residual actions.
         
         Args:
             base_action: (batch, action_dim) - frozen base policy output
             residual_action: (batch, action_dim) - residual correction
-            gate: (batch, 1) - safety gate in [0, 1]
-                  gate=1: fully trust base (safe)
-                  gate=0: apply full residual correction (danger)
         
         Returns:
             fused_action: (batch, action_dim) - clamped to [-1, 1]
         """
-        # corrected = base + residual, clamped
-        corrected = torch.clamp(base_action + residual_action, -1.0, 1.0)
-        # Interpolate: gate * base + (1 - gate) * corrected
-        fused = gate * base_action + (1 - gate) * corrected
-        return torch.clamp(fused, -1.0, 1.0)
+        return torch.clamp(base_action + residual_action, -1.0, 1.0)

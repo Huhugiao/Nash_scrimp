@@ -54,12 +54,12 @@ class ResidualModel:
         log_det_jac = torch.log(1.0 - torch.tanh(pre_tanh) ** 2 + 1e-6)
         return (base_log_prob - log_det_jac).sum(dim=-1)
 
-    def train(self, radar_obs=None, base_actions=None, velocity_obs=None, returns=None, values=None, 
-              actions=None, old_log_probs=None, mask=None,
+    def train(self, radar_obs=None, base_actions=None, velocity_obs=None,
+              returns=None, values=None, actions=None, old_log_probs=None, mask=None,
               writer=None, global_step=None, **kwargs):
         """
         PPO training step for Residual Network.
-        Gated: Uses radar + base_action + velocity as actor input.
+        Uses radar + base_action + velocity as actor input.
         """
         if self.net_optimizer is None:
             raise RuntimeError("Cannot train without optimizer (not a global model)")
@@ -104,7 +104,7 @@ class ResidualModel:
             if velocity_t.dim() == 1: velocity_t = velocity_t.unsqueeze(0)
 
             # Forward pass through residual network (radar + base_action + velocity)
-            mean, log_std, _ = self.network.actor(radar_obs, base_actions_t, velocity_t)
+            mean, log_std = self.network.actor(radar_obs, base_actions_t, velocity_t)
             new_values = self.network.critic(radar_obs).squeeze(-1)
             
             # Compute new log probs
