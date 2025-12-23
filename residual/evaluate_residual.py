@@ -265,7 +265,7 @@ def run_strategy_evaluation(cfg: EvalConfig, target_strategies: List[str]):
     all_results = []
     all_summaries = []
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")  # CPU is faster for small residual network
     base_model = load_base_model(cfg.base_model_path, device)
     residual_net = load_residual_model(cfg.residual_model_path, device)
 
@@ -374,7 +374,7 @@ def run_strategy_evaluation(cfg: EvalConfig, target_strategies: List[str]):
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate base tracker vs residual-enhanced tracker")
-    parser.add_argument("--residual_model", default='models/residual_avoidance_12-22-18-05/latest_model/checkpoint.pth', help="Path to residual checkpoint (best_model/checkpoint.pth)")
+    parser.add_argument("--residual_model", default='models/residual_avoidance_12-23-10-54/latest_model/checkpoint.pth', help="Path to residual checkpoint (best_model/checkpoint.pth)")
     parser.add_argument("--base_model", default='models/rl_CoverSeeker_collision_12-19-12-30/best_model/checkpoint.pth', help="Path to base tracker checkpoint")
     parser.add_argument("--target_policy", default=DEFAULT_TARGET_POLICY, help="Target policy to evaluate against (use 'all' for all policies)")
     parser.add_argument("--episodes", type=int, default=100, help="Number of episodes per tracker mode")
@@ -382,7 +382,7 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./battles/residual", help="Directory to store evaluation outputs")
     parser.add_argument("--seed", type=int, default=1234, help="Random seed")
     parser.add_argument("--obstacles", type=str, default=ObstacleDensity.DENSE, choices=ObstacleDensity.ALL_LEVELS, help="Obstacle density level")
-    parser.add_argument("--no-safety-layer", action="store_true", help="Disable environment safety layer")
+    parser.add_argument("--safety-layer", action="store_true", help="Enable environment safety layer (default: disabled)")
 
     args = parser.parse_args()
 
@@ -410,7 +410,7 @@ def main():
         output_dir=run_root,
         seed=args.seed,
         obstacle_density=args.obstacles,
-        enable_safety_layer=not args.no_safety_layer
+        enable_safety_layer=args.safety_layer  # Default: disabled (collisions detected)
     )
 
     set_global_seeds(cfg.seed)
@@ -420,7 +420,7 @@ def main():
         run_strategy_evaluation(cfg, target_strategies)
     else:
         # Original single policy evaluation
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device("cpu")  # CPU is faster for small residual network
         base_model = load_base_model(cfg.base_model_path, device)
         residual_net = load_residual_model(cfg.residual_model_path, device)
         target_policy = _get_target_policy(cfg.target_policy)

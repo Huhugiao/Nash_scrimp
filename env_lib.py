@@ -560,27 +560,25 @@ def _draw_fov(surface, tracker, fov_points=None):
     """基于预计算的 fov_points 绘制半透明扇形。"""
     if pygame is None or not fov_points or len(fov_points) < 3:
         return
-        # 1. 绘制填充 (Fill)
-        # 使用稍淡一点的颜色，减少视觉干扰
-        fill_color = (80, 140, 255, 30) 
-        pygame.gfxdraw.filled_polygon(surface, fov_points, fill_color)
-        
-        # 2. 绘制轮廓 (Outline) - 仅绘制两侧射线
-        # 修复波浪状边缘问题：不再绘制连接障碍物点的远端轮廓线，
-        # 而是只绘制 FOV 锥体的两条侧边，保持视觉整洁。
-        outline_color = (80, 140, 255, 200)
-        
-        center = fov_points[0]
-        p_left = fov_points[1]
-        p_right = fov_points[-1]
-        
-        # 转换为整数坐标
-        c_int = (int(center[0]), int(center[1]))
-        pl_int = (int(p_left[0]), int(p_left[1]))
-        pr_int = (int(p_right[0]), int(p_right[1]))
-        
-        pygame.draw.line(surface, outline_color, c_int, pl_int, 1)
-        pygame.draw.line(surface, outline_color, c_int, pr_int, 1)
+    
+    # 1. 绘制填充 (Fill)
+    fill_color = (80, 140, 255, 30) 
+    pygame.gfxdraw.filled_polygon(surface, fov_points, fill_color)
+    
+    # 2. 绘制轮廓 (Outline) - 仅绘制两侧射线
+    outline_color = (80, 140, 255, 200)
+    
+    center = fov_points[0]
+    p_left = fov_points[1]
+    p_right = fov_points[-1]
+    
+    # 转换为整数坐标
+    c_int = (int(center[0]), int(center[1]))
+    pl_int = (int(p_left[0]), int(p_left[1]))
+    pr_int = (int(p_right[0]), int(p_right[1]))
+    
+    pygame.draw.line(surface, outline_color, c_int, pl_int, 1)
+    pygame.draw.line(surface, outline_color, c_int, pr_int, 1)
 
 def _trace_ray_for_fov(origin, angle_rad, max_range):
     """占据栅格 DDA 不可用时的备份射线（粗到细）。"""

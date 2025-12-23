@@ -32,7 +32,6 @@ def extract_rl_data_from_rollout(rollout_data):
         'radar_obs': data['radar_obs'],
         'velocity_obs': data['velocity_obs'],
         'base_actions': data['base_actions'],
-        'collision_mask': data['collision_mask'],  # For gate supervision
         'returns': data['returns'],
         'values': data['values'],
         'actions': data['actions'],
@@ -64,7 +63,6 @@ def _flush_segments(rollout, start, end, window_size, segments):
             'radar_obs': rollout['radar_obs'][cursor:seg_end],
             'velocity_obs': rollout['velocity_obs'][cursor:seg_end],
             'base_actions': rollout['base_actions'][cursor:seg_end],
-            'collision_mask': rollout['collision_mask'][cursor:seg_end],
             'returns': rollout['returns'][cursor:seg_end],
             'values': rollout['values'][cursor:seg_end],
             'actions': rollout['actions'][cursor:seg_end],
@@ -84,7 +82,6 @@ def collate_segments(batch_segments):
         'radar_obs': np.zeros((batch_size, max_len, NetParameters.RADAR_DIM), dtype=np.float32),
         'velocity_obs': np.zeros((batch_size, max_len, NetParameters.VELOCITY_DIM), dtype=np.float32),
         'base_actions': np.zeros((batch_size, max_len, NetParameters.ACTION_DIM), dtype=np.float32),
-        'collision_mask': np.zeros((batch_size, max_len), dtype=np.float32),
         'returns': np.zeros((batch_size, max_len), dtype=np.float32),
         'values': np.zeros((batch_size, max_len), dtype=np.float32),
         'actions': np.zeros((batch_size, max_len, NetParameters.ACTION_DIM), dtype=np.float32),
@@ -98,7 +95,6 @@ def collate_segments(batch_segments):
         batch['radar_obs'][i, :l] = seg['radar_obs']
         batch['velocity_obs'][i, :l] = seg['velocity_obs']
         batch['base_actions'][i, :l] = seg['base_actions']
-        batch['collision_mask'][i, :l] = seg['collision_mask']
         batch['returns'][i, :l] = seg['returns']
         batch['values'][i, :l] = seg['values']
         batch['actions'][i, :l] = seg['actions']
@@ -283,7 +279,6 @@ def main():
                         radar_flat = batch['radar_obs'].reshape(-1, NetParameters.RADAR_DIM)
                         velocity_flat = batch['velocity_obs'].reshape(-1, NetParameters.VELOCITY_DIM)
                         base_actions_flat = batch['base_actions'].reshape(-1, NetParameters.ACTION_DIM)
-                        collision_mask_flat = batch['collision_mask'].reshape(-1)
                         returns_flat = batch['returns'].reshape(-1)
                         values_flat = batch['values'].reshape(-1)
                         actions_flat = batch['actions'].reshape(-1, NetParameters.ACTION_DIM)
@@ -298,7 +293,6 @@ def main():
                             'radar_obs': radar_flat,
                             'velocity_obs': velocity_flat,
                             'base_actions': base_actions_flat,
-                            'collision_mask': collision_mask_flat,  # For gate supervision
                             'returns': returns_flat,
                             'values': values_flat,
                             'actions': actions_flat,
