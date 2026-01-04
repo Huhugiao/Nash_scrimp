@@ -700,13 +700,13 @@ Available Strategies:
     parser.add_argument('--tracker', type=str, default="policy",
                        choices=list(TRACKER_TYPE_CHOICES),
                        help=f'Tracker type: {", ".join(TRACKER_TYPE_CHOICES)}')
-    parser.add_argument('--tracker_name', type=str, default="rl1221",
+    parser.add_argument('--tracker_name', type=str, default="rl0104",
                        help='Custom name for tracker when type is policy')
     parser.add_argument('--target', type=str, nargs='+', default=["all"],
                        help=f'Target type(s): {", ".join(TARGET_TYPE_CHOICES)}')
 
     parser.add_argument('--tracker_model', type=str,
-                       default='./models/rl_CoverSeeker_collision_shaping_12-20-14-23/best_model/checkpoint.pth',
+                       default='./models/rl_CoverSeeker_collision_12-23-19-54/best_model/checkpoint.pth',
                        help='Path to tracker model (required when --tracker=policy)')
     parser.add_argument('--target_model', type=str, default='./target_models/stealth_ppo_12-10-17-25/stealth_best.pth',
                        help='Path to target model (required when --target=policy)')
@@ -727,7 +727,7 @@ Available Strategies:
                        choices=ObstacleDensity.ALL_LEVELS,
                        help='Obstacle density level (none/sparse/medium/dense)')
 
-    parser.add_argument('--debug', action='store_true', default=True,
+    parser.add_argument('--debug', action='store_true', default=False,
                        help='Enable debug mode: save GIFs and detailed data for failed tracker episodes')
 
     parser.add_argument('--no-safety-layer', action='store_true', default=True,

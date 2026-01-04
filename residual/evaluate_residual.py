@@ -374,7 +374,7 @@ def run_strategy_evaluation(cfg: EvalConfig, target_strategies: List[str]):
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate base tracker vs residual-enhanced tracker")
-    parser.add_argument("--residual_model", default='models/residual_avoidance_12-23-10-54/latest_model/checkpoint.pth', help="Path to residual checkpoint (best_model/checkpoint.pth)")
+    parser.add_argument("--residual_model", default='models/residual_avoidance_12-23-11-47/latest_model/checkpoint.pth', help="Path to residual checkpoint (best_model/checkpoint.pth)")
     parser.add_argument("--base_model", default='models/rl_CoverSeeker_collision_12-19-12-30/best_model/checkpoint.pth', help="Path to base tracker checkpoint")
     parser.add_argument("--target_policy", default=DEFAULT_TARGET_POLICY, help="Target policy to evaluate against (use 'all' for all policies)")
     parser.add_argument("--episodes", type=int, default=100, help="Number of episodes per tracker mode")

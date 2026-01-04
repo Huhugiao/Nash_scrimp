@@ -17,14 +17,14 @@ class TrainingParameters:
     训练超参数
     """
     # --- 优化器设置 ---
-    lr = 3e-5                # 初始学习率
+    lr = 3e-4                # 初始学习率
     LR_FINAL = 1e-5          # 最终学习率
     LR_SCHEDULE = 'cosine'   # 学习率调度方式 ('cosine', 'linear', 'constant')
     
     # --- 训练流程设置 ---
     N_ENVS = 4               # 并行环境数量
     N_STEPS = 2048           # 每个环境采样的步数 (PPO Rollout Length)
-    N_MAX_STEPS = 15e7        # 最大训练总步数
+    N_MAX_STEPS = 30e7        # 最大训练总步数
     LOG_EPOCH_STEPS = int(1e4) # 每隔多少步记录一次日志
     
     MINIBATCH_SIZE = 64      # PPO更新的Mini-batch大小
@@ -85,10 +85,10 @@ class TrainingParameters:
     # 随机对手权重 (初始权重)
     RANDOM_OPPONENT_WEIGHTS = {
         "target": {
-            # "Greedy": 1.0,
-            "CoverSeeker": 1.0,
-            # "ZigZag": 1.0,
-            # "Orbiter": 1.0,
+            "Greedy": 1.0,
+            # "CoverSeeker": 1.0,
+            # "ZigZag": 0.5,
+            # "Orbiter": 0.5,
         }
     }
 
@@ -134,15 +134,14 @@ class RecordingParameters:
     _targets = list(TrainingParameters.RANDOM_OPPONENT_WEIGHTS.get("target", {}).keys())
     EXPERIMENT_NAME = f"rl_{_targets[0] if len(_targets) == 1 else 'all'}"
     EXPERIMENT_NAME += "_collision" if not ENABLE_SAFETY_LAYER else ""
-    EXPERIMENT_NAME += "_shaping"
     
     ENTITY = "user"
     EXPERIMENT_NOTE = "MLP PPO training with separate radar encoding"
     TIME = datetime.datetime.now().strftime("_%m-%d-%H-%M")
     
     RETRAIN = False          # 是否继续训练 (加载权重和进度)
-    FRESH_RETRAIN = True     # 仅加载模型权重，重置训练进度和学习率调度
-    RESTORE_DIR = "./models/rl_CoverSeeker_collision_12-19-12-30/latest_model/checkpoint.pth"       # 恢复模型的目录
+    FRESH_RETRAIN = False     # 仅加载模型权重，重置训练进度和学习率调度
+    RESTORE_DIR = "./models/rl_all_12-23-12-19/latest_model/checkpoint.pth"       # 恢复模型的目录
     
 
     TENSORBOARD = True       # 是否使用TensorBoard
@@ -158,7 +157,7 @@ class RecordingParameters:
     SAVE_INTERVAL = 300000   # 保存模型间隔 (步数)
     BEST_INTERVAL = 0        # (未使用)
     GIF_INTERVAL = 500000    # 保存GIF间隔 (步数)
-    EVAL_EPISODES = 32       # 评估时的对局数
+    EVAL_EPISODES = 48       # 评估时的对局数
     
     # Loss 名称列表 (用于日志记录)
     LOSS_NAME = [
@@ -166,31 +165,3 @@ class RecordingParameters:
         'approx_kl', 'value_clip_frac', 'clipfrac', 'grad_norm', 'adv_mean'
     ]
 
-
-class ResidualRLParameters:
-    """
-    Residual RL 训练参数
-    条件式残差网络：基础模型冻结，残差网络在危险时激活进行避障修正
-    """
-    ENABLED = True
-    EXPERIMENT_NAME = "residual_avoidance"
-    
-    # Base model path (frozen, pre-trained tracker)
-    BASE_MODEL_PATH = "./models/rl_CoverSeeker_collision_12-19-12-30/best_model/checkpoint.pth"
-    
-    # Residual network architecture (smaller than main network)
-    RESIDUAL_HIDDEN_DIM = 64         # 隐藏层维度
-    RESIDUAL_NUM_LAYERS = 2          # 隐藏层数
-    RESIDUAL_MAX_SCALE = 0.5         # Residual 最大幅度 [-0.5, 0.5]
-    
-    # Danger gate settings (controls when residual activates)
-    DANGER_THRESHOLD = 0.3           # 归一化雷达距离 < 此值时认为危险
-    USE_LEARNED_GATE = True          # True: 学习门控权重, False: 规则门控
-    GATE_HIDDEN_DIM = 32             # 门控网络隐藏维度
-    
-    # Training hyperparameters
-    RESIDUAL_LR = 1e-4               # 学习率 (比主网络低)
-    RESIDUAL_MAX_STEPS = 5e6         # 最大训练步数
-    ACTION_PENALTY_COEF = 0.01       # L2 惩罚系数 (鼓励小 residual)
-    GATE_ENTROPY_COEF = 0.01         # 门控熵正则化 (鼓励探索)
-    GATE_LR_MULTIPLIER = 2.0         # Gate 学习率倍率
