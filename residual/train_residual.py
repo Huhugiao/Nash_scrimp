@@ -23,6 +23,10 @@ from residual.model_residual import ResidualModel
 from residual.runner_residual import ResidualRunner
 from mlp.util_mlp import set_global_seeds, make_gif, write_to_tensorboard
 from mlp.policymanager_mlp import PolicyManager
+from map_config import set_obstacle_density
+
+# 设置障碍物密度等级
+set_obstacle_density(SetupParameters.OBSTACLE_DENSITY)
 
 def extract_rl_data_from_rollout(rollout_data):
     data = rollout_data['data']
@@ -173,10 +177,11 @@ def main():
     if setproctitle:
         setproctitle.setproctitle(f"AvoidMaker_{ResidualRLConfig.EXPERIMENT_NAME}")
         
-    # Paths
+    # Paths (包含障碍物密度等级)
     TIME = datetime.datetime.now().strftime("_%m-%d-%H-%M")
     EXP_NAME = ResidualRLConfig.EXPERIMENT_NAME
-    MODEL_PATH = f'./models/{EXP_NAME}{TIME}'
+    DENSITY_TAG = f'_{SetupParameters.OBSTACLE_DENSITY}'
+    MODEL_PATH = f'./models/{EXP_NAME}{DENSITY_TAG}{TIME}'
     SUMMARY_PATH = MODEL_PATH
     os.makedirs(MODEL_PATH, exist_ok=True)
     

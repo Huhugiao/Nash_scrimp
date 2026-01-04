@@ -3,6 +3,10 @@ Residual RL 训练参数配置 (独立)
 条件式残差网络：基础模型冻结，残差网络在危险时激活进行避障修正
 """
 import datetime
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from map_config import ObstacleDensity
 
 
 class SetupParameters:
@@ -11,6 +15,9 @@ class SetupParameters:
     NUM_GPU = 1
     USE_GPU_LOCAL = False
     USE_GPU_GLOBAL = False
+    
+    # 障碍物密度等级 (none, sparse, medium, dense)
+    OBSTACLE_DENSITY = ObstacleDensity.DENSE
 
 
 class TrainingParameters:
@@ -102,10 +109,11 @@ class RecordingParameters:
     
     TIME = datetime.datetime.now().strftime("_%m-%d-%H-%M")
     
-    # 路径设置
-    SUMMARY_PATH = f'./models/{EXPERIMENT_NAME}{TIME}'
-    MODEL_PATH = f'./models/{EXPERIMENT_NAME}{TIME}'
-    GIFS_PATH = f'./models/{EXPERIMENT_NAME}{TIME}/gifs'
+    # 路径设置 (包含障碍物密度等级)
+    _DENSITY_TAG = f'_{SetupParameters.OBSTACLE_DENSITY}'
+    SUMMARY_PATH = f'./models/{EXPERIMENT_NAME}{_DENSITY_TAG}{TIME}'
+    MODEL_PATH = f'./models/{EXPERIMENT_NAME}{_DENSITY_TAG}{TIME}'
+    GIFS_PATH = f'./models/{EXPERIMENT_NAME}{_DENSITY_TAG}{TIME}/gifs'
     
     # 频率设置
     SAVE_INTERVAL = 300000

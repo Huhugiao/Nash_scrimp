@@ -17,8 +17,11 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import setproctitle
 
 from torch.utils.tensorboard import SummaryWriter
-from map_config import EnvParameters
+from map_config import EnvParameters, set_obstacle_density
 from mlp.alg_parameters_mlp import *
+
+# 设置障碍物密度等级
+set_obstacle_density(SetupParameters.OBSTACLE_DENSITY)
 from env import TrackingEnv
 from mlp.model_mlp import Model
 from mlp.runner_mlp import Runner

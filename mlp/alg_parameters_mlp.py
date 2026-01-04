@@ -1,5 +1,5 @@
 import datetime
-from map_config import EnvParameters
+from map_config import EnvParameters, ObstacleDensity
 
 class SetupParameters:
     """
@@ -11,6 +11,9 @@ class SetupParameters:
     USE_GPU_GLOBAL = False    # 是否在全局（Driver/Learner）使用GPU
     PRETRAINED_TARGET_PATH = None  # 预训练Target模型路径
     PRETRAINED_TRACKER_PATH = None # 预训练Tracker模型路径
+    
+    # 障碍物密度等级 (none, sparse, medium, dense)
+    OBSTACLE_DENSITY = ObstacleDensity.DENSE
 
 class TrainingParameters:
     """
@@ -147,10 +150,11 @@ class RecordingParameters:
     TENSORBOARD = True       # 是否使用TensorBoard
     TXT_LOG = True           # 是否记录TXT日志
     
-    # 路径设置
-    SUMMARY_PATH = f'./models/{EXPERIMENT_NAME}{TIME}'
-    MODEL_PATH = f'./models/{EXPERIMENT_NAME}{TIME}'
-    GIFS_PATH = f'./models/{EXPERIMENT_NAME}{TIME}/gifs'
+    # 路径设置 (包含障碍物密度等级)
+    _DENSITY_TAG = f'_{SetupParameters.OBSTACLE_DENSITY}'
+    SUMMARY_PATH = f'./models/{EXPERIMENT_NAME}{_DENSITY_TAG}{TIME}'
+    MODEL_PATH = f'./models/{EXPERIMENT_NAME}{_DENSITY_TAG}{TIME}'
+    GIFS_PATH = f'./models/{EXPERIMENT_NAME}{_DENSITY_TAG}{TIME}/gifs'
     
     # 频率设置
     EVAL_INTERVAL = 100000   # 评估间隔 (步数)
