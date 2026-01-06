@@ -103,20 +103,20 @@ class NetParameters:
     RADAR_DIM = 64           # 原始雷达维度
     RADAR_EMBED_DIM = 8      # 雷达编码后维度
     
-    # Inputs
-    ACTOR_SCALAR_LEN = 11    # Actor 标量部分
+    # Inputs (移除了 normalized_heading，全部第一视角观测)
+    ACTOR_SCALAR_LEN = 10    # Actor 标量部分
     PRIVILEGED_SCALAR_LEN = 8 # Target 标量部分
     
     # Input Vectors (Scalar + Embedded Radar)
     # RAW dimensions (for buffers and env interaction)
-    ACTOR_RAW_LEN = ACTOR_SCALAR_LEN + RADAR_DIM           # 11 + 64 = 75
+    ACTOR_RAW_LEN = ACTOR_SCALAR_LEN + RADAR_DIM           # 10 + 64 = 74
     PRIVILEGED_RAW_LEN = PRIVILEGED_SCALAR_LEN + RADAR_DIM # 8 + 64 = 72
-    CRITIC_RAW_LEN = ACTOR_RAW_LEN + PRIVILEGED_RAW_LEN    # 75 + 72 = 147
+    CRITIC_RAW_LEN = ACTOR_RAW_LEN + PRIVILEGED_RAW_LEN    # 74 + 72 = 146
 
     # ENCODED dimensions (for network internal processing)
-    ACTOR_VECTOR_LEN = ACTOR_SCALAR_LEN + RADAR_EMBED_DIM      # 11 + 8 = 19
+    ACTOR_VECTOR_LEN = ACTOR_SCALAR_LEN + RADAR_EMBED_DIM      # 10 + 8 = 18
     PRIVILEGED_LEN = PRIVILEGED_SCALAR_LEN + RADAR_EMBED_DIM   # 8 + 8 = 16
-    CRITIC_VECTOR_LEN = ACTOR_VECTOR_LEN + PRIVILEGED_LEN      # 19 + 16 = 35
+    CRITIC_VECTOR_LEN = ACTOR_VECTOR_LEN + PRIVILEGED_LEN      # 18 + 16 = 34
     
     ACTION_DIM = 2           # 动作维度 (Angle, Speed)
     

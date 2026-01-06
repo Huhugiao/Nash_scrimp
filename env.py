@@ -54,9 +54,9 @@ class TrackingEnv(gym.Env):
         self.steps_since_observed = 0
         self._best_distance = None
 
-        # 观测空间保持不变：tracker(27), target(24) 打包成二元组
-        # 观测空间：tracker scalar (11) + radar (64) = 75
-        obs_dim = 11 + 64
+        # 观测空间：tracker scalar (10) + radar (64) = 74
+        # 移除了 normalized_heading，因为所有观测都是第一视角，不需要世界朝向
+        obs_dim = 10 + 64
         self.observation_space = spaces.Box(low=-1.0, high=1.0,
                                             shape=(obs_dim,), dtype=np.float32)
         self.action_space = spaces.Box(
@@ -81,10 +81,24 @@ class TrackingEnv(gym.Env):
         return tracker_obs, target_obs
 
     def _get_tracker_observation(self):
-        """Tracker 相对观测（75维），FOV / 雷达基于统一射线逻辑。"""
-        obs = np.zeros(75, dtype=np.float32)
+        """Tracker 相对观测（74维），FOV / 雷达基于统一射线逻辑。
+        
+        观测结构 (全部第一视角):
+        - obs[0]: 自身速度 (归一化)
+        - obs[1]: 自身角速度 (归一化)
+        - obs[2]: 目标相对距离
+        - obs[3]: 目标相对方位角
+        - obs[4]: 相对速度
+        - obs[5]: 相对角速度
+        - obs[6]: FOV边缘角度
+        - obs[7]: in_fov 标志
+        - obs[8]: occluded 标志
+        - obs[9]: 未观测步数
+        - obs[10:74]: 64维雷达 (射线0=正前方)
+        """
+        obs = np.zeros(74, dtype=np.float32)
 
-        # 1) 自身状态
+        # 1) 自身状态 (不含朝向，因为所有观测都是第一视角)
         current_vel = self._get_velocity(self.tracker, self.prev_tracker_pos)
         vel_magnitude = float(np.linalg.norm(current_vel))
         max_speed = float(max(self.tracker_speed, self.target_speed))
@@ -94,11 +108,9 @@ class TrackingEnv(gym.Env):
             self.tracker, self.prev_tracker_pos, 
             getattr(map_config, 'tracker_max_angular_speed', 10.0)
         )
-        normalized_heading = (self.tracker['theta'] / 180.0) - 1.0
 
         obs[0] = normalized_vel
         obs[1] = normalized_angular_vel
-        obs[2] = normalized_heading
 
         # 2) 计算可见性 & 确定目标参考状态
         # 先计算真实相对信息用于判断可见性
@@ -180,11 +192,11 @@ class TrackingEnv(gym.Env):
             normalized_relative_angular_vel = 0.0
             normalized_fov_edge = 1.0
 
-        obs[3] = normalized_distance
-        obs[4] = normalized_bearing
-        obs[5] = normalized_relative_speed
-        obs[6] = normalized_relative_angular_vel
-        obs[7] = normalized_fov_edge
+        obs[2] = normalized_distance
+        obs[3] = normalized_bearing
+        obs[4] = normalized_relative_speed
+        obs[5] = normalized_relative_angular_vel
+        obs[6] = normalized_fov_edge
 
         # 5) 状态特征
         max_unobserved = float(EnvParameters.MAX_UNOBSERVED_STEPS)
@@ -192,12 +204,12 @@ class TrackingEnv(gym.Env):
             (self.steps_since_observed / max_unobserved) * 2.0 - 1.0,
             -1.0, 1.0
         )
-        obs[8] = in_fov
-        obs[9] = occluded
-        obs[10] = normalized_unobserved
+        obs[7] = in_fov
+        obs[8] = occluded
+        obs[9] = normalized_unobserved
 
-        # 4) 雷达 64 维，360°
-        obs[11:11+64] = self._sense_agent_radar(
+        # 6) 雷达 64 维，360° (射线0=正前方)
+        obs[10:10+64] = self._sense_agent_radar(
             self.tracker, num_rays=self.radar_rays, full_circle=True
         )
         return obs
@@ -296,7 +308,9 @@ class TrackingEnv(gym.Env):
         ], dtype=float)
         heading = math.radians(agent.get('theta', 0.0))
         if full_circle:
-            angles = [2 * math.pi * i / num_rays for i in range(num_rays)]
+            # 从 agent 朝向开始，顺时针环绕 360°
+            # 射线 0 = 正前方，射线 16 = 右侧，射线 32 = 后方，射线 48 = 左侧
+            angles = [heading + 2 * math.pi * i / num_rays for i in range(num_rays)]
         else:
             angle_range = math.pi
             angles = [

@@ -73,14 +73,14 @@ class NetParameters:
     RADAR_DIM = 64
     RADAR_EMBED_DIM = 8
     
-    # Inputs
-    ACTOR_SCALAR_LEN = 11
+    # Inputs (移除了 normalized_heading，全部第一视角观测)
+    ACTOR_SCALAR_LEN = 10
     PRIVILEGED_SCALAR_LEN = 8
     
     # Input Vectors (RAW dimensions)
-    ACTOR_RAW_LEN = ACTOR_SCALAR_LEN + RADAR_DIM            # 75
+    ACTOR_RAW_LEN = ACTOR_SCALAR_LEN + RADAR_DIM            # 74
     PRIVILEGED_RAW_LEN = PRIVILEGED_SCALAR_LEN + RADAR_DIM  # 72
-    CRITIC_RAW_LEN = ACTOR_RAW_LEN + PRIVILEGED_RAW_LEN     # 147
+    CRITIC_RAW_LEN = ACTOR_RAW_LEN + PRIVILEGED_RAW_LEN     # 146
     
     ACTION_DIM = 2
     CONTEXT_WINDOW = 32
