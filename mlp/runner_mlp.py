@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import ray
+import map_config
 from mlp.alg_parameters_mlp import *
 from mlp.model_mlp import Model
 from mlp.util_mlp import set_global_seeds
@@ -12,6 +13,9 @@ from cbf_controller import CBFTracker
 class Runner(object):
     def __init__(self, env_id):
         self.ID = env_id
+        # Ensure Ray worker uses obstacle density specified in alg_parameters_mlp.py
+        map_config.set_obstacle_density(SetupParameters.OBSTACLE_DENSITY)
+
         set_global_seeds(env_id * 123)
         # Use ENABLE_SAFETY_LAYER from RecordingParameters
         enable_safety = getattr(RecordingParameters, 'ENABLE_SAFETY_LAYER', True)

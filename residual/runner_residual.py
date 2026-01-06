@@ -1,278 +1,287 @@
 import numpy as np
 import torch
 import ray
-from residual.alg_parameters_residual import *
-from mlp.model_mlp import Model as BaseModel  # For loading base policy
+import map_config
+
+from residual.alg_parameters_residual import SetupParameters, TrainingParameters, NetParameters, ResidualRLConfig
+from mlp.model_mlp import Model as BaseModel
 from residual.nets_residual import ResidualPolicyNetwork
 from mlp.util_mlp import set_global_seeds
 from env import TrackingEnv
 from mlp.policymanager_mlp import PolicyManager
 
+
+def _log_prob_from_pre_tanh(pre_tanh: torch.Tensor, mean: torch.Tensor, log_std: torch.Tensor) -> torch.Tensor:
+    """
+    Log prob of a Tanh-squashed Gaussian action, computed from pre-tanh sample u.
+    action = tanh(u) * scale  (scale does not affect log_det_jac of tanh; constant scale ignored here)
+    """
+    std = torch.exp(log_std)
+    dist = torch.distributions.Normal(mean, std)
+    base_log_prob = dist.log_prob(pre_tanh)  # [B, action_dim]
+    log_det_jac = torch.log(1.0 - torch.tanh(pre_tanh) ** 2 + 1e-6)  # [B, action_dim]
+    return (base_log_prob - log_det_jac).sum(dim=-1)  # [B]
+
+
 @ray.remote(num_cpus=1, num_gpus=SetupParameters.NUM_GPU / max((TrainingParameters.N_ENVS + 1), 1))
 class ResidualRunner(object):
-    """
-    Runner for Residual RL Training (Simplified Radar-Only).
-    
-    Manages interaction:
-    1. Get Base Action (Frozen RL)
-    2. Get Residual Action from radar (Trainable)
-    3. Fuse: action = base + residual
-    4. Step Environment
-    
-    Note: No Gate - Actor learns to output ~0 when safe via L2 penalty.
-    """
-    def __init__(self, env_id):
-        self.ID = env_id
-        set_global_seeds(env_id * 123 + 1000) # Offset seed to avoid exact same eps as base training
-        self.env = TrackingEnv()
-        self.local_device = torch.device('cuda') if SetupParameters.USE_GPU_LOCAL else torch.device('cpu')
-        
-        # --- Load Frozen Base Model ---
-        print(f"ResidualRunner {env_id}: Loading base model from {ResidualRLConfig.BASE_MODEL_PATH}")
+    def __init__(self, env_id: int):
+        self.ID = int(env_id)
+        set_global_seeds(self.ID * 123 + 1000)
+
+        # Ensure Ray worker uses obstacle density from alg_parameters_residual.py
+        map_config.set_obstacle_density(SetupParameters.OBSTACLE_DENSITY)
+
+        # Safety layer MUST be OFF during residual training (your requirement)
+        self.env = TrackingEnv(enable_safety_layer=False)
+
+        self.local_device = torch.device("cuda") if SetupParameters.USE_GPU_LOCAL else torch.device("cpu")
+
+        # Load frozen base model
         self.base_model = BaseModel(self.local_device)
-        checkpoint = torch.load(ResidualRLConfig.BASE_MODEL_PATH, map_location=self.local_device)
-        # Handle cases where checkpoint structure might differ
-        if 'model_weights' in checkpoint:
-            self.base_model.set_weights(checkpoint['model_weights'])
-        elif 'model' in checkpoint:
-            self.base_model.set_weights(checkpoint['model'])
+        ckpt = torch.load(ResidualRLConfig.BASE_MODEL_PATH, map_location=self.local_device)
+        if isinstance(ckpt, dict) and "model_weights" in ckpt:
+            self.base_model.set_weights(ckpt["model_weights"])
+        elif isinstance(ckpt, dict) and "model" in ckpt:
+            self.base_model.set_weights(ckpt["model"])
         else:
-            # Assume strict state dict if not wrapped
-            self.base_model.network.load_state_dict(checkpoint)
-        
-        # We don't need optimizer for base model, just inference
+            self.base_model.network.load_state_dict(ckpt)
         self.base_model.network.eval()
-        
-        # --- Initialize Residual Model (for local inference/sync) ---
+
+        # Residual policy (synced from learner each rollout)
         self.residual_model = ResidualPolicyNetwork().to(self.local_device)
-        
-        # Opponent handling (standard)
-        self.opponent_model = BaseModel(self.local_device) if TrainingParameters.OPPONENT_TYPE == "policy" else None
+        self.residual_model.eval()
+
+        # Opponent policy manager (optional)
         self.policy_manager = PolicyManager() if TrainingParameters.OPPONENT_TYPE in {"random", "random_nonexpert"} else None
         self.current_opponent_policy = None
-        self.current_opponent_id = -1
-        
+
         self.reset_env()
 
     def reset_env(self):
-        obs_tuple = self.env.reset()
-        # Gymnasium reset returns (obs, info), obs is (tracker_obs, target_obs)
-        if isinstance(obs_tuple, tuple) and len(obs_tuple) == 2:
-            obs, info = obs_tuple
-            if isinstance(obs, (tuple, list)) and len(obs) == 2:
-                self.tracker_obs, self.target_obs = obs
-            else:
-                self.tracker_obs = obs
-                self.target_obs = obs
-        else:
-            self.tracker_obs = obs_tuple
-            self.target_obs = obs_tuple
-        
+        obs, _info = self.env.reset()
+        # env returns (tracker_obs, target_obs)
+        self.tracker_obs, self.target_obs = obs
         self.tracker_obs = np.asarray(self.tracker_obs, dtype=np.float32)
         self.target_obs = np.asarray(self.target_obs, dtype=np.float32)
 
-    def _get_opponent_action(self, target_obs, tracker_obs):
-        # Same logic as main runner
-        if TrainingParameters.OPPONENT_TYPE == "policy":
-            critic_obs = np.concatenate([target_obs, tracker_obs])
-            opp_action, _, _, _ = self.opponent_model.evaluate(target_obs, critic_obs, greedy=True)
-            return opp_action
-        elif TrainingParameters.OPPONENT_TYPE in {"random", "random_nonexpert"}:
-            if self.policy_manager and self.current_opponent_policy:
-                return self.policy_manager.get_action(self.current_opponent_policy, target_obs)
-            return np.zeros(2, dtype=np.float32)
+    def _get_opponent_action(self, target_obs: np.ndarray) -> np.ndarray:
+        # TrainingParameters.OPPONENT_TYPE == "random" in your config; keep robust behavior
+        if self.policy_manager is not None:
+            if self.current_opponent_policy is None:
+                # PolicyManager API may vary; try best-effort
+                try:
+                    self.current_opponent_policy, _ = self.policy_manager.sample_policy("target")
+                except Exception:
+                    self.current_opponent_policy = "Greedy"
+            try:
+                return np.asarray(self.policy_manager.get_action(self.current_opponent_policy, target_obs), dtype=np.float32)
+            except Exception:
+                return np.zeros(2, dtype=np.float32)
+
+        # Fallback: stationary target (should not happen with your current config)
         return np.zeros(2, dtype=np.float32)
 
     def run(self, residual_weights, opponent_weights, total_steps, policy_manager_state=None):
-        """
-        Execute rollout with Gated Residual Policy.
-        """
-        with torch.no_grad():
-            # Sync weights
-            self.residual_model.load_state_dict(residual_weights)
-            if opponent_weights and self.opponent_model:
-                self.opponent_model.set_weights(opponent_weights)
-            
-            if self.policy_manager and policy_manager_state:
+        # Sync residual weights
+        self.residual_model.load_state_dict(residual_weights)
+        self.residual_model.eval()
+
+        # Restore policy_manager state if provided
+        if self.policy_manager is not None and policy_manager_state:
+            try:
                 for name, history in policy_manager_state.items():
                     if name in self.policy_manager.win_history:
                         self.policy_manager.win_history[name] = list(history)
+            except Exception:
+                pass
 
-            n_steps = TrainingParameters.N_STEPS
-            
-            # Data buffers
-            data = {
-                'actor_obs': np.zeros((n_steps, NetParameters.ACTOR_RAW_LEN), dtype=np.float32),
-                'critic_obs': np.zeros((n_steps, NetParameters.CRITIC_RAW_LEN), dtype=np.float32),
-                'radar_obs': np.zeros((n_steps, NetParameters.RADAR_DIM), dtype=np.float32),
-                'velocity_obs': np.zeros((n_steps, NetParameters.VELOCITY_DIM), dtype=np.float32),
-                'rewards': np.zeros(n_steps, dtype=np.float32),
-                'values': np.zeros(n_steps, dtype=np.float32),
-                'actions': np.zeros((n_steps, NetParameters.ACTION_DIM), dtype=np.float32),
-                'logp': np.zeros(n_steps, dtype=np.float32),
-                'dones': np.zeros(n_steps, dtype=np.bool_),
-                'episode_starts': np.zeros(n_steps, dtype=np.bool_),
-                
-                # Extra logs
-                'base_actions': np.zeros((n_steps, NetParameters.ACTION_DIM), dtype=np.float32),
-                'residual_actions': np.zeros((n_steps, NetParameters.ACTION_DIM), dtype=np.float32),
-                'episode_success': []
-            }
-            
-            performance_dict = {'per_r': [], 'per_episode_len': [], 'win': []}
+        n_steps = int(TrainingParameters.N_STEPS)
 
-            if self.current_opponent_policy is None and self.policy_manager:
-                self.current_opponent_policy, self.current_opponent_id = self.policy_manager.sample_policy("target")
+        # Determine obs sizes dynamically (avoid relying on missing NetParameters constants)
+        actor_dim = int(self.tracker_obs.size)
+        target_dim = int(self.target_obs.size)
+        critic_dim = actor_dim + target_dim
+        action_dim = 2
 
-            episode_reward = 0.0
-            ep_len = 0
-            episodes = 0
-            episode_start = True
-            current_episode_idx = 0
-            completed_opponents = []
+        data = {
+            "actor_obs": np.zeros((n_steps, actor_dim), dtype=np.float32),
+            "critic_obs": np.zeros((n_steps, critic_dim), dtype=np.float32),
+            "radar_obs": np.zeros((n_steps, NetParameters.RADAR_DIM), dtype=np.float32),
+            "velocity_obs": np.zeros((n_steps, 2), dtype=np.float32),
+            "base_actions": np.zeros((n_steps, action_dim), dtype=np.float32),
+            # Store PRE-TANH action u for PPO logp consistency
+            "actions": np.zeros((n_steps, action_dim), dtype=np.float32),
+            "logp": np.zeros((n_steps,), dtype=np.float32),
+            "values": np.zeros((n_steps,), dtype=np.float32),
+            "rewards": np.zeros((n_steps,), dtype=np.float32),
+            "dones": np.zeros((n_steps,), dtype=np.bool_),
+            "episode_starts": np.zeros((n_steps,), dtype=np.bool_),
+        }
 
-            for i in range(n_steps):
-                critic_obs_full = np.concatenate([self.tracker_obs, self.target_obs])
-                
-                # --- 1. Get Base Action (Frozen) ---
-                base_action, _, _, _ = self.base_model.evaluate(self.tracker_obs, critic_obs_full, greedy=True)
-                base_action_tensor = torch.from_numpy(base_action).float().to(self.local_device).unsqueeze(0)
-                
-                # --- 2. Extract radar observation (64-dim) and velocity (2-dim) ---
-                radar_obs = self.tracker_obs[NetParameters.ACTOR_SCALAR_LEN:]
-                radar_tensor = torch.from_numpy(radar_obs).float().to(self.local_device).unsqueeze(0)
-                
-                # Velocity: obs[0] = linear_vel, obs[1] = angular_vel
-                velocity_obs = self.tracker_obs[0:2]
-                velocity_tensor = torch.from_numpy(velocity_obs).float().to(self.local_device).unsqueeze(0)
-                
-                # --- 3. Get Residual Action (Stochastic) from radar + base_action + velocity ---
-                mean, log_std = self.residual_model.actor(radar_tensor, base_action_tensor, velocity_tensor)
+        performance = {"per_r": [], "per_episode_len": [], "win": []}
+        completed_opponents = []
+
+        # Safety shaping (adds emphasis on "not too close", on top of env_reward)
+        SAFE_EDGE_PX = 18.0      # below this edge distance, penalize strongly
+        SAFE_W = 0.15            # safety emphasis weight (keep modest; env_reward already has shaping)
+        EXTRA_COLLISION_PEN = 5.0  # extra penalty when tracker_collision happens (env_reward already penalizes)
+        action_pen_coef = float(getattr(ResidualRLConfig, "ACTION_PENALTY_COEF", 0.0))
+
+        # Residual scale (best-effort from network)
+        max_scale = 1.0
+        try:
+            max_scale = float(getattr(self.residual_model.actor, "max_scale", 1.0))
+        except Exception:
+            max_scale = 1.0
+
+        episode_reward = 0.0
+        ep_len = 0
+        episode_start = True
+
+        residual_l2_sum = 0.0
+        collision_steps = 0
+        min_edge_sum = 0.0
+        min_edge_count = 0
+
+        for t in range(n_steps):
+            tracker_obs = self.tracker_obs
+            target_obs = self.target_obs
+            critic_obs = np.concatenate([tracker_obs, target_obs]).astype(np.float32)
+
+            # Base action (frozen)
+            base_action, _, _, _ = self.base_model.evaluate(tracker_obs, critic_obs, greedy=True)
+            base_action = np.asarray(base_action, dtype=np.float32).reshape(-1)
+            base_action_t = torch.from_numpy(base_action).float().to(self.local_device).unsqueeze(0)
+
+            # Residual inputs
+            radar_obs = np.asarray(tracker_obs[NetParameters.ACTOR_SCALAR_LEN:], dtype=np.float32)
+            vel_obs = np.asarray(tracker_obs[0:2], dtype=np.float32)
+
+            radar_t = torch.from_numpy(radar_obs).float().to(self.local_device).unsqueeze(0)
+            vel_t = torch.from_numpy(vel_obs).float().to(self.local_device).unsqueeze(0)
+
+            with torch.no_grad():
+                mean, log_std = self.residual_model.actor(radar_t, base_action_t, vel_t)
                 std = torch.exp(log_std)
-                noise = torch.randn_like(mean)
-                residual_action_sampled = mean + std * noise
-                
-                # Compute log probability
-                log_prob = -0.5 * (((residual_action_sampled - mean) / std).pow(2) + 2 * log_std + np.log(2 * np.pi)).sum(-1)
-                
-                # --- 4. Simple Additive Fusion ---
-                fused_action = ResidualPolicyNetwork.fuse_actions(
-                    base_action_tensor, 
-                    residual_action_sampled
-                )
-                final_action_np = fused_action.cpu().numpy()[0]
-                
-                # --- 5. Get Value from radar ---
-                value_pred = self.residual_model.critic(radar_tensor).item()
-                
-                # --- 6. Step Environment ---
-                target_action = self._get_opponent_action(self.target_obs, self.tracker_obs)
-                
-                obs_result, env_reward, terminated, truncated, info = self.env.step(
-                    (final_action_np, target_action)
-                )
-                
-                # === Reward for Residual Learning (No Gate) ===
-                # Reward = Collision Penalty + L2 Regularization on Residual
-                # Actor learns to output ~0 when safe via L2 penalty
-                
-                # 1. Collision penalty
-                if info.get('tracker_collision', False):
-                    collision_penalty = -10.0
-                else:
-                    collision_penalty = 0.0
-                
-                # 2. L2 penalty on raw residual action magnitude
-                residual_magnitude = float(np.linalg.norm(residual_action_sampled.cpu().numpy()[0]))
-                l2_penalty = -ResidualRLConfig.ACTION_PENALTY_COEF * residual_magnitude
-                
-                reward = collision_penalty + l2_penalty
-                
-                done = terminated or truncated
+                u = mean + std * torch.randn_like(mean)  # pre-tanh
+                residual_used = torch.tanh(u) * max_scale  # bounded executed residual
+                logp = _log_prob_from_pre_tanh(u, mean, log_std)
+                value = self.residual_model.critic(radar_t).squeeze(-1)
 
-                # Store data
-                data['actor_obs'][i] = self.tracker_obs
-                data['critic_obs'][i] = critic_obs_full
-                data['radar_obs'][i] = radar_obs  # 64-dim radar
-                data['velocity_obs'][i] = velocity_obs  # 2-dim velocity
-                data['values'][i] = value_pred
-                data['actions'][i] = residual_action_sampled.cpu().numpy()[0]
-                data['logp'][i] = log_prob.cpu().numpy()[0]
-                data['rewards'][i] = reward
-                data['dones'][i] = done
-                data['episode_starts'][i] = episode_start
-                
-                data['base_actions'][i] = base_action
-                data['residual_actions'][i] = residual_action_sampled.cpu().numpy()[0]
-                
-                episode_start = False
-                episode_reward += float(reward)
-                ep_len += 1
-                
-                if isinstance(obs_result, tuple) and len(obs_result) == 2:
-                    self.tracker_obs, self.target_obs = obs_result
-                else:
-                    self.tracker_obs = obs_result
-                    self.target_obs = obs_result
+                fused = ResidualPolicyNetwork.fuse_actions(base_action_t, residual_used)
+                tracker_action = fused.squeeze(0).cpu().numpy().astype(np.float32)
 
-                # Obs Noise
-                if TrainingParameters.OBS_NOISE_STD > 0:
-                    self.tracker_obs = self.tracker_obs + np.random.randn(*self.tracker_obs.shape).astype(np.float32) * TrainingParameters.OBS_NOISE_STD
-                    self.tracker_obs = np.clip(self.tracker_obs, -1.0, 1.0)
+            # Opponent action
+            target_action = self._get_opponent_action(target_obs)
+            obs_next, env_reward, terminated, truncated, info = self.env.step((tracker_action, target_action))
+            done = bool(terminated or truncated)
 
-                if done:
-                    win = 1 if info.get('reason') == 'tracker_caught_target' else 0
-                    performance_dict['per_r'].append(episode_reward)
-                    performance_dict['per_episode_len'].append(ep_len)
-                    performance_dict['win'].append(win)
-                    
-                    completed_opponents.append(self.current_opponent_policy)
+            if bool(info.get("tracker_collision", False)):
+                collision_steps += 1
 
-                    if self.policy_manager:
+            # --- Reward: base env reward + extra safety emphasis - residual penalty ---
+            r = float(env_reward)
+
+            if bool(info.get("tracker_collision", False)):
+                r -= EXTRA_COLLISION_PEN
+
+            # Absolute closeness penalty using info['min_edge_distance'] (px). Smaller => more dangerous.
+            min_edge = info.get("min_edge_distance", None)
+            if min_edge is not None:
+                min_edge_sum += float(min_edge)
+                min_edge_count += 1
+                d = float(min_edge)
+                if d < SAFE_EDGE_PX:
+                    x = (SAFE_EDGE_PX - d) / (SAFE_EDGE_PX + 1e-6)
+                    r -= SAFE_W * (x * x)
+
+            # Penalize magnitude of executed residual (bounded)
+            residual_np = residual_used.squeeze(0).cpu().numpy().astype(np.float32)
+            residual_l2_sum += float(np.linalg.norm(residual_np))
+            r -= action_pen_coef * float(np.sum(residual_np * residual_np))
+
+            # Store rollout
+            data["actor_obs"][t] = tracker_obs
+            data["critic_obs"][t] = critic_obs
+            data["radar_obs"][t] = radar_obs
+            data["velocity_obs"][t] = vel_obs
+            data["base_actions"][t] = base_action
+            data["actions"][t] = u.squeeze(0).cpu().numpy().astype(np.float32)  # pre-tanh
+            data["logp"][t] = float(logp.item())
+            data["values"][t] = float(value.item())
+            data["rewards"][t] = float(r)
+            data["dones"][t] = done
+            data["episode_starts"][t] = episode_start
+
+            episode_start = False
+            episode_reward += float(r)
+            ep_len += 1
+
+            # Unpack next obs
+            (self.tracker_obs, self.target_obs) = obs_next
+            self.tracker_obs = np.asarray(self.tracker_obs, dtype=np.float32)
+            self.target_obs = np.asarray(self.target_obs, dtype=np.float32)
+
+            if done:
+                win = 1 if info.get("reason") == "tracker_caught_target" else 0
+                performance["per_r"].append(float(episode_reward))
+                performance["per_episode_len"].append(int(ep_len))
+                performance["win"].append(int(win))
+
+                if self.policy_manager is not None:
+                    try:
                         self.policy_manager.update_win_rate(self.current_opponent_policy, win)
-                        self.policy_manager.reset()
-                        self.current_opponent_policy, self.current_opponent_id = self.policy_manager.sample_policy("target")
+                        completed_opponents.append(self.current_opponent_policy)
+                        self.current_opponent_policy, _ = self.policy_manager.sample_policy("target")
+                    except Exception:
+                        pass
 
-                    data['episode_success'].append({
-                        'start_idx': current_episode_idx,
-                        'end_idx': i + 1,
-                        'success': bool(win),
-                        'reward': episode_reward,
-                        'length': ep_len,
-                        'opponent': completed_opponents[-1]
-                    })
-                    
-                    episodes += 1
-                    episode_reward = 0.0
-                    ep_len = 0
-                    episode_start = True
-                    current_episode_idx = i + 1
-                    self.reset_env()
+                episode_reward = 0.0
+                ep_len = 0
+                episode_start = True
+                self.reset_env()
 
-            # GAE Calculation
-            radar_last = self.tracker_obs[NetParameters.ACTOR_SCALAR_LEN:]
-            radar_tensor_last = torch.from_numpy(radar_last).float().to(self.local_device).unsqueeze(0)
-            last_value = self.residual_model.critic(radar_tensor_last).item()
-            
-            advantages = np.zeros_like(data['rewards'])
-            lastgaelam = 0.0
-            for t in reversed(range(n_steps)):
-                if t == n_steps - 1:
-                    next_non_terminal = 1.0 - data['dones'][t]
-                    next_value = last_value
-                else:
-                    next_non_terminal = 1.0 - data['dones'][t + 1]
-                    next_value = data['values'][t + 1]
-                delta = data['rewards'][t] + TrainingParameters.GAMMA * next_value * next_non_terminal - data['values'][t]
-                lastgaelam = delta + TrainingParameters.GAMMA * TrainingParameters.LAM * next_non_terminal * lastgaelam
-                advantages[t] = lastgaelam
-            data['returns'] = advantages + data['values']
+        # Compute GAE returns
+        with torch.no_grad():
+            radar_last = np.asarray(self.tracker_obs[NetParameters.ACTOR_SCALAR_LEN:], dtype=np.float32)
+            radar_last_t = torch.from_numpy(radar_last).float().to(self.local_device).unsqueeze(0)
+            last_value = float(self.residual_model.critic(radar_last_t).squeeze(-1).item())
 
-            pm_state = {k: list(v) for k, v in self.policy_manager.win_history.items()} if self.policy_manager else None
-            return {
-                'data': data,
-                'performance': performance_dict,
-                'episodes': episodes,
-                'policy_manager_state': pm_state,
-                'completed_opponents': completed_opponents
-            }
+        advantages = np.zeros((n_steps,), dtype=np.float32)
+        lastgaelam = 0.0
+        for t in reversed(range(n_steps)):
+            if t == n_steps - 1:
+                next_non_terminal = 1.0 - float(data["dones"][t])
+                next_value = last_value
+            else:
+                next_non_terminal = 1.0 - float(data["dones"][t + 1])
+                next_value = float(data["values"][t + 1])
+            delta = float(data["rewards"][t]) + float(TrainingParameters.GAMMA) * next_value * next_non_terminal - float(data["values"][t])
+            lastgaelam = delta + float(TrainingParameters.GAMMA) * float(TrainingParameters.LAM) * next_non_terminal * lastgaelam
+            advantages[t] = float(lastgaelam)
+
+        data["returns"] = advantages + data["values"]
+
+        pm_state = None
+        if self.policy_manager is not None:
+            try:
+                pm_state = {k: list(v) for k, v in self.policy_manager.win_history.items()}
+            except Exception:
+                pm_state = None
+
+
+        extra_stats = {
+            "residual_l2_mean": float(residual_l2_sum) / float(n_steps),
+            "collision_rate": float(collision_steps) / float(n_steps),
+            "min_edge_distance_mean": (float(min_edge_sum) / float(min_edge_count)) if min_edge_count > 0 else float("nan"),
+        }
+
+        return {
+            "data": data,
+            "performance": performance,
+            "episodes": len(performance["per_r"]),
+            "policy_manager_state": pm_state,
+            "completed_opponents": completed_opponents,
+            "extra_stats": extra_stats,
+        }

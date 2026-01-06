@@ -13,7 +13,7 @@ class SetupParameters:
     PRETRAINED_TRACKER_PATH = None # 预训练Tracker模型路径
     
     # 障碍物密度等级 (none, sparse, medium, dense)
-    OBSTACLE_DENSITY = ObstacleDensity.DENSE
+    OBSTACLE_DENSITY = ObstacleDensity.SPARSE
 
 class TrainingParameters:
     """
@@ -121,8 +121,8 @@ class NetParameters:
     ACTION_DIM = 2           # 动作维度 (Angle, Speed)
     
     # MLP 特有参数
-    HIDDEN_DIM = 128         # 隐藏层维度
-    NUM_HIDDEN_LAYERS = 5    # 隐藏层层数
+    HIDDEN_DIM = 256         # 隐藏层维度
+    NUM_HIDDEN_LAYERS = 3    # 隐藏层层数
     CONTEXT_WINDOW = TrainingParameters.TBPTT_STEPS # 上下文窗口长度 (用于数据处理)
 
 class RecordingParameters:

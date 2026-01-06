@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from residual.alg_parameters_residual import NetParameters
 
@@ -49,25 +50,15 @@ class ResidualActorNetwork(nn.Module):
         nn.init.constant_(self.mean_head.bias, 0.0)
         
     def forward(self, radar, base_action, velocity):
-        """
-        Args:
-            radar: (batch, 64) - normalized radar readings
-            base_action: (batch, 2) - base policy action
-            velocity: (batch, 2) - [linear_vel, angular_vel] normalized
-        Returns:
-            mean: (batch, action_dim) - bounded in [-max_scale, max_scale]
-            log_std: (batch, action_dim)
-        """
-        combined = torch.cat([radar, base_action, velocity], dim=-1)
-        features = self.feature_net(combined)
-        
-        raw_mean = self.mean_head(features)
-        log_std = self.log_std_head(features)
-        
-        scaled_mean = torch.tanh(raw_mean) * self.max_scale
-        log_std = torch.clamp(log_std, -20, 2)
-        
-        return scaled_mean, log_std
+        # Concatenate inputs
+        x = torch.cat([radar, base_action, velocity], dim=-1)
+        h = self.feature_net(x)
+
+        # IMPORTANT: return raw_mean (unbounded). Squashing happens at sampling/execution time.
+        raw_mean = self.mean_head(h)
+        log_std = self.log_std_head(h)
+        log_std = torch.clamp(log_std, NetParameters.LOG_STD_MIN, NetParameters.LOG_STD_MAX)
+        return raw_mean, log_std
 
 
 class ResidualCriticNetwork(nn.Module):

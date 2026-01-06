@@ -56,7 +56,10 @@ class TrainingParameters:
     
     RANDOM_OPPONENT_WEIGHTS = {
         "target": {
-            "CoverSeeker": 1.0,
+            "Greedy": 1.0,
+            # "CoverSeeker": 1.0,
+            # "ZigZag": 0.5,
+            # "Orbiter": 0.5,
         }
     }
     
@@ -88,6 +91,10 @@ class NetParameters:
     RESIDUAL_HIDDEN_DIM = 64          # 隐藏层维度 (比MLP小)
     RESIDUAL_NUM_LAYERS = 2           # 隐藏层数
     RESIDUAL_MAX_SCALE = 0.5          # Residual 最大幅度 [-0.5, 0.5]
+    
+    # Log std bounds for residual actor (stability)
+    LOG_STD_MIN = -20.0
+    LOG_STD_MAX = 2.0
 
 
 class ResidualRLConfig:
@@ -96,7 +103,7 @@ class ResidualRLConfig:
     EXPERIMENT_NAME = "residual_avoidance"
     
     # 基础模型路径 (冻结的预训练 Tracker)
-    BASE_MODEL_PATH = "./models/rl_CoverSeeker_collision_12-19-12-30/best_model/checkpoint.pth"
+    BASE_MODEL_PATH = "./models/rl_Greedy_collision_medium_01-05-09-21/best_model/checkpoint.pth"
     
     # 惩罚系数
     ACTION_PENALTY_COEF = 0.002       # L2 惩罚 (鼓励小 residual)

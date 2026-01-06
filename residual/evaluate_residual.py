@@ -76,6 +76,7 @@ class EvalConfig:
     seed: int
     obstacle_density: str
     enable_safety_layer: bool
+    stochastic_residual: bool = False
 
 
 def _get_target_policy(name: str):
@@ -84,14 +85,34 @@ def _get_target_policy(name: str):
     return TARGET_POLICY_REGISTRY[name]()
 
 
-def _fuse_action(base_action: np.ndarray, radar_obs: np.ndarray, velocity_obs: np.ndarray, residual_net: ResidualPolicyNetwork, device: torch.device) -> np.ndarray:
-    """Fuse base action with deterministic residual correction."""
+def _fuse_action(
+    base_action: np.ndarray,
+    radar_obs: np.ndarray,
+    velocity_obs: np.ndarray,
+    residual_net: ResidualPolicyNetwork,
+    device: torch.device,
+    stochastic: bool = False,
+) -> np.ndarray:
+    """Fuse base action with residual correction.
+
+    If stochastic=True, sample residual the same way as training:
+      residual = mean + std * noise, where noise ~ N(0, I)
+    """
     radar_tensor = torch.as_tensor(radar_obs, dtype=torch.float32, device=device).unsqueeze(0)
     base_tensor = torch.as_tensor(base_action, dtype=torch.float32, device=device).unsqueeze(0)
     velocity_tensor = torch.as_tensor(velocity_obs, dtype=torch.float32, device=device).unsqueeze(0)
+
     with torch.no_grad():
-        mean, _ = residual_net.actor(radar_tensor, base_tensor, velocity_tensor)
-        fused = ResidualPolicyNetwork.fuse_actions(base_tensor, mean)
+        mean, log_std = residual_net.actor(radar_tensor, base_tensor, velocity_tensor)
+        if stochastic:
+            std = torch.exp(log_std)
+            noise = torch.randn_like(mean)
+            residual = mean + std * noise
+        else:
+            residual = mean
+
+        fused = ResidualPolicyNetwork.fuse_actions(base_tensor, residual)
+
     return fused.cpu().numpy()[0]
 
 
@@ -141,12 +162,20 @@ def run_single_episode(mode: str,
                 target_actor_obs = np.asarray(target_obs, dtype=np.float32)
 
                 tracker_critic_obs = build_critic_observation(tracker_actor_obs, target_actor_obs)
+                # base tracker action
                 base_action, _, _, _ = base_model.evaluate(tracker_actor_obs, tracker_critic_obs, greedy=True)
 
                 if mode == "residual":
                     radar_obs = tracker_actor_obs[NetParameters.ACTOR_SCALAR_LEN:]
                     velocity_obs = tracker_actor_obs[0:2]  # linear_vel, angular_vel
-                    tracker_action = _fuse_action(base_action, radar_obs, velocity_obs, residual_net, device)
+                    tracker_action = _fuse_action(
+                        base_action=base_action,
+                        radar_obs=radar_obs,
+                        velocity_obs=velocity_obs,
+                        residual_net=residual_net,
+                        device=device,
+                        stochastic=cfg.stochastic_residual,
+                    )
                 else:
                     tracker_action = np.asarray(base_action, dtype=np.float32)
 
@@ -374,8 +403,8 @@ def run_strategy_evaluation(cfg: EvalConfig, target_strategies: List[str]):
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate base tracker vs residual-enhanced tracker")
-    parser.add_argument("--residual_model", default='models/residual_avoidance_12-23-11-47/latest_model/checkpoint.pth', help="Path to residual checkpoint (best_model/checkpoint.pth)")
-    parser.add_argument("--base_model", default='models/rl_CoverSeeker_collision_12-19-12-30/best_model/checkpoint.pth', help="Path to base tracker checkpoint")
+    parser.add_argument("--residual_model", default='models/residual_avoidance_dense_01-06-10-58/best_model/checkpoint.pth', help="Path to residual checkpoint (best_model/checkpoint.pth)")
+    parser.add_argument("--base_model", default='models/rl_Greedy_collision_medium_01-05-09-21/best_model/checkpoint.pth', help="Path to base tracker checkpoint")
     parser.add_argument("--target_policy", default=DEFAULT_TARGET_POLICY, help="Target policy to evaluate against (use 'all' for all policies)")
     parser.add_argument("--episodes", type=int, default=100, help="Number of episodes per tracker mode")
     parser.add_argument("--save_gif_freq", type=int, default=30, help="Save GIF every N episodes (0 to disable)")
@@ -383,6 +412,11 @@ def main():
     parser.add_argument("--seed", type=int, default=1234, help="Random seed")
     parser.add_argument("--obstacles", type=str, default=ObstacleDensity.DENSE, choices=ObstacleDensity.ALL_LEVELS, help="Obstacle density level")
     parser.add_argument("--safety-layer", action="store_true", help="Enable environment safety layer (default: disabled)")
+    parser.add_argument(
+        "--stochastic-residual",
+        action="store_true",
+        help="Sample residual action as mean + std*noise (matches training); default uses mean only",
+    )
 
     args = parser.parse_args()
 
@@ -410,7 +444,8 @@ def main():
         output_dir=run_root,
         seed=args.seed,
         obstacle_density=args.obstacles,
-        enable_safety_layer=args.safety_layer  # Default: disabled (collisions detected)
+        enable_safety_layer=args.safety_layer,
+        stochastic_residual=args.stochastic_residual,
     )
 
     set_global_seeds(cfg.seed)

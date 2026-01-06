@@ -2,7 +2,7 @@ import numpy as np
 import torch
 from residual.nets_residual import ResidualPolicyNetwork
 from residual.alg_parameters_residual import (
-    TrainingParameters, 
+    TrainingParameters,
     NetParameters,
     ResidualRLConfig
 )
@@ -47,12 +47,12 @@ class ResidualModel:
         return torch.nan_to_num(input_vector)
 
     @staticmethod
-    def _log_prob_from_pre_tanh(pre_tanh, mean, log_std):
+    def _log_prob_from_pre_tanh(pre_tanh: torch.Tensor, mean: torch.Tensor, log_std: torch.Tensor) -> torch.Tensor:
         std = torch.exp(log_std)
         dist = torch.distributions.Normal(mean, std)
-        base_log_prob = dist.log_prob(pre_tanh)
-        log_det_jac = torch.log(1.0 - torch.tanh(pre_tanh) ** 2 + 1e-6)
-        return (base_log_prob - log_det_jac).sum(dim=-1)
+        base_log_prob = dist.log_prob(pre_tanh)  # [B, action_dim]
+        log_det_jac = torch.log(1.0 - torch.tanh(pre_tanh) ** 2 + 1e-6)  # [B, action_dim]
+        return (base_log_prob - log_det_jac).sum(dim=-1)  # [B]
 
     def train(self, radar_obs=None, base_actions=None, velocity_obs=None,
               returns=None, values=None, actions=None, old_log_probs=None, mask=None,
@@ -106,8 +106,8 @@ class ResidualModel:
             # Forward pass through residual network (radar + base_action + velocity)
             mean, log_std = self.network.actor(radar_obs, base_actions_t, velocity_t)
             new_values = self.network.critic(radar_obs).squeeze(-1)
-            
-            # Compute new log probs
+
+            # IMPORTANT: actions here must be pre-tanh u (runner 已经按 u 存了)
             new_log_probs = self._log_prob_from_pre_tanh(actions, mean, log_std)
 
             # Compute advantages

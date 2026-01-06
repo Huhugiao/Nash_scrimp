@@ -216,6 +216,8 @@ def main():
     
     epoch_perf_buffer = {'per_r': [], 'per_episode_len': [], 'win': []}
     epoch_loss_buffer = []
+
+    epoch_extra_buffer = {'residual_l2': [], 'collision_rate': [], 'min_edge_distance': []}
     
     last_train_log_t = 0
     last_save_t = 0
@@ -255,6 +257,22 @@ def main():
                 epoch_perf_buffer['per_r'].extend(perf['per_r'])
                 epoch_perf_buffer['per_episode_len'].extend(perf['per_episode_len'])
                 epoch_perf_buffer['win'].extend(perf['win'])
+                extra = result.get('extra_stats', {})
+                if extra:
+                    try:
+                        epoch_extra_buffer['residual_l2'].append(float(extra.get('residual_l2_mean')))
+                    except Exception:
+                        pass
+                    try:
+                        epoch_extra_buffer['collision_rate'].append(float(extra.get('collision_rate')))
+                    except Exception:
+                        pass
+                    try:
+                        v = float(extra.get('min_edge_distance_mean'))
+                        if np.isfinite(v):
+                            epoch_extra_buffer['min_edge_distance'].append(v)
+                    except Exception:
+                        pass
                 total_new_episodes += result['episodes']
                 
                 if global_pm and result['policy_manager_state']:
@@ -328,6 +346,8 @@ def main():
 
                 epoch_perf_buffer = {'per_r': [], 'per_episode_len': [], 'win': []}
                 epoch_loss_buffer = []
+
+                epoch_extra_buffer = {'residual_l2': [], 'collision_rate': [], 'min_edge_distance': []}
 
             # Periodic Evaluation
             if curr_steps - last_eval_t >= RecordingParameters.EVAL_INTERVAL:

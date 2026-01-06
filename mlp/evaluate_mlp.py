@@ -706,7 +706,7 @@ Available Strategies:
                        help=f'Target type(s): {", ".join(TARGET_TYPE_CHOICES)}')
 
     parser.add_argument('--tracker_model', type=str,
-                       default='./models/rl_CoverSeeker_collision_12-23-19-54/best_model/checkpoint.pth',
+                       default='./models/rl_Greedy_collision_sparse_01-06-13-50/best_model/checkpoint.pth',
                        help='Path to tracker model (required when --tracker=policy)')
     parser.add_argument('--target_model', type=str, default='./target_models/stealth_ppo_12-10-17-25/stealth_best.pth',
                        help='Path to target model (required when --target=policy)')
@@ -723,11 +723,11 @@ Available Strategies:
                        help='State space representation')
 
     parser.add_argument('--obstacles', type=str,
-                       default=ObstacleDensity.DENSE,
+                       default=ObstacleDensity.SPARSE,
                        choices=ObstacleDensity.ALL_LEVELS,
                        help='Obstacle density level (none/sparse/medium/dense)')
 
-    parser.add_argument('--debug', action='store_true', default=False,
+    parser.add_argument('--debug', action='store_true', default=True,
                        help='Enable debug mode: save GIFs and detailed data for failed tracker episodes')
 
     parser.add_argument('--no-safety-layer', action='store_true', default=True,
