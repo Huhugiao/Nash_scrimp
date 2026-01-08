@@ -88,9 +88,9 @@ class NetParameters:
     # --- 残差网络特有参数 ---
     VELOCITY_DIM = 2  # 线速度 + 角速度
     RESIDUAL_INPUT_DIM = RADAR_DIM + ACTION_DIM + VELOCITY_DIM  # 64 + 2 + 2 = 68
-    RESIDUAL_HIDDEN_DIM = 64          # 隐藏层维度 (比MLP小)
-    RESIDUAL_NUM_LAYERS = 2           # 隐藏层数
-    RESIDUAL_MAX_SCALE = 0.5          # Residual 最大幅度 [-0.5, 0.5]
+    RESIDUAL_HIDDEN_DIM = 128         # 隐藏层维度 (增大容量)
+    RESIDUAL_NUM_LAYERS = 3           # 隐藏层数 (更深网络)
+    RESIDUAL_MAX_SCALE = 0.8          # Residual 最大幅度 [-0.8, 0.8]
     
     # Log std bounds for residual actor (stability)
     LOG_STD_MIN = -20.0
@@ -103,7 +103,7 @@ class ResidualRLConfig:
     EXPERIMENT_NAME = "residual_avoidance"
     
     # 基础模型路径 (冻结的预训练 Tracker)
-    BASE_MODEL_PATH = "./models/rl_Greedy_collision_medium_01-05-09-21/best_model/checkpoint.pth"
+    BASE_MODEL_PATH = "./models/rl_CoverSeeker_collision_dense_01-07-19-29/best_model/checkpoint.pth"
     
     # 惩罚系数
     ACTION_PENALTY_COEF = 0.002       # L2 惩罚 (鼓励小 residual)

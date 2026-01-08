@@ -64,7 +64,7 @@ class ResidualActorNetwork(nn.Module):
 class ResidualCriticNetwork(nn.Module):
     """
     Value function for residual policy
-    Input: Radar only (64-dim)
+    Input: Radar (64) + Base Action (2) + Velocity (2) = 68-dim
     """
     def __init__(self,
                  input_dim=None,
@@ -73,7 +73,7 @@ class ResidualCriticNetwork(nn.Module):
         super().__init__()
         
         if input_dim is None:
-            input_dim = NetParameters.RADAR_DIM
+            input_dim = NetParameters.RESIDUAL_INPUT_DIM  # 68 (same as actor)
         if hidden_dim is None:
             hidden_dim = NetParameters.RESIDUAL_HIDDEN_DIM
         if num_layers is None:
@@ -94,8 +94,9 @@ class ResidualCriticNetwork(nn.Module):
         nn.init.orthogonal_(self.value_head.weight, gain=1.0)
         nn.init.constant_(self.value_head.bias, 0.0)
     
-    def forward(self, radar):
-        features = self.feature_net(radar)
+    def forward(self, radar, base_action, velocity):
+        x = torch.cat([radar, base_action, velocity], dim=-1)
+        features = self.feature_net(x)
         return self.value_head(features)
 
 
@@ -103,7 +104,7 @@ class ResidualPolicyNetwork(nn.Module):
     """
     Residual Policy Module:
     - Actor: Outputs bounded residual action from radar + base_action + velocity
-    - Critic: Estimates value from radar
+    - Critic: Estimates value from radar + base_action + velocity
     - Fusion: Simple addition (base + residual, clamped)
     """
     def __init__(self):

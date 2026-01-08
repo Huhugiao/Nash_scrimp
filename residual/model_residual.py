@@ -105,7 +105,7 @@ class ResidualModel:
 
             # Forward pass through residual network (radar + base_action + velocity)
             mean, log_std = self.network.actor(radar_obs, base_actions_t, velocity_t)
-            new_values = self.network.critic(radar_obs).squeeze(-1)
+            new_values = self.network.critic(radar_obs, base_actions_t, velocity_t).squeeze(-1)
 
             # IMPORTANT: actions here must be pre-tanh u (runner 已经按 u 存了)
             new_log_probs = self._log_prob_from_pre_tanh(actions, mean, log_std)

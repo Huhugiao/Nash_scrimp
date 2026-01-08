@@ -124,7 +124,7 @@ class ResidualRunner(object):
 
         # 奖励结构: 原生奖励 + 碰撞惩罚 + residual惩罚
         EXTRA_COLLISION_PEN = 100.0  # 碰撞额外惩罚
-        RESIDUAL_PENALTY_COEF = 0.5  # residual L2 惩罚系数 (防止过度修正)
+        RESIDUAL_PENALTY_COEF = 0.1  # residual L2 惩罚系数 (允许积极修正)
 
         # Residual scale (best-effort from network)
         max_scale = 1.0
@@ -163,7 +163,7 @@ class ResidualRunner(object):
                 u = mean + std * torch.randn_like(mean)  # pre-tanh
                 residual_used = torch.tanh(u) * max_scale  # bounded executed residual
                 logp = _log_prob_from_pre_tanh(u, mean, log_std)
-                value = self.residual_model.critic(radar_t).squeeze(-1)
+                value = self.residual_model.critic(radar_t, base_action_t, vel_t).squeeze(-1)
 
                 fused = ResidualPolicyNetwork.fuse_actions(base_action_t, residual_used)
                 tracker_action = fused.squeeze(0).cpu().numpy().astype(np.float32)
@@ -233,7 +233,13 @@ class ResidualRunner(object):
         with torch.no_grad():
             radar_last = np.asarray(self.tracker_obs[NetParameters.ACTOR_SCALAR_LEN:], dtype=np.float32)
             radar_last_t = torch.from_numpy(radar_last).float().to(self.local_device).unsqueeze(0)
-            last_value = float(self.residual_model.critic(radar_last_t).squeeze(-1).item())
+            # Get base action and velocity for last state
+            critic_obs_last = np.concatenate([self.tracker_obs, self.target_obs]).astype(np.float32)
+            base_action_last, _, _, _ = self.base_model.evaluate(self.tracker_obs, critic_obs_last, greedy=True)
+            base_action_last = np.asarray(base_action_last, dtype=np.float32).reshape(-1)
+            base_action_last_t = torch.from_numpy(base_action_last).float().to(self.local_device).unsqueeze(0)
+            vel_last_t = torch.from_numpy(self.tracker_obs[0:2].astype(np.float32)).float().to(self.local_device).unsqueeze(0)
+            last_value = float(self.residual_model.critic(radar_last_t, base_action_last_t, vel_last_t).squeeze(-1).item())
 
         advantages = np.zeros((n_steps,), dtype=np.float32)
         lastgaelam = 0.0
