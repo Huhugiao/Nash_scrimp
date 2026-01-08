@@ -149,7 +149,7 @@ class Model(object):
                 with torch.no_grad():
                     _, il_value_flat, _ = self.network(il_actor, il_critic)
                     q_expert_flat = self.network.forward_q(il_critic, il_actions).squeeze(-1)
-                    conf_mask = (q_expert_flat - il_value_flat.squeeze(-1) > TrainingParameters.IL_FILTER_THRESHOLD).float()
+                    conf_mask = (q_expert_flat - q_expert_flat.squeeze(-1) > TrainingParameters.IL_FILTER_THRESHOLD).float()
                 il_filter_ratio = float(conf_mask.mean().item())
                 gating_mask = gating_mask * conf_mask
             else:

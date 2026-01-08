@@ -122,11 +122,9 @@ class ResidualRunner(object):
         performance = {"per_r": [], "per_episode_len": [], "win": []}
         completed_opponents = []
 
-        # Safety shaping (adds emphasis on "not too close", on top of env_reward)
-        SAFE_EDGE_PX = 18.0      # below this edge distance, penalize strongly
-        SAFE_W = 0.15            # safety emphasis weight (keep modest; env_reward already has shaping)
-        EXTRA_COLLISION_PEN = 5.0  # extra penalty when tracker_collision happens (env_reward already penalizes)
-        action_pen_coef = float(getattr(ResidualRLConfig, "ACTION_PENALTY_COEF", 0.0))
+        # 奖励结构: 原生奖励 + 碰撞惩罚 + residual惩罚
+        EXTRA_COLLISION_PEN = 100.0  # 碰撞额外惩罚
+        RESIDUAL_PENALTY_COEF = 0.5  # residual L2 惩罚系数 (防止过度修正)
 
         # Residual scale (best-effort from network)
         max_scale = 1.0
@@ -141,8 +139,6 @@ class ResidualRunner(object):
 
         residual_l2_sum = 0.0
         collision_steps = 0
-        min_edge_sum = 0.0
-        min_edge_count = 0
 
         for t in range(n_steps):
             tracker_obs = self.tracker_obs
@@ -180,26 +176,17 @@ class ResidualRunner(object):
             if bool(info.get("tracker_collision", False)):
                 collision_steps += 1
 
-            # --- Reward: base env reward + extra safety emphasis - residual penalty ---
+            # --- Reward: 原生奖励 + 碰撞惩罚 + residual惩罚 ---
             r = float(env_reward)
 
+            # 碰撞额外惩罚
             if bool(info.get("tracker_collision", False)):
                 r -= EXTRA_COLLISION_PEN
 
-            # Absolute closeness penalty using info['min_edge_distance'] (px). Smaller => more dangerous.
-            min_edge = info.get("min_edge_distance", None)
-            if min_edge is not None:
-                min_edge_sum += float(min_edge)
-                min_edge_count += 1
-                d = float(min_edge)
-                if d < SAFE_EDGE_PX:
-                    x = (SAFE_EDGE_PX - d) / (SAFE_EDGE_PX + 1e-6)
-                    r -= SAFE_W * (x * x)
-
-            # Penalize magnitude of executed residual (bounded)
+            # Residual L2 惩罚 (防止过度修正)
             residual_np = residual_used.squeeze(0).cpu().numpy().astype(np.float32)
             residual_l2_sum += float(np.linalg.norm(residual_np))
-            r -= action_pen_coef * float(np.sum(residual_np * residual_np))
+            r -= RESIDUAL_PENALTY_COEF * float(np.sum(residual_np * residual_np))
 
             # Store rollout
             data["actor_obs"][t] = tracker_obs
@@ -274,7 +261,6 @@ class ResidualRunner(object):
         extra_stats = {
             "residual_l2_mean": float(residual_l2_sum) / float(n_steps),
             "collision_rate": float(collision_steps) / float(n_steps),
-            "min_edge_distance_mean": (float(min_edge_sum) / float(min_edge_count)) if min_edge_count > 0 else float("nan"),
         }
 
         return {
