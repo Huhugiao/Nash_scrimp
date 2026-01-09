@@ -972,7 +972,14 @@ class TrackingEnv(gym.Env):
         self._fov_cache_valid = True
         return pts
 
-    def render(self, mode='rgb_array'):
+    def render(self, mode='rgb_array', collision_info=None):
+        """
+        渲染当前环境状态。
+        
+        Args:
+            mode: 渲染模式 (仅支持 'rgb_array')
+            collision_info: 可选的碰撞信息字典，用于在GIF中高亮显示碰撞
+        """
         if pygame is not None and self._render_surface is None:
             ss = getattr(map_config, 'ssaa', 1)
             self._render_surface = pygame.Surface(
@@ -983,7 +990,8 @@ class TrackingEnv(gym.Env):
             self.target, self.tracker,
             self.tracker_trajectory, self.target_trajectory,
             surface=self._render_surface,
-            fov_points=fov_points
+            fov_points=fov_points,
+            collision_info=collision_info
         )
         return canvas
 

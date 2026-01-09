@@ -72,8 +72,14 @@ CAPTURE_SECTOR_COLOR = (90, 220, 140, 50)
 FAST = os.getenv('SCRIMP_RENDER_MODE', 'fast').lower() == 'fast'
 
 # GIF 输出配置
-# 提升至 640 (原生分辨率) 以获得最高清晰度，虽然文件稍大但视觉效果最好
-gif_max_side = 640
+# 提升至 800 以获得更高清晰度，用于碰撞分析
+gif_max_side = 800
+
+# 碰撞可视化颜色配置
+COLLISION_TRACKER_COLOR = (255, 50, 50, 255)      # 红色 - 标记碰撞的tracker
+COLLISION_OBSTACLE_COLOR = (180, 50, 255, 255)   # 紫色 - 标记被撞的障碍物
+COLLISION_POINT_COLOR = (255, 255, 0, 255)        # 黄色 - 碰撞点
+COLLISION_FREEZE_FRAMES = 30                       # 碰撞后停留帧数
 
 # 视觉主题：浅背景 + 高对比色
 # 改为纯白背景以优化GIF压缩率

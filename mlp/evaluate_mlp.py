@@ -98,6 +98,9 @@ class BattleConfig:
 def run_battle_batch(args):
     config, episode_indices = args
     map_config.set_obstacle_density(config.obstacle_density)
+    
+    # 确保在子进程中导入 env_lib 以便碰撞检测可用
+    import env_lib
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -272,9 +275,25 @@ def run_single_episode(config, episode_idx, tracker_model, target_model, device,
                     stats['collision_type'] = "tracker_collision"
 
                 if should_record:
-                    frame = env.render(mode='rgb_array')
+                    # 检查是否在本帧发生碰撞
+                    collision_info = None
+                    if info.get('tracker_collision'):
+                        import env_lib
+                        tracker_cx = env.tracker['x'] + map_config.pixel_size * 0.5
+                        tracker_cy = env.tracker['y'] + map_config.pixel_size * 0.5
+                        agent_radius = float(getattr(map_config, 'agent_radius', map_config.pixel_size * 0.5))
+                        collision_info = env_lib.find_colliding_obstacle(tracker_cx, tracker_cy, agent_radius)
+                    
+                    # 使用碰撞信息渲染帧
+                    frame = env.render(mode='rgb_array', collision_info=collision_info)
                     if frame is not None:
                         episode_frames.append(frame)
+                        
+                        # 如果发生碰撞，添加停留帧让用户看清碰撞位置
+                        if collision_info and collision_info.get('collision'):
+                            freeze_count = getattr(map_config, 'COLLISION_FREEZE_FRAMES', 30)
+                            for _ in range(freeze_count):
+                                episode_frames.append(frame.copy())
 
         save_gif = False
         if config.debug:
@@ -711,7 +730,7 @@ Available Strategies:
     parser.add_argument('--target_model', type=str, default='./target_models/stealth_ppo_12-10-17-25/stealth_best.pth',
                        help='Path to target model (required when --target=policy)')
 
-    parser.add_argument('--episodes', type=int, default=400,
+    parser.add_argument('--episodes', type=int, default=100,
                        help='Number of episodes to run')
     parser.add_argument('--save_gif_freq', type=int, default=0,
                        help='Save GIF every N episodes (0 to disable)')
@@ -727,7 +746,7 @@ Available Strategies:
                        choices=ObstacleDensity.ALL_LEVELS,
                        help='Obstacle density level (none/sparse/medium/dense)')
 
-    parser.add_argument('--debug', action='store_true', default=False,
+    parser.add_argument('--debug', action='store_true', default=True,
                        help='Enable debug mode: save GIFs and detailed data for failed tracker episodes')
 
     parser.add_argument('--no-safety-layer', action='store_true', default=True,

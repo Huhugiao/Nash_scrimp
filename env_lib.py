@@ -222,10 +222,113 @@ def _occ_any_with_pad(ix, iy, pad_cells):
         return True
     return bool(_OCC_GRID[y1:y2, x1:x2].any())
 
+# === Analytical Ray Intersection Helpers ===
+
+def _ray_intersect_circle(ox, oy, dx, dy, cx, cy, r):
+    fx = ox - cx
+    fy = oy - cy
+    b = 2 * (dx * fx + dy * fy)
+    c = (fx * fx + fy * fy) - r * r
+    disc = b * b - 4 * c
+    if disc < 0:
+        return float('inf')
+    sqrt_disc = math.sqrt(disc)
+    t1 = (-b - sqrt_disc) / 2
+    t2 = (-b + sqrt_disc) / 2
+    
+    if t2 < 0: return float('inf')
+    if t1 > 0: return t1
+    return t2 # Inside circle
+
+def _ray_intersect_segment_line(ox, oy, dx, dy, x1, y1, x2, y2):
+    rx = x2 - x1
+    ry = y2 - y1
+    cross = dx * ry - dy * rx
+    if abs(cross) < 1e-9:
+        return float('inf')
+    
+    dp_x = x1 - ox
+    dp_y = y1 - oy
+    
+    t = (dp_x * ry - dp_y * rx) / cross
+    u = (dp_x * dy - dp_y * dx) / cross
+    
+    if 0 <= u <= 1 and t >= 0:
+        return t
+    return float('inf')
+
+def _ray_intersect_capsule_segment(ox, oy, dx, dy, p1x, p1y, p2x, p2y, r):
+    dist = _ray_intersect_circle(ox, oy, dx, dy, p1x, p1y, r)
+    dist = min(dist, _ray_intersect_circle(ox, oy, dx, dy, p2x, p2y, r))
+    
+    vx = p2x - p1x
+    vy = p2y - p1y
+    length = math.hypot(vx, vy)
+    if length < 1e-9: return dist
+    
+    nx = -vy / length
+    ny = vx / length
+    
+    off_x = nx * r
+    off_y = ny * r
+    
+    t1 = _ray_intersect_segment_line(ox, oy, dx, dy, p1x + off_x, p1y + off_y, p2x + off_x, p2y + off_y)
+    t2 = _ray_intersect_segment_line(ox, oy, dx, dy, p1x - off_x, p1y - off_y, p2x - off_x, p2y - off_y)
+    
+    return min(dist, t1, t2)
+
+def _ray_intersect_rect(ox, oy, dx, dy, rx, ry, rw, rh):
+    t_min = float('inf')
+    if abs(dx) > 1e-9:
+        t = (rx - ox) / dx
+        y = oy + t * dy
+        if t >= 0 and ry <= y <= ry + rh: t_min = min(t_min, t)
+        t = (rx + rw - ox) / dx
+        y = oy + t * dy
+        if t >= 0 and ry <= y <= ry + rh: t_min = min(t_min, t)
+    if abs(dy) > 1e-9:
+        t = (ry - oy) / dy
+        x = ox + t * dx
+        if t >= 0 and rx <= x <= rx + rw: t_min = min(t_min, t)
+        t = (ry + rh - oy) / dy
+        x = ox + t * dx
+        if t >= 0 and rx <= x <= rx + rw: t_min = min(t_min, t)
+    return t_min
+
+def _ray_intersect_obstacles(origin, angle_rad, max_range, padding=0.0):
+    ox, oy = float(origin[0]), float(origin[1])
+    dx, dy = math.cos(angle_rad), math.sin(angle_rad)
+    
+    min_dist = float(max_range)
+    
+    for obs in getattr(map_config, 'obstacles', []):
+        d = float('inf')
+        if obs['type'] == 'rect':
+            d = _ray_intersect_rect(ox, oy, dx, dy, obs['x'] - padding, obs['y'] - padding, obs['w'] + 2*padding, obs['h'] + 2*padding)
+        elif obs['type'] == 'circle':
+            d = _ray_intersect_circle(ox, oy, dx, dy, obs['cx'], obs['cy'], obs['r'] + padding)
+        elif obs.get('type') == 'segment':
+            thick = float(obs.get('thick', 8.0))
+            radius = thick * 0.5 + padding
+            d = _ray_intersect_capsule_segment(ox, oy, dx, dy, obs['x1'], obs['y1'], obs['x2'], obs['y2'], radius)
+        
+        if d < min_dist:
+            min_dist = d
+            
+    return min_dist
+
 def ray_distance_grid(origin, angle_rad, max_range, padding=0.0):
     """
-    在占据栅格上沿方向 angle_rad 执行 DDA 射线。
-    如果 Numba 可用，使用加速内核。
+    执行射线检测。
+    默认使用精确解析几何计算 (_ray_intersect_obstacles)，保证雷达精度。
+    不再使用占据栅格 (Occupancy Grid) 进行射线检测。
+    """
+    return _ray_intersect_obstacles(origin, angle_rad, max_range, padding)
+
+def _ray_distance_grid_legacy(origin, angle_rad, max_range, padding=0.0):
+    """
+    (Legacy) 在占据栅格上沿方向 angle_rad 执行 DDA 射线。
+    保留供参考或性能回退（但当前被 ray_distance_grid 取代）。
     """
     if not _occ_available():
         return _trace_ray_for_fov(origin, angle_rad, max_range)
@@ -312,14 +415,8 @@ def ray_distance_grid(origin, angle_rad, max_range, padding=0.0):
     return float(max_range)
 
 def ray_distances_multi(origin, angles_rad, max_range, padding=0.0):
-    if NUMBA_AVAILABLE and _occ_available():
-        ox, oy = float(origin[0]), float(origin[1])
-        nx, ny = _OCC_GRID.shape[1], _OCC_GRID.shape[0]
-        pad_cells = int(math.ceil(float(padding) / float(_OCC_CELL)))
-        # Ensure angles is numpy array
-        angles_arr = np.asarray(angles_rad, dtype=np.float64)
-        return _numba_ray_cast_batch(ox, oy, angles_arr, float(max_range), 
-                                   _OCC_GRID, float(_OCC_CELL), nx, ny, pad_cells)
+    # 强制不使用 Numba/OccGrid 路径，以确保使用精确的几何计算
+    # if NUMBA_AVAILABLE and _occ_available(): ...
     
     return np.array([ray_distance_grid(origin, ang, max_range, padding) for ang in angles_rad],
                     dtype=np.float32)
@@ -508,11 +605,14 @@ def _segment_contains(px, py, seg, padding=0.0):
     return _dist2_point_to_segment(px, py, seg['x1'], seg['y1'], seg['x2'], seg['y2']) <= (0.5 * thick + padding)**2
 
 def is_point_blocked(px, py, padding=0.0):
-    """点是否与任何障碍碰撞；优先使用栅格。"""
-    if _occ_available():
-        ix, iy, _, _ = _world_to_cell(px, py, _OCC_CELL)
-        pad_cells = int(math.ceil(float(padding) / float(_OCC_CELL)))
-        return _occ_any_with_pad(ix, iy, pad_cells)
+    """点是否与任何障碍碰撞；使用精确几何检测。
+    
+    注意：为了保证物理碰撞的精确性，这里不再使用 Occupancy Grid (栅格)。
+    虽然栅格能加速，但在边缘处会导致精度损失（虚边问题），影响训练和可视化一致性。
+    对于单点查询，直接遍历几何体的开销是可以接受的。
+    """
+    # 这一行被注释掉，以强制使用精确检测
+    # if _occ_available(): ...
 
     for obs in getattr(map_config, 'obstacles', []):
         if obs['type'] == 'rect' and _rect_contains(px, py, obs, padding):
@@ -523,18 +623,86 @@ def is_point_blocked(px, py, padding=0.0):
             return True
     return False
 
+def find_colliding_obstacle(px, py, padding=0.0):
+    """
+    找到与指定点碰撞的障碍物及碰撞点信息。
+    
+    Args:
+        px, py: 点的坐标
+        padding: 碰撞检测的膨胀半径
+        
+    Returns:
+        dict: 包含碰撞信息，或 None 如果没有碰撞
+            - 'collision': bool, 是否碰撞
+            - 'collision_point': tuple (x, y), 碰撞点坐标
+            - 'collided_obstacle': dict, 被撞障碍物对象
+    """
+    for obs in getattr(map_config, 'obstacles', []):
+        if obs['type'] == 'rect':
+            if _rect_contains(px, py, obs, padding):
+                # 计算最近的碰撞点 (矩形边上最近点)
+                cx = max(obs['x'], min(px, obs['x'] + obs['w']))
+                cy = max(obs['y'], min(py, obs['y'] + obs['h']))
+                return {
+                    'collision': True,
+                    'collision_point': (cx, cy),
+                    'collided_obstacle': obs
+                }
+        elif obs['type'] == 'circle':
+            if _circle_contains(px, py, obs, padding):
+                # 计算碰撞点 (圆边上最近点)
+                dx = px - obs['cx']
+                dy = py - obs['cy']
+                dist = math.hypot(dx, dy)
+                if dist > 1e-6:
+                    cx = obs['cx'] + dx / dist * obs['r']
+                    cy = obs['cy'] + dy / dist * obs['r']
+                else:
+                    cx, cy = obs['cx'], obs['cy'] - obs['r']
+                return {
+                    'collision': True,
+                    'collision_point': (cx, cy),
+                    'collided_obstacle': obs
+                }
+        elif obs.get('type') == 'segment':
+            if _segment_contains(px, py, obs, padding):
+                # 计算最近点到线段的投影
+                x1, y1, x2, y2 = obs['x1'], obs['y1'], obs['x2'], obs['y2']
+                vx, vy = (x2 - x1), (y2 - y1)
+                wx, wy = (px - x1), (py - y1)
+                seg_len2 = vx * vx + vy * vy
+                if seg_len2 <= 1e-9:
+                    cx, cy = x1, y1
+                else:
+                    t = max(0.0, min(1.0, (wx * vx + wy * vy) / seg_len2))
+                    cx = x1 + t * vx
+                    cy = y1 + t * vy
+                return {
+                    'collision': True,
+                    'collision_point': (cx, cy),
+                    'collided_obstacle': obs
+                }
+    return None
+
 def _resolve_obstacle_collision(old_pos, new_pos):
     if is_point_blocked(new_pos['x'] + map_config.pixel_size * 0.5,
                         new_pos['y'] + map_config.pixel_size * 0.5):
         new_pos['x'], new_pos['y'] = old_pos['x'], old_pos['y']
     return new_pos
 
-def _draw_obstacles(surface):
-    """绘制矩形边界 + 线段墙"""
+def _draw_obstacles(surface, exclude_obstacle=None):
+    """绘制矩形边界 + 线段墙
+    
+    Args:
+        exclude_obstacle: 排除绘制的障碍物(被碰撞的障碍物单独高亮绘制)
+    """
     if pygame is None:
         return
     ss = getattr(map_config, 'ssaa', 1)
     for obs in getattr(map_config, 'obstacles', []):
+        # 跳过被排除的障碍物 (用于碰撞高亮)
+        if exclude_obstacle is not None and obs is exclude_obstacle:
+            continue
         color = obs.get('color', (80, 80, 80, 255))
         if obs['type'] == 'rect':
             pygame.draw.rect(
@@ -555,6 +723,76 @@ def _draw_obstacles(surface):
                 (int(obs['x2']*ss), int(obs['y2']*ss)),
                 max(1, int(float(obs.get('thick', 8.0))*ss))
             )
+
+def _draw_collision_highlight(surface, collision_info):
+    """高亮绘制被碰撞的障碍物"""
+    if pygame is None or not collision_info:
+        return
+    
+    obs = collision_info.get('collided_obstacle')
+    if obs is None:
+        return
+        
+    ss = getattr(map_config, 'ssaa', 1)
+    color = getattr(map_config, 'COLLISION_OBSTACLE_COLOR', (180, 50, 255, 255))
+    
+    if obs['type'] == 'rect':
+        # 绘制填充矩形
+        pygame.draw.rect(
+            surface, color,
+            (int(obs['x']*ss), int(obs['y']*ss),
+             int(obs['w']*ss), int(obs['h']*ss))
+        )
+        # 绘制发光边框效果
+        border_color = (255, 100, 255, 255)
+        pygame.draw.rect(
+            surface, border_color,
+            (int(obs['x']*ss)-2, int(obs['y']*ss)-2,
+             int(obs['w']*ss)+4, int(obs['h']*ss)+4), 3
+        )
+    elif obs['type'] == 'circle':
+        pygame.draw.circle(
+            surface, color,
+            (int(obs['cx']*ss), int(obs['cy']*ss)),
+            int(obs['r']*ss)
+        )
+        # 绘制发光边框
+        border_color = (255, 100, 255, 255)
+        pygame.draw.circle(
+            surface, border_color,
+            (int(obs['cx']*ss), int(obs['cy']*ss)),
+            int(obs['r']*ss)+3, 3
+        )
+    elif obs.get('type') == 'segment':
+        pygame.draw.line(
+            surface, color,
+            (int(obs['x1']*ss), int(obs['y1']*ss)),
+            (int(obs['x2']*ss), int(obs['y2']*ss)),
+            max(1, int(float(obs.get('thick', 8.0))*ss)) + 4
+        )
+
+def _draw_collision_point(surface, collision_info):
+    """绘制碰撞点标记 - 尺寸与智能体相当"""
+    if pygame is None or not collision_info:
+        return
+        
+    point = collision_info.get('collision_point')
+    if point is None:
+        return
+        
+    ss = getattr(map_config, 'ssaa', 1)
+    color = getattr(map_config, 'COLLISION_POINT_COLOR', (255, 255, 0, 255))
+    
+    # 获取智能体半径作为参考尺寸
+    agent_radius = float(getattr(map_config, 'agent_radius', 8.0))
+    
+    cx, cy = int(point[0] * ss), int(point[1] * ss)
+    r = int(agent_radius * ss * 0.5)  # 进一步缩小至0.6倍半径，更加精致
+    
+    # 绘制实心圆作为碰撞点
+    pygame.draw.circle(surface, color, (cx, cy), r, 0)  # 实心
+    # 绘制一圈白色边框增加可见度
+    pygame.draw.circle(surface, (255, 255, 255, 255), (cx, cy), r + 2, 1)
 
 def _draw_fov(surface, tracker, fov_points=None):
     """基于预计算的 fov_points 绘制半透明扇形。"""
@@ -646,7 +884,16 @@ def _draw_capture_sector(surface, tracker):
         pygame.gfxdraw.aapolygon(surface, pts, outline_color)
         pygame.draw.lines(surface, outline_color, True, pts, 1)
 
-def get_canvas(target, tracker, tracker_traj, target_traj, surface=None, fov_points=None):
+def get_canvas(target, tracker, tracker_traj, target_traj, surface=None, fov_points=None, collision_info=None):
+    """
+    渲染画布。
+    
+    Args:
+        collision_info: 可选的碰撞信息字典，包含:
+            - 'collision': bool, 是否发生碰撞
+            - 'collision_point': tuple (x, y), 碰撞点坐标
+            - 'collided_obstacle': dict, 被撞障碍物信息
+    """
     w, h = map_config.width, map_config.height
     ss = getattr(map_config, 'ssaa', 1)
     if pygame is None:
@@ -657,12 +904,27 @@ def get_canvas(target, tracker, tracker_traj, target_traj, surface=None, fov_poi
     surface.fill(map_config.background_color)
 
     _draw_grid(surface)
-    _draw_obstacles(surface)
+    
+    # 如果发生碰撞，需要先绘制普通障碍物，再高亮被撞障碍物
+    if collision_info and collision_info.get('collision'):
+        _draw_obstacles(surface, exclude_obstacle=collision_info.get('collided_obstacle'))
+        _draw_collision_highlight(surface, collision_info)
+    else:
+        _draw_obstacles(surface)
+    
     _draw_fov(surface, tracker, fov_points)
     _draw_capture_sector(surface, tracker)
     _draw_trail(surface, tracker_traj, map_config.trail_color_tracker, map_config.trail_width)
     _draw_trail(surface, target_traj, map_config.trail_color_target, map_config.trail_width)
-    _draw_agent(surface, tracker, map_config.tracker_color, role='tracker')
+    
+    # 如果发生碰撞，用特殊颜色绘制tracker
+    if collision_info and collision_info.get('collision'):
+        collision_color = getattr(map_config, 'COLLISION_TRACKER_COLOR', (255, 50, 50, 255))
+        _draw_agent(surface, tracker, collision_color, role='tracker')
+        _draw_collision_point(surface, collision_info)
+    else:
+        _draw_agent(surface, tracker, map_config.tracker_color, role='tracker')
+    
     _draw_agent(surface, target, map_config.target_color, role='target')
 
     canvas = pygame.transform.smoothscale(surface, (w, h)) if ss > 1 else surface
