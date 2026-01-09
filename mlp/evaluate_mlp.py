@@ -700,20 +700,20 @@ Available Strategies:
     parser.add_argument('--tracker', type=str, default="policy",
                        choices=list(TRACKER_TYPE_CHOICES),
                        help=f'Tracker type: {", ".join(TRACKER_TYPE_CHOICES)}')
-    parser.add_argument('--tracker_name', type=str, default="rl0104",
+    parser.add_argument('--tracker_name', type=str, default="rl0108",
                        help='Custom name for tracker when type is policy')
-    parser.add_argument('--target', type=str, nargs='+', default=["all"],
+    parser.add_argument('--target', type=str, nargs='+', default=["Greedy","CoverSeeker"],
                        help=f'Target type(s): {", ".join(TARGET_TYPE_CHOICES)}')
 
     parser.add_argument('--tracker_model', type=str,
-                       default='./models/rl_Greedy_collision_sparse_01-06-13-50/best_model/checkpoint.pth',
+                       default='./models/rl_CoverSeeker_collision_dense_01-07-19-29/best_model/checkpoint.pth',
                        help='Path to tracker model (required when --tracker=policy)')
     parser.add_argument('--target_model', type=str, default='./target_models/stealth_ppo_12-10-17-25/stealth_best.pth',
                        help='Path to target model (required when --target=policy)')
 
-    parser.add_argument('--episodes', type=int, default=100,
+    parser.add_argument('--episodes', type=int, default=400,
                        help='Number of episodes to run')
-    parser.add_argument('--save_gif_freq', type=int, default=10,
+    parser.add_argument('--save_gif_freq', type=int, default=0,
                        help='Save GIF every N episodes (0 to disable)')
     parser.add_argument('--output_dir', type=str, default='./battles',
                        help='Output directory for results')
@@ -723,11 +723,11 @@ Available Strategies:
                        help='State space representation')
 
     parser.add_argument('--obstacles', type=str,
-                       default=ObstacleDensity.SPARSE,
+                       default=ObstacleDensity.DENSE,
                        choices=ObstacleDensity.ALL_LEVELS,
                        help='Obstacle density level (none/sparse/medium/dense)')
 
-    parser.add_argument('--debug', action='store_true', default=True,
+    parser.add_argument('--debug', action='store_true', default=False,
                        help='Enable debug mode: save GIFs and detailed data for failed tracker episodes')
 
     parser.add_argument('--no-safety-layer', action='store_true', default=True,

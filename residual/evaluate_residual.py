@@ -403,11 +403,11 @@ def run_strategy_evaluation(cfg: EvalConfig, target_strategies: List[str]):
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate base tracker vs residual-enhanced tracker")
-    parser.add_argument("--residual_model", default='models/residual_avoidance_dense_01-06-10-58/best_model/checkpoint.pth', help="Path to residual checkpoint (best_model/checkpoint.pth)")
-    parser.add_argument("--base_model", default='models/rl_Greedy_collision_medium_01-05-09-21/best_model/checkpoint.pth', help="Path to base tracker checkpoint")
+    parser.add_argument("--residual_model", default='models/residual_avoidance_dense_01-08-16-05/best_model/checkpoint.pth', help="Path to residual checkpoint (best_model/checkpoint.pth)")
+    parser.add_argument("--base_model", default='models/rl_CoverSeeker_collision_dense_01-07-19-29/best_model/checkpoint.pth', help="Path to base tracker checkpoint")
     parser.add_argument("--target_policy", default=DEFAULT_TARGET_POLICY, help="Target policy to evaluate against (use 'all' for all policies)")
-    parser.add_argument("--episodes", type=int, default=100, help="Number of episodes per tracker mode")
-    parser.add_argument("--save_gif_freq", type=int, default=30, help="Save GIF every N episodes (0 to disable)")
+    parser.add_argument("--episodes", type=int, default=200, help="Number of episodes per tracker mode")
+    parser.add_argument("--save_gif_freq", type=int, default=60, help="Save GIF every N episodes (0 to disable)")
     parser.add_argument("--output_dir", type=str, default="./battles/residual", help="Directory to store evaluation outputs")
     parser.add_argument("--seed", type=int, default=1234, help="Random seed")
     parser.add_argument("--obstacles", type=str, default=ObstacleDensity.DENSE, choices=ObstacleDensity.ALL_LEVELS, help="Obstacle density level")

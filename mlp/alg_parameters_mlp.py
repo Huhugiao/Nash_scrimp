@@ -13,7 +13,7 @@ class SetupParameters:
     PRETRAINED_TRACKER_PATH = None # 预训练Tracker模型路径
     
     # 障碍物密度等级 (none, sparse, medium, dense)
-    OBSTACLE_DENSITY = ObstacleDensity.SPARSE
+    OBSTACLE_DENSITY = ObstacleDensity.DENSE
 
 class TrainingParameters:
     """
@@ -27,7 +27,7 @@ class TrainingParameters:
     # --- 训练流程设置 ---
     N_ENVS = 4               # 并行环境数量
     N_STEPS = 2048           # 每个环境采样的步数 (PPO Rollout Length)
-    N_MAX_STEPS = 30e7        # 最大训练总步数
+    N_MAX_STEPS = 4e7        # 最大训练总步数
     LOG_EPOCH_STEPS = int(1e4) # 每隔多少步记录一次日志
     
     MINIBATCH_SIZE = 64      # PPO更新的Mini-batch大小
@@ -88,8 +88,8 @@ class TrainingParameters:
     # 随机对手权重 (初始权重)
     RANDOM_OPPONENT_WEIGHTS = {
         "target": {
-            "Greedy": 1.0,
-            # "CoverSeeker": 1.0,
+            # "Greedy": 1.0,
+            "CoverSeeker": 1.0,
             # "ZigZag": 0.5,
             # "Orbiter": 0.5,
         }
@@ -144,7 +144,7 @@ class RecordingParameters:
     
     RETRAIN = False          # 是否继续训练 (加载权重和进度)
     FRESH_RETRAIN = False     # 仅加载模型权重，重置训练进度和学习率调度
-    RESTORE_DIR = "./models/rl_all_12-23-12-19/latest_model/checkpoint.pth"       # 恢复模型的目录
+    RESTORE_DIR = "./models/rl_CoverSeeker_collision_dense_01-07-10-53/latest_model/checkpoint.pth"       # 恢复模型的目录
     
 
     TENSORBOARD = True       # 是否使用TensorBoard

@@ -177,7 +177,7 @@ class ResidualRunner(object):
                 collision_steps += 1
 
             # --- Reward: 原生奖励 + 碰撞惩罚 + residual惩罚 ---
-            r = float(env_reward)
+            r = 0
 
             # 碰撞额外惩罚
             if bool(info.get("tracker_collision", False)):
